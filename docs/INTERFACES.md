@@ -143,13 +143,24 @@ Used wisely:
 * Text concepts other than sky/subject need SAM 3; without it the agent looks at a preview,
   locates the thing and calls `segment.box` (MobileSAM segments it precisely).
 
-Speed: the TinyViT encoder is ImageLab's own (`imagelab-segment/src/tiny_vit.rs`), same weights and
-output as candle's to 1e-6. Batch norms are folded into the convs, depthwise convs and windowed
-attention are parallel kernels, and bias/GELU/residual run fused after each gemm. On an M2 Pro
-(12 cores) an encode takes 0.23 s, down from 2.4 s with candle's TinyViT; on a one-core emulator
-11 s, down from 75 s (a tap: 1.8 s, down from 3.0 s). A tap (prompt encoder + candle's mask decoder) takes ~80 ms on the M2. Open: port the
-mask decoder the same way (candle's ConvTranspose dominates it); a GPU (wgpu) or NNAPI backend
-after that.
+Speed: the encoder and the mask decoder are ImageLab's own (`imagelab-segment/src/tiny_vit.rs`,
+`sam_decoder.rs`): the same weights and output as candle's (encoder to 1e-6, mask logits to 1e-5
+relative). Batch norms are folded into the convs. Depthwise convs, windowed and cross attention
+and the upscaler's pixel shuffle are parallel kernels. Bias, GELU, ReLU and residual adds run fused
+after each gemm. The prompt encoder stays candle's, with its constant positional encoding computed once.
+
+| | candle | ImageLab |
+|---|---|---|
+| Encode, M2 Pro, 12 threads | 2.4 s | 0.23 s |
+| Encode, M2 Pro, 1 thread | 3.7 s | 1.15 s |
+| Tap (decode), M2 Pro, 12 threads | 80 ms | 21 ms |
+| Tap, M2 Pro, 1 thread | 139 ms | 64 ms |
+| Tap, one-core emulator | 248 ms | 95 ms |
+
+On the one-core emulator an encode takes ~1.9 s with the host idle. Under heavy host load it was
+75 s with candle's encoder and 11 s with ours. What remains is mostly gemm. Open: a GPU (wgpu)
+or NNAPI backend; caching the first cross-attention's image-side projections per embedding (~15%
+of a tap).
 
 ## 7. `cv`: OpenCV-style, for agents
 

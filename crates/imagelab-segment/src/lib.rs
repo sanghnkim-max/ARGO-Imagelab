@@ -24,6 +24,8 @@ mod sam;
 pub mod segment;
 pub mod select;
 #[cfg(feature = "mobile-sam")]
+mod sam_decoder;
+#[cfg(feature = "mobile-sam")]
 mod tiny_vit;
 
 use std::sync::Arc;

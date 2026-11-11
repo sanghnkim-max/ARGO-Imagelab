@@ -32,7 +32,7 @@ const MEAN: [f32; 3] = [123.675, 116.28, 103.53];
 const STD: [f32; 3] = [58.395, 57.12, 57.375];
 
 /// Contiguous f32 view of a CPU tensor (no copy when it is already contiguous).
-fn with_f32<R>(t: &Tensor, f: impl FnOnce(&[f32]) -> Result<R>) -> Result<R> {
+pub(crate) fn with_f32<R>(t: &Tensor, f: impl FnOnce(&[f32]) -> Result<R>) -> Result<R> {
     let t = t.contiguous()?;
     let (s, l) = t.storage_and_layout();
     let Storage::Cpu(CpuStorage::F32(v)) = &*s else { bail!("TinyViT expects CPU f32 tensors") };
@@ -40,7 +40,7 @@ fn with_f32<R>(t: &Tensor, f: impl FnOnce(&[f32]) -> Result<R>) -> Result<R> {
     f(v.get(a..b).unwrap_or_default())
 }
 
-fn vec_f32(t: &Tensor) -> Result<Vec<f32>> {
+pub(crate) fn vec_f32(t: &Tensor) -> Result<Vec<f32>> {
     t.flatten_all()?.to_dtype(DType::F32)?.to_vec1()
 }
 
@@ -65,7 +65,7 @@ fn tanh(x: f32) -> f32 {
 
 /// candle's `Tensor::gelu` (the tanh approximation), so the result matches candle's encoder.
 #[inline]
-fn gelu(v: f32) -> f32 {
+pub(crate) fn gelu(v: f32) -> f32 {
     const SQRT_TWO_OVER_PI: f32 = 0.797_884_6;
     0.5 * v * (1.0 + tanh(SQRT_TWO_OVER_PI * v * (1.0 + 0.044_715 * v * v)))
 }
@@ -73,7 +73,7 @@ fn gelu(v: f32) -> f32 {
 /// e^x for x ≤ 0 (softmax after subtracting the row max): Cephes' range reduction and degree-6
 /// polynomial, ~1 ulp, branch-free so the softmax loop vectorizes (libm's `expf` does not).
 #[inline]
-fn exp_nonpositive(x: f32) -> f32 {
+pub(crate) fn exp_nonpositive(x: f32) -> f32 {
     const LOG2E: f32 = std::f32::consts::LOG2_E;
     const LN2_HI: f32 = 0.693_359_4;
     const LN2_LO: f32 = -2.121_944_4e-4;
@@ -90,20 +90,21 @@ fn exp_nonpositive(x: f32) -> f32 {
     y * f32::from_bits(((n as i32 + 127) as u32) << 23)
 }
 
-fn gelu_all(v: &mut [f32]) {
+pub(crate) fn gelu_all(v: &mut [f32]) {
     v.iter_mut().for_each(|x| *x = gelu(*x));
 }
 
 /// What runs after a matmul / convolution, fused into one pass over the output.
 #[derive(Clone, Copy, Default)]
-struct Ep<'a> {
-    gelu: bool,
-    residual: Option<&'a Tensor>,
-    gelu_after_residual: bool,
+pub(crate) struct Ep<'a> {
+    pub gelu: bool,
+    pub relu: bool,
+    pub residual: Option<&'a Tensor>,
+    pub gelu_after_residual: bool,
 }
 
 /// `y` (rows × c) + per-column bias, then the [`Ep`] steps; parallel over row blocks.
-fn epilogue(y: &Tensor, bias: Option<&[f32]>, ep: Ep) -> Result<Tensor> {
+pub(crate) fn epilogue(y: &Tensor, bias: Option<&[f32]>, ep: Ep) -> Result<Tensor> {
     let shape = y.shape().clone();
     let c = y.dim(D::Minus1)?;
     if bias.is_some_and(|b| b.len() != c) {
@@ -123,6 +124,9 @@ fn epilogue(y: &Tensor, bias: Option<&[f32]>, ep: Ep) -> Result<Tensor> {
                 }
                 if ep.gelu {
                     gelu_all(orow);
+                }
+                if ep.relu {
+                    orow.iter_mut().for_each(|v| *v = v.max(0.0));
                 }
                 if let Some(res) = res {
                     orow.iter_mut().zip(&res[row * c..(row + 1) * c]).for_each(|(o, r)| *o += r);
@@ -147,14 +151,14 @@ fn epilogue(y: &Tensor, bias: Option<&[f32]>, ep: Ep) -> Result<Tensor> {
 }
 
 /// A 1×1 convolution (or linear layer) over pixel-major rows: `x (rows × cin) · w + b`.
-struct Pointwise {
+pub(crate) struct Pointwise {
     /// cin × cout.
-    w: Tensor,
-    b: Option<Vec<f32>>,
+    pub w: Tensor,
+    pub b: Option<Vec<f32>>,
 }
 
 impl Pointwise {
-    fn forward(&self, x: &Tensor, ep: Ep) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, ep: Ep) -> Result<Tensor> {
         epilogue(&x.matmul(&self.w)?, self.b.as_deref(), ep)
     }
 }
@@ -283,24 +287,24 @@ fn dense_bn(vb: VarBuilder, cin: usize, cout: usize, stride: usize) -> Result<De
     Ok(Dense { w: dense_weight(&w)?, b: Some(b), cin, stride })
 }
 
-fn linear(vb: VarBuilder, cin: usize, cout: usize) -> Result<Pointwise> {
+pub(crate) fn linear(vb: VarBuilder, cin: usize, cout: usize) -> Result<Pointwise> {
     let w = vb.get((cout, cin), "weight")?;
     let b = vec_f32(&vb.get(cout, "bias")?)?;
     Ok(Pointwise { w: w.t()?.contiguous()?, b: Some(b) })
 }
 
-struct Norm {
+pub(crate) struct Norm {
     w: Tensor,
     b: Tensor,
     eps: f32,
 }
 
 impl Norm {
-    fn new(vb: VarBuilder, c: usize, eps: f32) -> Result<Self> {
+    pub fn new(vb: VarBuilder, c: usize, eps: f32) -> Result<Self> {
         Ok(Self { w: vb.get(c, "weight")?, b: vb.get(c, "bias")?, eps })
     }
     /// Normalise each row (pixel) over its channels.
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         candle_nn::ops::layer_norm(&x.contiguous()?, &self.w, &self.b, self.eps)
     }
 }
@@ -583,8 +587,17 @@ impl TinyViT {
     }
 
     /// RGB proxy (`w×h` u8, both ≤ [`IMG`]) → embedding `1×256×64×64`. The proxy is normalised
-    /// and zero-padded at the bottom/right to the encoder's square, as SAM does.
+    /// and zero-padded at the bottom/right to the encoder's square, as SAM does. (Tests compare
+    /// it with candle's encoder; the app uses [`Self::encode_tokens`].)
+    #[cfg(test)]
     pub fn encode(&self, rgb: &[u8], w: usize, h: usize) -> Result<Tensor> {
+        // Pixel-major → channel-major, the layout candle's SAM takes.
+        self.encode_tokens(rgb, w, h)?.t()?.contiguous()?.reshape((1, 256, GRID, GRID))
+    }
+
+    /// Like [`Self::encode`], pixel-major: `4096 × 256` (row = embedding cell), the layout
+    /// [`crate::sam_decoder::MaskDecoder`] takes.
+    pub fn encode_tokens(&self, rgb: &[u8], w: usize, h: usize) -> Result<Tensor> {
         if w > IMG || h > IMG || rgb.len() != w * h * 3 {
             bail!("proxy {w}x{h} does not fit the {IMG} px encoder");
         }
@@ -616,9 +629,7 @@ impl TinyViT {
         }
         let x = self.neck_ln1.forward(&self.neck1.forward(&x, Ep::default())?)?;
         let (x, _, _) = with_f32(&x, |v| self.neck2.forward(v, h, w, false))?;
-        let x = self.neck_ln2.forward(&x)?;
-        // Pixel-major → channel-major, the layout SAM's mask decoder takes.
-        x.t()?.contiguous()?.reshape((1, 256, GRID, GRID))
+        self.neck_ln2.forward(&x)
     }
 }
 

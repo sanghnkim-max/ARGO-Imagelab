@@ -1,8 +1,9 @@
 //! MobileSAM: the phone-sized interactive segmenter (feature `mobile-sam`).
 //!
-//! SAM's prompt encoder and mask decoder (candle's segment-anything modules, candle-transformers,
-//! Apache-2.0) with MobileSAM's TinyViT-5M image encoder in [`crate::tiny_vit`]: the same model
-//! re-laid out for a multi-core phone CPU (10× faster than candle's own TinyViT on 12 cores). Weights:
+//! SAM's prompt encoder (candle's segment-anything module, candle-transformers, Apache-2.0),
+//! MobileSAM's TinyViT-5M image encoder in [`crate::tiny_vit`] and SAM's mask decoder in
+//! [`crate::sam_decoder`]: the same model re-laid out for a multi-core phone CPU (10× faster
+//! than candle's own encoder and decoder on 12 cores). Weights:
 //! `mobile_sam-tiny-vitt.safetensors`, 40.6 MB F32, the safetensors conversion of the MobileSAM
 //! checkpoint (github.com/ChaoningZhang/MobileSAM, Apache-2.0) published at
 //! huggingface.co/lmz/candle-sam. Public, ungated: the app downloads it (its own TLS stack) and
@@ -18,9 +19,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::segment_anything::mask_decoder::MaskDecoder;
 use candle_transformers::models::segment_anything::prompt_encoder::PromptEncoder;
 use imagelab_api::{ApiError, ApiResult, Ctx, Event};
 use serde_json::{Value, json};
@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::{EmbeddingCache, Encoder};
 use crate::input::Input;
+use crate::sam_decoder::MaskDecoder;
 use crate::segment::{Click, Pred};
 use crate::tiny_vit::TinyViT;
 
@@ -43,8 +44,8 @@ const IMAGE_SIZE: usize = 1024;
 const PATCH: usize = 16;
 const EMBED_DIM: usize = 256;
 /// Low-resolution mask side the decoder outputs (over the padded 1024 square).
-const LOW_RES: usize = 256;
-/// Embeddings kept (each 256×64×64 f32 = 4 MB).
+const LOW_RES: usize = crate::sam_decoder::LOW_RES;
+/// Embeddings kept (each 64×64×256 f32 = 4 MB).
 const CACHE_ENTRIES: usize = 4;
 
 pub fn model_path(root: &Path) -> PathBuf {
@@ -55,7 +56,16 @@ struct Model {
     encoder: TinyViT,
     prompt: PromptEncoder,
     decoder: MaskDecoder,
+    /// SAM's dense positional encoding and the "no mask" dense prompt, pixel-major
+    /// (`4096 × 256`); both constant, so computed once.
+    pe: Tensor,
+    dense: Tensor,
     device: Device,
+}
+
+/// `(1, 256, 64, 64)` → `4096 × 256`.
+fn tokens(t: &Tensor) -> candle_core::Result<Tensor> {
+    t.squeeze(0)?.flatten_from(1)?.t()?.contiguous()
 }
 
 impl Model {
@@ -64,17 +74,22 @@ impl Model {
         let bytes = std::fs::read(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
         let vb = VarBuilder::from_buffered_safetensors(bytes, DType::F32, &device)?;
         let grid = IMAGE_SIZE / PATCH;
+        let prompt = PromptEncoder::new(EMBED_DIM, (grid, grid), (IMAGE_SIZE, IMAGE_SIZE), 16, vb.pp("prompt_encoder"))?;
+        let pe = tokens(&prompt.get_dense_pe()?)?;
+        let (_, dense) = prompt.forward(None, None, None)?;
         Ok(Self {
             encoder: TinyViT::new(vb.pp("image_encoder"))?,
-            prompt: PromptEncoder::new(EMBED_DIM, (grid, grid), (IMAGE_SIZE, IMAGE_SIZE), 16, vb.pp("prompt_encoder"))?,
-            decoder: MaskDecoder::new(EMBED_DIM, 3, 3, 256, vb.pp("mask_decoder"))?,
+            decoder: MaskDecoder::new(vb.pp("mask_decoder"))?,
+            prompt,
+            pe,
+            dense: tokens(&dense)?,
             device,
         })
     }
 
-    /// RGB proxy (`w×h`, both ≤ 1024) → image embedding (1×256×64×64).
+    /// RGB proxy (`w×h`, both ≤ 1024) → image embedding, pixel-major (4096×256).
     fn encode(&self, rgb: &[u8], w: usize, h: usize) -> candle_core::Result<Tensor> {
-        self.encoder.encode(rgb, w, h)
+        self.encoder.encode_tokens(rgb, w, h)
     }
 
     /// Prompts in proxy pixels → the best mask's low-res logits (256², padded square) + IoU.
@@ -94,7 +109,7 @@ impl Model {
         // flattened to (1, 512) instead of (1, 2, 256) (it concatenates rank-2 corner embeddings
         // along dim 1), which the decoder then rejects. Reshape them back: same values, SAM's
         // layout. With both points and a box, the box tokens follow the (padded) point tokens.
-        let (sparse, dense) = match (pts.as_ref(), boxes.as_ref()) {
+        let (sparse, _) = match (pts.as_ref(), boxes.as_ref()) {
             (None, Some(b)) => {
                 let (sp, de) = self.prompt.forward(None, Some(b), None)?;
                 (sp.reshape((1, 2, EMBED_DIM))?, de)
@@ -108,12 +123,7 @@ impl Model {
         };
         // One positive point is ambiguous (part vs whole): ask for three masks, keep the best.
         let multi = rect.is_none() && points.len() == 1;
-        let pe = self.prompt.get_dense_pe()?;
-        let (masks, iou) = self.decoder.forward(emb, &pe, &sparse, &dense, multi)?;
-        let iou: Vec<f32> = iou.flatten_all()?.to_vec1()?;
-        let best = iou.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-        let logits: Vec<f32> = masks.i((0, best))?.flatten_all()?.to_vec1()?;
-        Ok((logits, iou.get(best).copied().unwrap_or(0.0)))
+        self.decoder.forward(emb, &self.pe, &self.dense, &sparse, multi)
     }
 }
 
