@@ -352,11 +352,11 @@ impl Lab {
             .map_err(|_| LabError::Other("rendering panicked".into()))?;
         drop(guard);
         let mut px = img.pixels;
-        for p in px.chunks_exact_mut(4) {
-            let a = u16::from(p[3]);
-            if a < 255 {
-                for c in &mut p[..3] {
-                    *c = ((u16::from(*c) * a + 127) / 255) as u8;
+        for [r, g, b, a] in px.as_chunks_mut::<4>().0 {
+            let alpha = u16::from(*a);
+            if alpha < 255 {
+                for c in [r, g, b] {
+                    *c = ((u16::from(*c) * alpha + 127) / 255) as u8;
                 }
             }
         }
