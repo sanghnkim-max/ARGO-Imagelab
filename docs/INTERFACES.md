@@ -143,8 +143,13 @@ Used wisely:
 * Text concepts other than sky/subject need SAM 3; without it the agent looks at a preview,
   locates the thing and calls `segment.box` (MobileSAM segments it precisely).
 
-Open: MobileSAM encoding on candle's CPU backend is single-threaded-bound (≈3 s on an M2, more on
-a phone CPU); a GPU (wgpu) or NNAPI backend is the next speed step.
+Speed: the TinyViT encoder is ImageLab's own (`imagelab-segment/src/tiny_vit.rs`), same weights and
+output as candle's to 1e-6. Batch norms are folded into the convs, depthwise convs and windowed
+attention are parallel kernels, and bias/GELU/residual run fused after each gemm. On an M2 Pro
+(12 cores) an encode takes 0.23 s, down from 2.4 s with candle's TinyViT; on a one-core emulator
+11 s, down from 75 s (a tap: 1.8 s, down from 3.0 s). A tap (prompt encoder + candle's mask decoder) takes ~80 ms on the M2. Open: port the
+mask decoder the same way (candle's ConvTranspose dominates it); a GPU (wgpu) or NNAPI backend
+after that.
 
 ## 7. `cv`: OpenCV-style, for agents
 

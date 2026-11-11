@@ -2853,6 +2853,7 @@ dependencies = [
  "lightcraft-segment",
  "photocraft-codecs",
  "photocraft-engine",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

@@ -23,6 +23,8 @@ pub mod mobile;
 mod sam;
 pub mod segment;
 pub mod select;
+#[cfg(feature = "mobile-sam")]
+mod tiny_vit;
 
 use std::sync::Arc;
 

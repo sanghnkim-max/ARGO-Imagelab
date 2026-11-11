@@ -1,7 +1,8 @@
 //! MobileSAM: the phone-sized interactive segmenter (feature `mobile-sam`).
 //!
-//! SAM's prompt encoder and mask decoder with MobileSAM's TinyViT-5M image encoder, assembled
-//! from candle's own segment-anything modules (candle-transformers, Apache-2.0). Weights:
+//! SAM's prompt encoder and mask decoder (candle's segment-anything modules, candle-transformers,
+//! Apache-2.0) with MobileSAM's TinyViT-5M image encoder in [`crate::tiny_vit`]: the same model
+//! re-laid out for a multi-core phone CPU (10× faster than candle's own TinyViT on 12 cores). Weights:
 //! `mobile_sam-tiny-vitt.safetensors`, 40.6 MB F32, the safetensors conversion of the MobileSAM
 //! checkpoint (github.com/ChaoningZhang/MobileSAM, Apache-2.0) published at
 //! huggingface.co/lmz/candle-sam. Public, ungated: the app downloads it (its own TLS stack) and
@@ -17,11 +18,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-use candle_core::{DType, Device, IndexOp, Module, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::segment_anything::mask_decoder::MaskDecoder;
 use candle_transformers::models::segment_anything::prompt_encoder::PromptEncoder;
-use candle_transformers::models::segment_anything::tiny_vit::{TinyViT, tiny_vit_5m};
 use imagelab_api::{ApiError, ApiResult, Ctx, Event};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::cache::{EmbeddingCache, Encoder};
 use crate::input::Input;
 use crate::segment::{Click, Pred};
+use crate::tiny_vit::TinyViT;
 
 /// Model id in paths, events and params.
 pub const MODEL: &str = "mobilesam";
@@ -54,8 +55,6 @@ struct Model {
     encoder: TinyViT,
     prompt: PromptEncoder,
     decoder: MaskDecoder,
-    mean: Tensor,
-    std: Tensor,
     device: Device,
 }
 
@@ -66,24 +65,16 @@ impl Model {
         let vb = VarBuilder::from_buffered_safetensors(bytes, DType::F32, &device)?;
         let grid = IMAGE_SIZE / PATCH;
         Ok(Self {
-            encoder: tiny_vit_5m(vb.pp("image_encoder"))?,
+            encoder: TinyViT::new(vb.pp("image_encoder"))?,
             prompt: PromptEncoder::new(EMBED_DIM, (grid, grid), (IMAGE_SIZE, IMAGE_SIZE), 16, vb.pp("prompt_encoder"))?,
             decoder: MaskDecoder::new(EMBED_DIM, 3, 3, 256, vb.pp("mask_decoder"))?,
-            mean: Tensor::new(&[123.675f32, 116.28, 103.53], &device)?.reshape((3, 1, 1))?,
-            std: Tensor::new(&[58.395f32, 57.12, 57.375], &device)?.reshape((3, 1, 1))?,
             device,
         })
     }
 
     /// RGB proxy (`w×h`, both ≤ 1024) → image embedding (1×256×64×64).
     fn encode(&self, rgb: &[u8], w: usize, h: usize) -> candle_core::Result<Tensor> {
-        if w > IMAGE_SIZE || h > IMAGE_SIZE || rgb.len() != w * h * 3 {
-            candle_core::bail!("proxy {w}x{h} does not fit the {IMAGE_SIZE} px encoder");
-        }
-        let img = Tensor::from_slice(rgb, (h, w, 3), &self.device)?.permute((2, 0, 1))?.to_dtype(DType::F32)?;
-        let img = img.broadcast_sub(&self.mean)?.broadcast_div(&self.std)?;
-        let img = img.pad_with_zeros(1, 0, IMAGE_SIZE - h)?.pad_with_zeros(2, 0, IMAGE_SIZE - w)?;
-        self.encoder.forward(&img.unsqueeze(0)?)
+        self.encoder.encode(rgb, w, h)
     }
 
     /// Prompts in proxy pixels → the best mask's low-res logits (256², padded square) + IoU.
@@ -303,3 +294,4 @@ mod tests {
         assert!(positive > LOW_RES * LOW_RES * 9 / 10, "{positive}");
     }
 }
+
