@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "imagelab": {
+      "type": "http",
+      "url": "http://localhost:7700/mcp",
+      "headers": { "Authorization": "Bearer ${IMAGELAB_MCP_TOKEN}" }
+    }
+  }
+}

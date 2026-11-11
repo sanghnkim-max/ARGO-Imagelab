@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["crates/imagelab-core", "crates/imagelab-ffi", "crates/imagelab-cli", "tools/uniffi-bindgen"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.95"
+
+# PhotoCraft is consumed as-is, as Cargo git dependencies: never vendored, never forked (the
+# ARGO-Workspace rule for the craft engines). The rev is pinned here AND in Cargo.lock.
+# Move it with `tools/bump-photocraft.sh <rev>`, which checks the Android build first.
+#
+# Pinned to 20fcb61 (2026-11-11), not main's tip: main at 6d99175 does not compile
+# (photocraft-codecs tiff/decode.rs defines TAG_PREDICTOR and TAG_JPEG_TABLES twice after
+# merging #9781). Move forward once upstream fixes it.
+[workspace.dependencies]
+imagelab-core = { path = "crates/imagelab-core" }
+photocraft-automation = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
+photocraft-engine = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
+photocraft-cli = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528", default-features = false }
+photocraft-codecs = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
+
+# rmcp and tokio at the versions PhotoCraft's own lock resolves (rmcp 3.6), plus the
+# streamable-HTTP server transport, which PhotoCraft's stdio-only server does not enable.
+rmcp = { version = "3.5", default-features = false, features = ["server", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uniffi = { version = "0.31", features = ["tokio"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+# Shipped in the APK. Unwinding stays on: the FFI turns a panic in a command into an error.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# PhotoCraft's own [patch.crates-io] does not travel with a git dependency, so it is repeated
+# here for the crates this build actually links (craft-pdf's vendored Hayro trees). Keep the
+# rev equal to PhotoCraft's Cargo.toml at the pinned commit.
+[patch.crates-io]
+hayro = { git = "https://github.com/storytold/craft-libs", rev = "1b34eba41e62138fc2438d2734523b302840b45d" }
+hayro-syntax = { git = "https://github.com/storytold/craft-libs", rev = "1b34eba41e62138fc2438d2734523b302840b45d" }
+hayro-interpret = { git = "https://github.com/storytold/craft-libs", rev = "1b34eba41e62138fc2438d2734523b302840b45d" }
+hayro-jbig2 = { git = "https://github.com/storytold/craft-libs", rev = "1b34eba41e62138fc2438d2734523b302840b45d" }

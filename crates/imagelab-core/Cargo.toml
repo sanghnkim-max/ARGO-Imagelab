@@ -1,0 +1,32 @@
+[package]
+name = "imagelab-core"
+description = "ImageLab's core: one PhotoCraft session shared by the app UI, the in-app agent, the MCP server and the CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["gpu"]
+# PhotoCraft's wgpu renderer (Vulkan on Android, Metal on macOS) for full-size previews and
+# flat exports. Off, everything renders on the CPU compositor.
+gpu = ["photocraft-automation/gpu"]
+
+[lints]
+workspace = true
+
+[dependencies]
+photocraft-automation = { workspace = true }
+photocraft-engine = { workspace = true }
+photocraft-cli = { workspace = true }
+photocraft-io = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tokio-util = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
