@@ -11,7 +11,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use imagelab_core::imagelab_api::{ApiError, Event, EventSink, Source};
 use imagelab_core::{Lab, LabError, LabOptions};
 use serde_json::Value;
 
@@ -31,9 +33,66 @@ impl From<LabError> for ImageLabError {
     fn from(e: LabError) -> Self {
         match e {
             LabError::BadRequest(reason) => ImageLabError::BadRequest { reason },
+            LabError::Api(api) => api.into(),
             other => ImageLabError::Failed { reason: other.to_string() },
         }
     }
+}
+
+/// Registry errors keep their stable code at the front of `reason` (`read_only: ...`).
+impl From<ApiError> for ImageLabError {
+    fn from(e: ApiError) -> Self {
+        let reason = e.to_string();
+        match e.code.as_str() {
+            "bad_params" | "not_found" | "read_only" | "too_large" => ImageLabError::BadRequest { reason },
+            _ => ImageLabError::Failed { reason },
+        }
+    }
+}
+
+fn parse_source(source: &str) -> Result<Source> {
+    match source.trim().to_ascii_lowercase().as_str() {
+        "" | "ui" => Ok(Source::Ui),
+        "agent" => Ok(Source::Agent),
+        "mcp" => Ok(Source::Mcp),
+        "cli" => Ok(Source::Cli),
+        other => Err(ImageLabError::BadRequest { reason: format!("unknown source `{other}` (ui, agent, mcp, cli)") }),
+    }
+}
+
+/// Receives core events (docs/INTERFACES.md §5) as JSON, e.g.
+/// `{"type":"docChanged","doc":0,"revision":7,"source":"agent"}`. Called off the main thread.
+#[uniffi::export(callback_interface)]
+pub trait EventListener: Send + Sync {
+    fn on_event(&self, event_json: String);
+}
+
+struct ListenerSink(Box<dyn EventListener>);
+
+impl EventSink for ListenerSink {
+    fn emit(&self, event: Event) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            self.0.on_event(json);
+        }
+    }
+}
+
+/// One image a script returned (`{image: "img:N"}` in its value).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ScriptImage {
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// What a `lab_script` / `lab_read` program produced. `value_json` is `null` when `error` is
+/// set; `error` is `"<code>: <message>"` (codes: syntax, exception, timeout, cancelled,
+/// read_only, ...). `images[k]` is the one whose object in the value has `attached: k`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ScriptResult {
+    pub value_json: String,
+    pub logs: Vec<String>,
+    pub images: Vec<ScriptImage>,
+    pub error: Option<String>,
 }
 
 type Result<T> = std::result::Result<T, ImageLabError>;
@@ -75,6 +134,52 @@ impl ImageLab {
 
     pub fn workspace_root(&self) -> String {
         self.lab.root().display().to_string()
+    }
+
+    // ------------------------------------------------------------ registry and scripts
+
+    /// `Registry::call("area.name", params)`; `source` is `ui`, `agent`, `mcp` or `cli`.
+    pub fn call(&self, id: String, params_json: String, source: String) -> Result<String> {
+        let source = parse_source(&source)?;
+        Ok(text(&self.lab.call(&id, parse(&params_json)?, source)?))
+    }
+
+    /// Areas and function names (no area), or one area's / function's full entries.
+    pub fn help(&self, area: Option<String>) -> Result<String> {
+        Ok(text(&self.lab.help(area.as_deref().filter(|a| !a.trim().is_empty()))?))
+    }
+
+    /// One line per area (for the agent's tool description).
+    pub fn areas_summary(&self) -> String {
+        self.lab.areas_summary()
+    }
+
+    /// Run a program as the in-app agent: `lab_script` (`read_only` false) or `lab_read`.
+    /// `timeout_ms` 0 means the default (120 s); capped at 30 min. Never throws.
+    pub fn run_script(&self, code: String, read_only: bool, timeout_ms: u64) -> ScriptResult {
+        let outcome = self.lab.run_script(&code, read_only, Duration::from_millis(timeout_ms));
+        ScriptResult {
+            value_json: text(&outcome.value),
+            logs: outcome.logs,
+            images: outcome.images.into_iter().map(|i| ScriptImage { mime: i.mime, bytes: i.bytes }).collect(),
+            error: outcome.error.map(|e| e.to_string()),
+        }
+    }
+
+    /// Cancel every running script (they finish with error `cancelled: ...`).
+    pub fn cancel_scripts(&self) {
+        self.lab.cancel_scripts();
+    }
+
+    /// Where core events go from now on (replaces the previous listener).
+    pub fn set_event_listener(&self, listener: Box<dyn EventListener>) {
+        self.lab.set_event_sink(Arc::new(ListenerSink(listener)));
+    }
+
+    /// PNG of an `img:N` / `mask:N` handle (masks grayscale), longest side at most `max_side`
+    /// (0: full size). For selection overlays.
+    pub fn render_handle(&self, handle: String, max_side: u32) -> Result<Vec<u8>> {
+        Ok(self.lab.render_handle(&handle, max_side)?)
     }
 
     // ------------------------------------------------------------ documents
@@ -159,9 +264,17 @@ impl ImageLab {
         Ok(text(&self.lab.mcp_request(&method, parse(&params_json)?)?))
     }
 
-    /// Serve MCP over HTTP at 127.0.0.1:`port`/mcp with a bearer token. Returns the port.
-    pub fn start_mcp_http(&self, port: u16, token: String) -> Result<u16> {
-        Ok(self.lab.start_http(port, &token)?)
+    /// One MCP request to ImageLab's own server (`lab_script`, `lab_read`, `lab_help`),
+    /// in-process with edits allowed: returns the JSON `result`.
+    pub fn lab_mcp_request(&self, method: String, params_json: String) -> Result<String> {
+        Ok(text(&self.lab.lab_mcp_request(&method, parse(&params_json)?)?))
+    }
+
+    /// Serve MCP over HTTP on 127.0.0.1:`port` with a bearer token: ImageLab's tools at `/mcp`,
+    /// PhotoCraft's at `/photocraft/mcp`. Without `allow_edits` only `lab_read`/`lab_help`
+    /// are served. Returns the port.
+    pub fn start_mcp_http(&self, port: u16, token: String, allow_edits: bool) -> Result<u16> {
+        Ok(self.lab.start_http(port, &token, allow_edits)?)
     }
 
     pub fn stop_mcp_http(&self) {

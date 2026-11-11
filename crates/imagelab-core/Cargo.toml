@@ -16,11 +16,18 @@ gpu = ["photocraft-automation/gpu"]
 workspace = true
 
 [dependencies]
+imagelab-api = { workspace = true }
+imagelab-script = { workspace = true }
+imagelab-library = { workspace = true }
+imagelab-cv = { workspace = true }
+imagelab-segment = { workspace = true }
+imagelab-edit = { workspace = true }
+base64 = "0.22"
 photocraft-automation = { workspace = true }
 photocraft-engine = { workspace = true }
 photocraft-cli = { workspace = true }
 photocraft-io = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
-rmcp = { workspace = true }
+rmcp = { workspace = true, features = ["transport-async-rw"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 tokio-util = "0.7"

@@ -1,0 +1,195 @@
+//! The part of the core every surface shares: registry + shared state, the swappable event
+//! sink, `DocChanged` detection, running scripts and their cancel flags.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::time::Duration;
+
+use imagelab_api::{ApiResult, Ctx, Event, EventSink, NoEvents, Registry, Shared, Source};
+use imagelab_script::{Budget, ScriptOutcome, ScriptRuntime};
+use serde_json::Value;
+
+/// How often the watcher looks for edits made through PhotoCraft's HTTP MCP endpoint.
+const WATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// An [`EventSink`] whose target can be replaced at any time (the FFI installs the Kotlin
+/// listener after the core exists). A sink that panics loses that event, nothing more.
+pub(crate) struct ForwardingSink {
+    inner: RwLock<Arc<dyn EventSink>>,
+}
+
+impl Default for ForwardingSink {
+    fn default() -> Self {
+        Self { inner: RwLock::new(Arc::new(NoEvents)) }
+    }
+}
+
+impl ForwardingSink {
+    pub(crate) fn set(&self, sink: Arc<dyn EventSink>) {
+        *self.inner.write().unwrap_or_else(PoisonError::into_inner) = sink;
+    }
+}
+
+impl EventSink for ForwardingSink {
+    fn emit(&self, event: Event) {
+        let sink = self.inner.read().unwrap_or_else(PoisonError::into_inner).clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.emit(event)));
+    }
+}
+
+/// Decrements the in-flight counter when dropped.
+pub(crate) struct Busy<'a>(&'a AtomicUsize);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) struct Core {
+    pub registry: Registry,
+    pub shared: Shared,
+    pub sink: Arc<ForwardingSink>,
+    /// The active document and its revision as last reported (`None`: nothing seen yet or
+    /// no document open).
+    seen: Mutex<Option<(usize, u64)>>,
+    /// Calls in flight inside the core; the watcher stays quiet while any run, so an edit is
+    /// attributed to the surface that made it.
+    in_flight: AtomicUsize,
+    /// Cancel flags of the scripts running now.
+    running: Mutex<Vec<Arc<AtomicBool>>>,
+}
+
+impl Core {
+    pub(crate) fn new(registry: Registry, shared: Shared, sink: Arc<ForwardingSink>) -> Self {
+        let core = Self { registry, shared, sink, seen: Mutex::new(None), in_flight: AtomicUsize::new(0), running: Mutex::new(Vec::new()) };
+        // Start from the current state, so the first event is a real change.
+        let current = core.current();
+        *core.seen.lock().unwrap_or_else(PoisonError::into_inner) = current;
+        core
+    }
+
+    pub(crate) fn busy(&self) -> Busy<'_> {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        Busy(&self.in_flight)
+    }
+
+    pub(crate) fn call(&self, id: &str, params: Value, source: Source) -> ApiResult<Value> {
+        let _busy = self.busy();
+        let ctx = Ctx::new(self.shared.clone(), source);
+        let result = self.registry.call(&ctx, id, params);
+        self.notice(source);
+        result
+    }
+
+    pub(crate) fn run_script(&self, code: &str, read_only: bool, timeout: Duration, source: Source, cancel: Arc<AtomicBool>) -> ScriptOutcome {
+        let _busy = self.busy();
+        let mut ctx = Ctx::new(self.shared.clone(), source);
+        ctx.cancel = cancel.clone();
+        if read_only {
+            ctx = ctx.read_only();
+        }
+        self.running.lock().unwrap_or_else(PoisonError::into_inner).push(cancel.clone());
+        let outcome = ScriptRuntime::run(&self.registry, &ctx, code, Budget::with_wall(timeout));
+        self.running.lock().unwrap_or_else(PoisonError::into_inner).retain(|c| !Arc::ptr_eq(c, &cancel));
+        self.notice(source);
+        outcome
+    }
+
+    pub(crate) fn cancel_scripts(&self) {
+        for flag in self.running.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The active document and its revision, from PhotoCraft's `session_list`.
+    fn current(&self) -> Option<(usize, u64)> {
+        let list = self.shared.session.lock().unwrap_or_else(PoisonError::into_inner).session_list();
+        active_revision(&list)
+    }
+
+    /// Emit `DocChanged` attributed to `source` if the active document or its revision moved.
+    pub(crate) fn notice(&self, source: Source) {
+        let current = self.current();
+        self.report(current, source);
+    }
+
+    /// [`Core::notice`] that gives up when the session is busy (the watcher).
+    fn try_notice(&self, source: Source) {
+        let current = match self.shared.session.try_lock() {
+            Ok(guard) => active_revision(&guard.session_list()),
+            Err(_) => return,
+        };
+        self.report(current, source);
+    }
+
+    fn report(&self, current: Option<(usize, u64)>, source: Source) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if *seen == current {
+            return;
+        }
+        *seen = current;
+        drop(seen);
+        let (doc, revision) = current.unwrap_or((0, 0));
+        self.shared.events.emit(Event::DocChanged { doc, revision, source });
+    }
+}
+
+fn active_revision(list: &Value) -> Option<(usize, u64)> {
+    let active = usize::try_from(list.get("active")?.as_u64()?).ok()?;
+    let doc = list.get("documents")?.as_array()?.get(active)?;
+    Some((active, doc.get("revision")?.as_u64()?))
+}
+
+/// Notices edits that arrive through PhotoCraft's HTTP MCP endpoint (they bypass the core).
+/// Runs only while the HTTP server does.
+pub(crate) struct Watcher {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watcher {
+    pub(crate) fn start(core: Weak<Core>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("imagelab-watch".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(WATCH_INTERVAL);
+                    let Some(core) = core.upgrade() else { break };
+                    if core.in_flight.load(Ordering::Acquire) == 0 {
+                        core.try_notice(Source::Mcp);
+                    }
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+
+    pub(crate) fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_the_active_revision() {
+        let list = json!({"active": 1, "documents": [{"revision": 3}, {"revision": 9}]});
+        assert_eq!(active_revision(&list), Some((1, 9)));
+        assert_eq!(active_revision(&json!({"active": null, "documents": []})), None);
+    }
+}
