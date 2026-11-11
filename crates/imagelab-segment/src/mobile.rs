@@ -61,6 +61,17 @@ struct Model {
     pe: Tensor,
     dense: Tensor,
     device: Device,
+    /// The encoder on the GPU, when enabled and working; `None` runs it on the CPU.
+    #[cfg(feature = "mobile-sam-gpu")]
+    gpu: Option<crate::tiny_vit::gpu::GpuTinyViT>,
+    /// Which encoder runs, and why the GPU does not when it does not.
+    backend: String,
+}
+
+/// The GPU encoder is opt-in (`IMAGELAB_MOBILESAM_GPU=1`) until it has run on more phones.
+#[cfg(feature = "mobile-sam-gpu")]
+fn gpu_wanted() -> bool {
+    std::env::var("IMAGELAB_MOBILESAM_GPU").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
 }
 
 /// `(1, 256, 64, 64)` → `4096 × 256`.
@@ -77,18 +88,48 @@ impl Model {
         let prompt = PromptEncoder::new(EMBED_DIM, (grid, grid), (IMAGE_SIZE, IMAGE_SIZE), 16, vb.pp("prompt_encoder"))?;
         let pe = tokens(&prompt.get_dense_pe()?)?;
         let (_, dense) = prompt.forward(None, None, None)?;
+        let encoder = TinyViT::new(vb.pp("image_encoder"))?;
+        #[cfg(feature = "mobile-sam-gpu")]
+        let (gpu, backend) = if gpu_wanted() {
+            // A driver bug must not take the app down: a panic here means "no GPU".
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::tiny_vit::gpu::GpuTinyViT::new(&encoder))) {
+                Ok(Ok(g)) => {
+                    let name = format!("gpu: {}", g.adapter());
+                    (Some(g), name)
+                }
+                Ok(Err(e)) => (None, format!("cpu ({e})")),
+                Err(_) => (None, "cpu (the GPU encoder panicked while starting)".to_string()),
+            }
+        } else {
+            (None, "cpu".to_string())
+        };
+        #[cfg(not(feature = "mobile-sam-gpu"))]
+        let backend = "cpu".to_string();
         Ok(Self {
-            encoder: TinyViT::new(vb.pp("image_encoder"))?,
+            encoder,
             decoder: MaskDecoder::new(vb.pp("mask_decoder"))?,
             prompt,
             pe,
             dense: tokens(&dense)?,
             device,
+            #[cfg(feature = "mobile-sam-gpu")]
+            gpu,
+            backend,
         })
     }
 
-    /// RGB proxy (`w×h`, both ≤ 1024) → image embedding, pixel-major (4096×256).
-    fn encode(&self, rgb: &[u8], w: usize, h: usize) -> candle_core::Result<Tensor> {
+    /// RGB proxy (`w×h`, both ≤ 1024) → image embedding, pixel-major (4096×256). On the GPU
+    /// when there is one; a GPU failure switches this model to the CPU for good and retries.
+    fn encode(&mut self, rgb: &[u8], w: usize, h: usize) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "mobile-sam-gpu")]
+        if let Some(g) = &self.gpu {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.encode_tokens(rgb, w, h))) {
+                Ok(Ok(t)) => return Ok(t),
+                Ok(Err(e)) => self.backend = format!("cpu (GPU failed: {e})"),
+                Err(_) => self.backend = "cpu (the GPU encoder panicked)".to_string(),
+            }
+            self.gpu = None;
+        }
         self.encoder.encode_tokens(rgb, w, h)
     }
 
@@ -127,7 +168,7 @@ impl Model {
     }
 }
 
-struct ModelEncoder<'a>(&'a Model);
+struct ModelEncoder<'a>(&'a mut Model);
 impl Encoder for ModelEncoder<'_> {
     type Embedding = Tensor;
     fn encode(&mut self, rgb: &[u8], w: usize, h: usize) -> Result<Tensor, String> {
@@ -195,7 +236,7 @@ impl MobileSam {
             g.model = Some(Model::load(&path).map_err(|e| format!("loading MobileSAM: {e}"))?);
         }
         let Engine { model, cache } = &mut *g;
-        let model = model.as_ref().ok_or_else(|| "MobileSAM did not load".to_string())?;
+        let model = model.as_mut().ok_or_else(|| "MobileSAM did not load".to_string())?;
         let (pw, ph) = (input.pw as usize, input.ph as usize);
         let (emb, cached) = cache.get_or_encode_similar(&mut ModelEncoder(model), &input.rgb, pw, ph)?;
         let points: Vec<(f32, f32, bool)> = clicks.iter().map(|c| (c.x * pw as f32, c.y * ph as f32, c.positive)).collect();
@@ -215,7 +256,7 @@ impl MobileSam {
             g.model = Some(Model::load(&model_path(root)).map_err(|e| format!("loading MobileSAM: {e}"))?);
         }
         let Engine { model, cache } = &mut *g;
-        let model = model.as_ref().ok_or_else(|| "MobileSAM did not load".to_string())?;
+        let model = model.as_mut().ok_or_else(|| "MobileSAM did not load".to_string())?;
         let (_, cached) = cache.get_or_encode_similar(&mut ModelEncoder(model), &input.rgb, input.pw as usize, input.ph as usize)?;
         Ok(cached)
     }
@@ -223,6 +264,12 @@ impl MobileSam {
     pub fn loaded(&self) -> (bool, usize) {
         let g = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
         (g.model.is_some(), g.cache.len())
+    }
+
+    /// Which encoder the loaded model runs ("gpu: <adapter>" or "cpu (why)"); `None` before load.
+    fn backend(&self) -> Option<String> {
+        let g = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
+        g.model.as_ref().map(|m| m.backend.clone())
     }
 
     pub fn unload(&self) -> bool {
@@ -245,6 +292,7 @@ impl MobileSam {
             "licence": LICENCE,
             "loaded": loaded,
             "cachedEmbeddings": cached,
+            "encoder": self.backend(),
         })
     }
 

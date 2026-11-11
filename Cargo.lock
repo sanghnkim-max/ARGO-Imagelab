@@ -2846,6 +2846,7 @@ dependencies = [
 name = "imagelab-segment"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "candle-core",
  "candle-nn",
  "candle-transformers",
@@ -2853,11 +2854,13 @@ dependencies = [
  "lightcraft-segment",
  "photocraft-codecs",
  "photocraft-engine",
+ "pollster",
  "rayon",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "wgpu",
 ]
 
 [[package]]

@@ -22,6 +22,9 @@ use candle_core::{CpuStorage, D, DType, Device, IndexOp, Result, Storage, Tensor
 use candle_nn::VarBuilder;
 use rayon::prelude::*;
 
+#[cfg(feature = "mobile-sam-gpu")]
+pub(crate) mod gpu;
+
 /// Encoder input side (the proxy is padded to this square).
 pub const IMG: usize = 1024;
 /// Embedding grid side (`IMG / 16`).
@@ -530,6 +533,20 @@ struct Stage {
     down: Option<PatchMerging>,
 }
 
+/// The proxy normalised by SAM's mean/std and zero-padded at the bottom/right to the
+/// encoder's square, NHWC (`IMG × IMG × 3`).
+fn normalized_input(rgb: &[u8], w: usize, h: usize) -> Vec<f32> {
+    let mut input = vec![0f32; IMG * IMG * 3];
+    input.par_chunks_mut(IMG * 3).take(h).enumerate().for_each(|(y, row)| {
+        for (x, px) in row.chunks_mut(3).take(w).enumerate() {
+            for c in 0..3 {
+                px[c] = (f32::from(rgb[(y * w + x) * 3 + c]) - MEAN[c]) / STD[c];
+            }
+        }
+    });
+    input
+}
+
 /// MobileSAM's image encoder: an RGB proxy → the 1×256×64×64 image embedding.
 pub struct TinyViT {
     embed1: Dense,
@@ -601,14 +618,7 @@ impl TinyViT {
         if w > IMG || h > IMG || rgb.len() != w * h * 3 {
             bail!("proxy {w}x{h} does not fit the {IMG} px encoder");
         }
-        let mut input = vec![0f32; IMG * IMG * 3];
-        input.par_chunks_mut(IMG * 3).take(h).enumerate().for_each(|(y, row)| {
-            for (x, px) in row.chunks_mut(3).take(w).enumerate() {
-                for c in 0..3 {
-                    px[c] = (f32::from(rgb[(y * w + x) * 3 + c]) - MEAN[c]) / STD[c];
-                }
-            }
-        });
+        let input = normalized_input(rgb, w, h);
         let (x, h, w) = self.embed1.forward(&input, IMG, IMG, true)?;
         let (x, h, w) = with_f32(&x, |v| self.embed2.forward(v, h, w, false))?;
         let mut x = x;

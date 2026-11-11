@@ -7,13 +7,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["sam3", "mobile-sam"]
+default = ["sam3", "mobile-sam", "mobile-sam-gpu"]
 # SAM 3 inference (LightCraft's pure-Rust candle port) and its model downloader. Off, every
 # segment.* call answers with PhotoCraft's selections ("engine": "photocraft").
 sam3 = ["dep:lightcraft-segment", "dep:candle-core", "dep:sha2"]
 # MobileSAM (TinyViT encoder, ~10M params, 40.6 MB weights, Apache-2.0) on candle's own
 # segment-anything implementation: the phone-sized interactive segmenter for points and boxes.
 mobile-sam = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:sha2", "dep:rayon"]
+# MobileSAM's encoder on the GPU through wgpu compute (Vulkan on Android, Metal on macOS), the
+# same wgpu PhotoCraft renders with; the CPU encoder stays the fallback.
+mobile-sam-gpu = ["mobile-sam", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [lints]
 workspace = true
@@ -31,9 +34,17 @@ candle-core = { version = "=0.9.2", default-features = false, optional = true }
 candle-nn = { version = "=0.9.2", default-features = false, optional = true }
 candle-transformers = { version = "=0.9.2", default-features = false, optional = true }
 # Verifies a model file the app downloaded itself (segment.installModel); already in the tree via lightcraft-fetch.
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "vulkan", "metal"], optional = true }
+pollster = { version = "1", optional = true }
+bytemuck = { version = "1", optional = true }
 # The encoder's parallel kernels (src/tiny_vit.rs); the same pool candle's gemm uses.
 rayon = { version = "1", optional = true }
 sha2 = { version = "0.10", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+
+[[example]]
+name = "gpu_gemm"
+required-features = ["mobile-sam-gpu"]
