@@ -113,6 +113,7 @@ class Agent(private val lab: Lab, private val settings: Settings) {
         val photos = _context.value
         _context.value = emptyList()
         add(ChatItem.User(text, photos))
+        val historyMark = history.size
         try {
             val key = withContext(Dispatchers.IO) { settings.apiKey }
             if (key.isBlank()) {
@@ -131,6 +132,9 @@ class Agent(private val lab: Lab, private val settings: Settings) {
                 }
             }
         } catch (t: Throwable) {
+            // Drop the failed turn so a retry does not leave an unanswered user message (or a
+            // tool_use without its result) in the conversation.
+            while (history.size > historyMark) history.removeAt(history.lastIndex)
             add(ChatItem.Notice("Error: ${t.message ?: t.javaClass.simpleName}"))
         } finally {
             _running.value = false

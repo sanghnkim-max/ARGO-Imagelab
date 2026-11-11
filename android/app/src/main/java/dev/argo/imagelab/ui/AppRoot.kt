@@ -16,12 +16,15 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.window.layout.WindowLayoutInfo
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import dev.argo.imagelab.ImageLabApp
 
 /**
@@ -34,12 +37,13 @@ import dev.argo.imagelab.ImageLabApp
 fun AppRoot(app: ImageLabApp, model: AppViewModel, windowInfo: WindowLayoutInfo?, onOpenUri: (Uri) -> Unit) {
     val layout = currentWindowLayout(windowInfo)
     val snackbar = remember { SnackbarHostState() }
-    val labState by app.lab.state.collectAsState()
 
-    LaunchedEffect(labState.message) {
-        val msg = labState.message ?: return@LaunchedEffect
-        app.lab.clearMessage()
-        snackbar.showSnackbar(msg, withDismissAction = true)
+    // Core errors and notices → snackbars (queued; clearing the message never cancels one).
+    LaunchedEffect(Unit) {
+        app.lab.state.map { it.message }.distinctUntilChanged().filterNotNull().collect { msg ->
+            app.lab.clearMessage()
+            launch { snackbar.showSnackbar(msg, withDismissAction = true) }
+        }
     }
     BackHandler(enabled = model.canGoBack) { model.back() }
 

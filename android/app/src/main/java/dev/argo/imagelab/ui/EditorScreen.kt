@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -164,25 +165,27 @@ fun EditorScreen(
                 }
                 ToolBar(vm)
             }
-            else -> Row(Modifier.fillMaxSize().safeDrawingPadding()) {
-                ToolRail(vm)
-                Column(Modifier.weight(1f).fillMaxHeight()) {
-                    topBar()
-                    Row(Modifier.weight(1f)) {
-                        canvasArea(Modifier.weight(1f).fillMaxHeight(), !layout.expanded)
-                        if (layout.expanded && state.documents > 0) {
-                            VerticalDivider()
-                            LayersColumn(state, vm, Modifier.width(200.dp).fillMaxHeight())
-                        }
+            else -> Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+                val paneOpen = agentPane != null || vm.tool != null
+                // The layers column only when the canvas keeps room beside the right pane.
+                val layersColumn = layout.expanded && state.documents > 0 && (!paneOpen || layout.widthDp >= 1200f)
+                val paneWidth = if (layout.expanded) 360.dp else 300.dp
+                // The top bar spans the window: beside a rail and a pane the canvas column is too narrow for it.
+                topBar()
+                Row(Modifier.weight(1f).fillMaxWidth()) {
+                    ToolRail(vm)
+                    canvasArea(Modifier.weight(1f).fillMaxHeight(), !layersColumn)
+                    if (layersColumn) {
+                        VerticalDivider()
+                        LayersColumn(state, vm, Modifier.width(200.dp).fillMaxHeight())
                     }
-                }
-                val paneWidth = if (layout.expanded) 380.dp else 320.dp
-                if (agentPane != null) {
-                    VerticalDivider()
-                    agentPane(Modifier.width(paneWidth).fillMaxHeight())
-                } else if (vm.tool != null) {
-                    VerticalDivider()
-                    sheet(Modifier.width(paneWidth).fillMaxHeight())
+                    if (agentPane != null) {
+                        VerticalDivider()
+                        agentPane(Modifier.width(paneWidth).fillMaxHeight())
+                    } else if (vm.tool != null) {
+                        VerticalDivider()
+                        sheet(Modifier.width(paneWidth).fillMaxHeight())
+                    }
                 }
             }
         }
@@ -198,7 +201,7 @@ private fun EditorTopBar(state: EditorState, agentOpen: Boolean, vm: EditorViewM
         SymButton(Sym.home, "Library", onHome)
         Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
             Text(state.name ?: "ImageLab", style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (hasDoc) Text("${state.width}×${state.height}", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+            if (hasDoc) Text("${state.width}×${state.height}", style = MaterialTheme.typography.labelSmall, color = Color.Gray, maxLines = 1)
         }
         if (state.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
         SymButton(Sym.undo, "Undo", { vm.undo() }, enabled = hasDoc)
@@ -446,7 +449,7 @@ private fun toolIcon(t: Tool) = when (t) {
 
 @Composable
 private fun ToolBar(vm: EditorViewModel) {
-    NavigationBar(Modifier.height(72.dp)) {
+    NavigationBar(Modifier.height(72.dp), windowInsets = WindowInsets(0.dp)) {
         Tool.entries.forEach { t ->
             NavigationBarItem(
                 selected = vm.tool == t,
@@ -460,7 +463,7 @@ private fun ToolBar(vm: EditorViewModel) {
 
 @Composable
 private fun ToolRail(vm: EditorViewModel) {
-    NavigationRail {
+    NavigationRail(windowInsets = WindowInsets(0.dp)) {
         Spacer(Modifier.height(8.dp))
         Tool.entries.forEach { t ->
             NavigationRailItem(
