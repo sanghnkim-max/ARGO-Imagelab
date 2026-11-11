@@ -323,13 +323,21 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                 translationY = vm.offset.y
             }
             // While a slider moves, the GPU draws the change the engine has not rendered yet.
-            Image(
-                bitmap = preview.asImageBitmap(),
-                contentDescription = "Document preview",
-                contentScale = ContentScale.Fit,
-                colorFilter = vm.live.matrix?.let { androidx.compose.ui.graphics.ColorFilter.colorMatrix(it) },
-                modifier = transform,
-            )
+            // Straightening rotates the frame inside the photo's own rectangle (clipped), so the
+            // drag shows exactly what the crop will keep.
+            Box(transform.graphicsLayer { clip = vm.straightener.active; shape = FitRect(preview.width, preview.height) }) {
+                Image(
+                    bitmap = preview.asImageBitmap(),
+                    contentDescription = "Document preview",
+                    contentScale = ContentScale.Fit,
+                    colorFilter = vm.live.matrix?.let { androidx.compose.ui.graphics.ColorFilter.colorMatrix(it) },
+                    modifier = Modifier.fillMaxSize().graphicsLayer {
+                        rotationZ = vm.straightener.rotation
+                        scaleX = vm.straightener.zoom
+                        scaleY = vm.straightener.zoom
+                    },
+                )
+            }
             vm.selection?.overlay?.let { ov ->
                 Image(bitmap = ov.asImageBitmap(), contentDescription = "Selection mask", contentScale = ContentScale.Fit, modifier = transform)
             }
@@ -337,6 +345,14 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
         Canvas(Modifier.fillMaxSize()) {
             draft?.let { (a, b) ->
                 drawRect(Accent, topLeft = Offset(minOf(a.x, b.x), minOf(a.y, b.y)), size = Size(kotlin.math.abs(b.x - a.x), kotlin.math.abs(b.y - a.y)), style = Stroke(2.dp.toPx()))
+            }
+            // A rule-of-thirds-and-finer grid while straightening, to line up horizons.
+            if (vm.straightener.active) {
+                val step = size.minDimension / 8f
+                var x = step
+                while (x < size.width) { drawLine(Color.White.copy(alpha = 0.25f), Offset(x, 0f), Offset(x, size.height), 1f); x += step }
+                var y = step
+                while (y < size.height) { drawLine(Color.White.copy(alpha = 0.25f), Offset(0f, y), Offset(size.width, y), 1f); y += step }
             }
             hover?.let { drawCircle(Color.White.copy(alpha = 0.8f), radius = 14.dp.toPx(), center = it, style = Stroke(1.5.dp.toPx())) }
         }
@@ -488,5 +504,18 @@ private fun ToolRail(vm: EditorViewModel) {
                 label = { Text(t.label) },
             )
         }
+    }
+}
+
+
+/** The rectangle a `w×h` bitmap occupies under ContentScale.Fit, centred: the clip while straightening. */
+private class FitRect(private val w: Int, private val h: Int) : androidx.compose.ui.graphics.Shape {
+    override fun createOutline(size: Size, layoutDirection: androidx.compose.ui.unit.LayoutDirection, density: androidx.compose.ui.unit.Density): androidx.compose.ui.graphics.Outline {
+        if (w <= 0 || h <= 0) return androidx.compose.ui.graphics.Outline.Rectangle(androidx.compose.ui.geometry.Rect(Offset.Zero, size))
+        val fit = minOf(size.width / w, size.height / h)
+        val (dw, dh) = w * fit to h * fit
+        val left = (size.width - dw) / 2f
+        val top = (size.height - dh) / 2f
+        return androidx.compose.ui.graphics.Outline.Rectangle(androidx.compose.ui.geometry.Rect(left, top, left + dw, top + dh))
     }
 }

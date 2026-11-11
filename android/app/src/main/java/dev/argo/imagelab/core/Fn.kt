@@ -18,6 +18,7 @@ object Fn {
     /** `{id, params}`: one allowlisted PhotoCraft engine command. Masked edits load the mask as the selection first ([SELECT_FROM_MASK]). */
     const val EDIT_RUN = "edit.run"
     const val EDIT_ADJUST = "edit.adjust"
+    const val EDIT_STRAIGHTEN = "edit.straighten"
 
     const val SELECT_SUBJECT = "select.subject"
     const val SELECT_SKY = "select.sky"

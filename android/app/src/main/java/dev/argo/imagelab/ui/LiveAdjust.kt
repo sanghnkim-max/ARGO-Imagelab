@@ -175,3 +175,113 @@ class LiveAdjust(private val lab: Lab, scope: CoroutineScope, private val maskFo
         }
     }
 }
+
+/**
+ * Live straighten: the photo rotates with the Crop sheet's slider.
+ *
+ * * Every value change rotates the displayed frame at once on the GPU ([rotation]), zoomed
+ *   ([zoom]) just enough to hide the corners — what `edit.straighten`'s crop keeps.
+ * * The engine follows with the newest angle (`edit.straighten {angle, crop: true}`: rotate +
+ *   crop to the largest inscribed rectangle, two undo steps), replacing its previous attempt in
+ *   the same drag, then an interactive render replaces the frame.
+ * * Dragging again re-adjusts the same straighten (its steps are undone first) as long as
+ *   nothing else edited the document in between; [done] starts a new one.
+ */
+class LiveStraighten(private val lab: Lab, scope: CoroutineScope) {
+    /** Degrees (clockwise) the displayed frame is rotated beyond what the engine rendered. */
+    var rotation by mutableStateOf(0f); private set
+    /** Extra scale that hides the rotated frame's corners. */
+    var zoom by mutableStateOf(1f); private set
+    /** True while straightening (the canvas draws a grid). */
+    var active by mutableStateOf(false); private set
+
+    private sealed interface Msg {
+        data class Angle(val angle: Float) : Msg
+        data object Release : Msg
+    }
+
+    private val inbox = Channel<Msg>(Channel.UNLIMITED)
+
+    // Engine-side (worker only): steps our current straighten made, and the document revision
+    // right after them (another edit since → start a new straighten instead of replacing).
+    private var steps = 0
+    private var revisionAfter: Long? = null
+
+    @Volatile private var rendered = 0f
+    @Volatile private var target = 0f
+
+    init {
+        scope.launch {
+            while (true) {
+                var msg = inbox.receive()
+                var release = msg is Msg.Release
+                while (true) {
+                    val next = inbox.tryReceive().getOrNull() ?: break
+                    if (next is Msg.Release) release = true else msg = next
+                }
+                if (msg is Msg.Angle) apply(msg.angle)
+                if (release && inbox.isEmpty) {
+                    active = false
+                    lab.requestRefresh()
+                }
+            }
+        }
+    }
+
+    fun drag(angle: Float) {
+        active = true
+        target = angle
+        setDelta(angle - rendered)
+        lab.markInteractive()
+        inbox.trySend(Msg.Angle(angle))
+    }
+
+    fun release() {
+        inbox.trySend(Msg.Release)
+    }
+
+    /** Keep the current straighten; the next drag starts a new one from 0°. */
+    fun done() {
+        inbox.trySend(Msg.Release)
+        steps = 0
+        revisionAfter = null
+        rendered = 0f
+        target = 0f
+        setDelta(0f)
+    }
+
+    private fun setDelta(d: Float) {
+        rotation = d
+        val bmp = lab.state.value.preview
+        val ratio = if (bmp != null && bmp.width > 0 && bmp.height > 0) maxOf(bmp.width, bmp.height).toFloat() / minOf(bmp.width, bmp.height) else 1f
+        val r = Math.toRadians(kotlin.math.abs(d).toDouble())
+        zoom = (cos(r) + ratio * sin(r)).toFloat().coerceAtLeast(1f)
+    }
+
+    private suspend fun revision(): Long? = lab.io { api ->
+        val info = lab.parse(api.sessionInfo()) as? JsonObject
+        val docs = info?.get("documents") as? kotlinx.serialization.json.JsonArray
+        val active = (info?.get("active") as? JsonPrimitive)?.content?.toIntOrNull() ?: 0
+        ((docs?.getOrNull(active) as? JsonObject)?.get("revision") as? JsonPrimitive)?.longOrNull
+    }.getOrNull()
+
+    private suspend fun apply(angle: Float) {
+        // Replace our previous straighten only if it is still the last thing that happened.
+        if (steps > 0 && revisionAfter != null && revision() == revisionAfter) {
+            lab.io { it.call("doc.undo", buildJsonObject { put("steps", steps) }.toString(), "ui") }
+        }
+        steps = 0
+        val r = lab.io { it.call(Fn.EDIT_STRAIGHTEN, buildJsonObject { put("angle", angle); put("crop", true) }.toString(), "ui") }
+        val result = r.getOrNull()?.let { lab.parse(it) as? JsonObject }
+        val rotated = (result?.get("rotated") as? JsonPrimitive)?.content == "true"
+        val cropped = (result?.get("cropped") as? JsonPrimitive)?.content == "true"
+        steps = (if (rotated) 1 else 0) + (if (cropped) 1 else 0)
+        revisionAfter = revision()
+        if (r.isFailure) return
+        lab.markInteractive()
+        if (lab.renderInteractive()) {
+            rendered = angle
+            setDelta(target - angle)
+        }
+    }
+}

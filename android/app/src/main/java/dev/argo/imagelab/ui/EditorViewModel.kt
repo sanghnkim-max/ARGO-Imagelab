@@ -57,6 +57,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     /** Live adjustment: the photo follows the Adjust sliders (masked by the selection's handle). */
     val live = LiveAdjust(lab, viewModelScope) { selection?.mask }
 
+    /** Live straighten: the photo rotates with the Crop sheet's slider. */
+    val straightener = LiveStraighten(lab, viewModelScope)
+
     /** Last stylus pressure on the canvas (0..1): plumbed for the coming retouch brushes. */
     var stylusPressure by mutableFloatStateOf(0f)
 

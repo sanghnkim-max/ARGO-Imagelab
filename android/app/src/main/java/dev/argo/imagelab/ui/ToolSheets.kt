@@ -193,11 +193,18 @@ private fun CropSheet(vm: EditorViewModel) {
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         SymIcon(Sym.straighten, "Straighten", Modifier.size(20.dp))
-        Slider(value = angle, onValueChange = { angle = it }, valueRange = -15f..15f, modifier = Modifier.weight(1f).padding(horizontal = 8.dp))
+        // The photo rotates as the slider moves (LiveStraighten); releasing commits the crop.
+        Slider(
+            value = angle,
+            onValueChange = { angle = it; vm.straightener.drag(it) },
+            onValueChangeFinished = { vm.straightener.release() },
+            valueRange = -15f..15f,
+            modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+        )
         Text("%.1f°".format(angle), Modifier.width(52.dp), fontFamily = FontFamily.Monospace)
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = { vm.straighten(angle); angle = 0f }, enabled = angle != 0f) { Text("Straighten") }
-        TextButton(onClick = { angle = 0f }) { Text("Reset") }
+        Button(onClick = { vm.straightener.done(); angle = 0f }, enabled = angle != 0f) { Text("Done") }
+        TextButton(onClick = { angle = 0f; vm.straightener.drag(0f); vm.straightener.release() }) { Text("Reset") }
     }
 }
