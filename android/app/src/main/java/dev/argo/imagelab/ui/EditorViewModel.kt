@@ -74,10 +74,15 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private suspend fun editNow(id: String, params: String, mask: String?): Result<JsonElement?> {
+        // A mask becomes the document selection first; PhotoCraft's filters and new adjustment
+        // layers then apply to it (the selection becomes the adjustment layer's mask).
+        if (mask != null) {
+            val loaded = lab.fn(Fn.SELECT_FROM_MASK, buildJsonObject { put("mask", mask) }.toString(), refreshAfter = false)
+            if (loaded.isFailure) return loaded
+        }
         val body = buildJsonObject {
             put("id", id)
             put("params", lab.parse(params) ?: JsonObject(emptyMap()))
-            if (mask != null) put("mask", mask)
         }
         return lab.fn(Fn.EDIT_RUN, body.toString())
     }
@@ -92,7 +97,11 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun addPhotoLayer(uri: Uri) = viewModelScope.launch {
         val picked = Imports.read(app, uri) ?: return@launch lab.showMessage("Cannot read the picked image.")
         val rel = Imports.store(app.workspace, picked.first, picked.second)
-        editNow("file.placeEmbedded", buildJsonObject { put("path", rel) }.toString(), null)
+        // Decode into a handle, then place it as a new layer of the open document.
+        val read = lab.fn(Fn.CV_READ, buildJsonObject { put("path", rel) }.toString(), refreshAfter = false).getOrNull()
+        val img = ((read as? JsonObject)?.get("img") as? kotlinx.serialization.json.JsonPrimitive)?.content
+            ?: return@launch lab.showMessage("Cannot decode the picked image.")
+        lab.fn(Fn.CV_TO_LAYER, buildJsonObject { put("img", img); put("name", picked.first) }.toString())
     }
 
     fun addText() {
@@ -141,7 +150,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun selectConcept(text: String) {
         if (text.isBlank()) return
-        select("“${text.trim()}”", Fn.SEGMENT_CONCEPT, buildJsonObject { put("text", text.trim()) }.toString())
+        select("“${text.trim()}”", Fn.SEGMENT_CONCEPT, buildJsonObject { put("prompt", text.trim()) }.toString())
     }
 
     private fun select(label: String, id: String, params: String) {

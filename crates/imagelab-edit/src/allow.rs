@@ -16,7 +16,8 @@ use imagelab_api::Headless;
 use serde_json::{Value, json};
 
 /// Prefixes whose commands edit the open document.
-const PREFIXES: &[&str] = &["image.", "layer.", "filter.", "select.", "paint."];
+// `type.` = text layers (create, edit, style) in the open document; `type.fonts` only lists fonts.
+const PREFIXES: &[&str] = &["image.", "layer.", "filter.", "select.", "paint.", "type."];
 
 /// `edit.*` families that edit the open document in memory (the rest of `edit.*` is settings,
 /// preset libraries, purges, colour settings, keyboard shortcuts…).

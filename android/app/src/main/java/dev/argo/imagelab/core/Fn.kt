@@ -15,14 +15,17 @@ object Fn {
     const val DOC_INSPECT = "doc.inspect"
     const val DOC_OPEN = "doc.open"
 
-    /** `{id, params, mask?}`: one PhotoCraft engine command, masked through an adjustment layer when `mask` is set. */
+    /** `{id, params}`: one allowlisted PhotoCraft engine command. Masked edits load the mask as the selection first ([SELECT_FROM_MASK]). */
     const val EDIT_RUN = "edit.run"
 
     const val SELECT_SUBJECT = "select.subject"
     const val SELECT_SKY = "select.sky"
     const val SEGMENT_POINT = "segment.point"
     const val SEGMENT_BOX = "segment.box"
-    const val SEGMENT_CONCEPT = "segment.concept"
+    const val SEGMENT_CONCEPT = "segment.text"
+    const val SELECT_FROM_MASK = "select.fromMask"
+    const val CV_READ = "cv.read"
+    const val CV_TO_LAYER = "cv.toDocumentLayer"
 
     const val CV_INVERT_MASK = "cv.invertMask"
     const val CV_DENOISE = "cv.denoise"

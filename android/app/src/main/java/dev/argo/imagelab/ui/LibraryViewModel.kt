@@ -90,7 +90,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                 is JsonObject -> {
                     fun s(k: String) = (e[k] as? JsonPrimitive)?.contentOrNull
                     val id = s("id") ?: return@mapNotNull null
-                    val path = s("path") ?: s("file")
+                    val path = s("path") ?: s("file") ?: id
                     Photo(id, path, s("name") ?: path?.substringAfterLast('/') ?: id, (e["rating"] as? JsonPrimitive)?.intOrNull ?: 0, s("flag") ?: "none")
                 }
                 else -> null
