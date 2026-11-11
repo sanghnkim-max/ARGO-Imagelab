@@ -3,6 +3,8 @@ package dev.argo.imagelab.ui
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.util.LruCache
 import androidx.compose.runtime.getValue
@@ -185,7 +187,28 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    /** A small decoded thumbnail of the photo's file, or null (RAW/HEIC the platform can't read). */
+    /**
+     * `bitmap` turned upright by the file's EXIF orientation (BitmapFactory decodes the stored
+     * pixels as they are; cameras often store them sideways and record the turn in EXIF).
+     */
+    private fun upright(bitmap: Bitmap, file: File): Bitmap {
+        val orientation = runCatching { ExifInterface(file.path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL) }
+            .getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+        val m = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.setScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> m.setRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> m.setScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> { m.setRotate(90f); m.postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_90 -> m.setRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> { m.setRotate(-90f); m.postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_270 -> m.setRotate(-90f)
+            else -> return bitmap
+        }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true).also { if (it !== bitmap) bitmap.recycle() }
+    }
+
+    /** A small decoded thumbnail of the photo's file, upright, or null (RAW/HEIC the platform can't read). */
     suspend fun thumbnail(photo: Photo, side: Int = 384): Bitmap? {
         val path = photo.path ?: return null
         thumbs.get(path)?.let { return it }
@@ -196,7 +219,8 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                 BitmapFactory.decodeFile(file.path, bounds)
                 var sample = 1
                 while (minOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= side) sample *= 2
-                BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
+                val bitmap = BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
+                upright(bitmap, file)
             }.getOrNull()?.also { thumbs.put(path, it) }
         }
     }
