@@ -41,6 +41,20 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import dev.argo.imagelab.core.EditorState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.background
+import dev.argo.imagelab.ui.menu.layerBlendModes
+import dev.argo.imagelab.ui.menu.Choice
+import dev.argo.imagelab.ui.menu.Kind
+import dev.argo.imagelab.ui.menu.MenuItem
+import dev.argo.imagelab.ui.menu.MenuGroup
+import dev.argo.imagelab.ui.menu.CommandSheet
+import dev.argo.imagelab.ui.menu.Catalog
+import dev.argo.imagelab.ui.menu.Slider as MSlider
+import androidx.compose.material3.HorizontalDivider
 import kotlin.math.roundToInt
 
 /** The contextual sheet for [tool]: above the tool bar (compact) or in the right pane. */
@@ -59,9 +73,21 @@ fun ToolSheet(tool: Tool, state: EditorState, vm: EditorViewModel, modifier: Mod
             when (tool) {
                 Tool.Layers -> LayersSheet(state, vm)
                 Tool.Select -> SelectSheet(vm)
-                Tool.Adjust -> AdjustSheet(vm)
+                Tool.Adjust -> {
+                    AdjustSheet(vm)
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    CommandSheet(listOf(Catalog.light, Catalog.adjustmentLayers), vm.command)
+                }
+                Tool.Filters -> CommandSheet(Catalog.filters, vm.command, note = if (vm.selection != null) "Filters apply inside the selection." else "Filters change the active layer's pixels; the photo follows the sliders.")
+                Tool.Effects -> CommandSheet(listOf(Catalog.styles), vm.command, note = "Effects style the active layer (not the locked Background: duplicate it or use a text/shape layer).")
                 Tool.Retouch -> RetouchSheet(vm)
-                Tool.Crop -> CropSheet(vm)
+                Tool.Paint -> PaintSheet(vm)
+                Tool.Text -> TextSheet(state, vm)
+                Tool.Crop -> {
+                    CropSheet(vm)
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    CommandSheet(listOf(Catalog.document), vm.command)
+                }
             }
         }
     }
@@ -76,11 +102,100 @@ private fun ChipRow(content: @Composable () -> Unit) {
 
 @Composable
 private fun LayersSheet(state: EditorState, vm: EditorViewModel) {
-    LayerList(state, vm, Modifier.fillMaxWidth().heightIn(max = 180.dp))
+    LayerList(state, vm, Modifier.fillMaxWidth().heightIn(max = 200.dp))
+    val active = state.layers.firstOrNull { it.id != null && it.id == state.activeLayer }
     ChipRow {
-        AssistChip(onClick = { vm.edit("layer.duplicate") }, label = { Text("Duplicate") })
+        AssistChip(onClick = { vm.edit("layer.arrange.bringForward") }, label = { Text("Up") }, leadingIcon = { SymIcon(Sym.up, null, Modifier.size(18.dp)) })
+        AssistChip(onClick = { vm.edit("layer.arrange.sendBackward") }, label = { Text("Down") }, leadingIcon = { SymIcon(Sym.down, null, Modifier.size(18.dp)) })
+        AssistChip(onClick = { vm.edit("layer.duplicate") }, label = { Text("Duplicate") }, leadingIcon = { SymIcon(Sym.copy, null, Modifier.size(18.dp)) })
+        AssistChip(onClick = { vm.edit("layer.mergeDown") }, label = { Text("Merge down") }, leadingIcon = { SymIcon(Sym.merge, null, Modifier.size(18.dp)) })
         AssistChip(onClick = { vm.edit("layer.delete") }, label = { Text("Delete") }, leadingIcon = { SymIcon(Sym.delete, null, Modifier.size(18.dp)) })
         AssistChip(onClick = { vm.edit("layer.flattenImage") }, label = { Text("Flatten") })
+    }
+    ChipRow {
+        AssistChip(onClick = { vm.maskFromSelection() }, label = { Text(if (vm.selection != null) "Mask from selection" else "Add mask") })
+        AssistChip(onClick = { vm.edit("layer.layerMask.hideAll") }, label = { Text("Black mask") })
+        AssistChip(onClick = { vm.edit("layer.layerMask.delete") }, label = { Text("Delete mask") })
+        AssistChip(onClick = { vm.edit("layer.layerMask.apply") }, label = { Text("Apply mask") })
+    }
+    if (active != null) {
+        var name by remember(active.id) { mutableStateOf(active.name) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(name, { name = it }, singleLine = true, label = { Text("Name") }, modifier = Modifier.weight(1f))
+            TextButton(onClick = { vm.renameLayer(name) }, enabled = name.isNotBlank() && name != active.name) { Text("Rename") }
+        }
+        // Opacity, fill and blend of the active layer, live through the same engine as filters.
+        val id = active.id ?: 0L
+        CommandSheet(
+            listOf(
+                MenuGroup(
+                    "Properties",
+                    listOf(
+                        MenuItem("Opacity", "layer.setProps", Kind.Pixels, listOf(MSlider("opacity", "Opacity %", 0f, 100f, 100f, sendScale = 0.01f, integer = false)), fixed = mapOf("layer" to id)),
+                        MenuItem("Fill", "layer.setProps", Kind.Pixels, listOf(MSlider("fill", "Fill %", 0f, 100f, 100f, sendScale = 0.01f, integer = false)), fixed = mapOf("layer" to id)),
+                        MenuItem("Blend", "layer.setProps", Kind.Pixels, listOf(Choice("blend", "Blend mode", layerBlendModes.map { it to it }, "Normal")), fixed = mapOf("layer" to id)),
+                    ),
+                ),
+            ),
+            vm.command,
+        )
+    }
+}
+
+// ── Paint ────────────────────────────────────────────────────────────────────────────────────
+
+private val paintSwatches = listOf("#ffffff", "#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047", "#3d7bf5", "#8e24aa")
+
+@Composable
+private fun PaintSheet(vm: EditorViewModel) {
+    Text("Draw on the photo with one finger (two fingers zoom). Pressure works with a stylus.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+    ChipRow {
+        FilterChip(selected = !vm.eraser, onClick = { vm.eraser = false }, label = { Text("Brush") }, leadingIcon = { SymIcon(Sym.brush, null, Modifier.size(18.dp)) })
+        FilterChip(selected = vm.eraser, onClick = { vm.eraser = true }, label = { Text("Eraser") }, leadingIcon = { SymIcon(Sym.erase, null, Modifier.size(18.dp)) })
+        FilterChip(selected = vm.paintOnNewLayer, onClick = { vm.paintOnNewLayer = !vm.paintOnNewLayer }, label = { Text("On a new layer") })
+        AssistChip(onClick = vm::newPaintLayer, label = { Text("Next layer") })
+    }
+    if (!vm.eraser) Swatches(paintSwatches, vm.paintColor) { vm.paintColor = it }
+    LabeledSlider("Size", vm.paintSize, 1f..300f, { vm.paintSize = it }) { "${it.roundToInt()} px" }
+    LabeledSlider("Opacity", vm.paintOpacity, 0.05f..1f, { vm.paintOpacity = it }) { "${(it * 100).roundToInt()}%" }
+    LabeledSlider("Hardness", vm.paintHardness, 0f..1f, { vm.paintHardness = it }) { "${(it * 100).roundToInt()}%" }
+}
+
+// ── Text ─────────────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun TextSheet(state: EditorState, vm: EditorViewModel) {
+    val activeIsText = state.layers.firstOrNull { it.id == state.activeLayer }?.kind?.let { it.contains("type", true) || it.contains("text", true) } == true
+    Text(if (vm.textAt == null) "Tap the photo to place text, or add it in the centre." else "Placing at (${vm.textAt?.x?.roundToInt()}, ${vm.textAt?.y?.roundToInt()}).", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+    OutlinedTextField(vm.textContent, { vm.textContent = it }, label = { Text("Text") }, modifier = Modifier.fillMaxWidth(), maxLines = 3)
+    LabeledSlider("Size", vm.textSize, 8f..400f, { vm.textSize = it }) { "${it.roundToInt()} pt" }
+    Swatches(paintSwatches, vm.textColor) { vm.textColor = it }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = vm::placeText) { Text("Add text") }
+        if (activeIsText) OutlinedButton(onClick = { vm.updateText() }) { Text("Update selected text") }
+    }
+}
+
+@Composable
+private fun Swatches(colors: List<String>, selected: String, onPick: (String) -> Unit) {
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        colors.forEach { hex ->
+            val on = hex.equals(selected, ignoreCase = true)
+            Box(
+                Modifier.size(30.dp).background(Color(android.graphics.Color.parseColor(hex)), CircleShape)
+                    .border(if (on) 3.dp else 1.dp, if (on) Accent else Color.Gray, CircleShape)
+                    .clickable { onPick(hex) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun LabeledSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, onChange: (Float) -> Unit, format: (Float) -> String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.width(72.dp), style = MaterialTheme.typography.bodySmall)
+        Slider(value = value, onValueChange = onChange, valueRange = range, modifier = Modifier.weight(1f))
+        Text(format(value), Modifier.width(60.dp), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
     }
 }
 

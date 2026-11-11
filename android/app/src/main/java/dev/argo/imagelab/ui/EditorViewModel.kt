@@ -36,7 +36,10 @@ enum class SelectMode(val label: String) { Object("Object"), Box("Box"), Rect("R
 /** How a new selection combines with the current one. */
 enum class Combine(val label: String) { New("New"), Add("Add"), Subtract("Subtract") }
 
-enum class Tool(val label: String) { Layers("Layers"), Select("Select"), Adjust("Adjust"), Retouch("Retouch"), Crop("Crop") }
+enum class Tool(val label: String) {
+    Layers("Layers"), Select("Select"), Adjust("Adjust"), Filters("Filters"), Effects("Effects"),
+    Retouch("Retouch"), Paint("Paint"), Text("Text"), Crop("Crop & size"),
+}
 
 /**
  * The current selection: a registry mask handle (`mask:N`, from `segment.*`/`select.*`) with
@@ -69,7 +72,12 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     /** Last stylus pressure on the canvas (0..1): plumbed for the coming retouch brushes. */
     var stylusPressure by mutableFloatStateOf(0f)
 
+    /** Any catalog item (filters, effects, light & color, size, layer properties), live. */
+    val command = dev.argo.imagelab.ui.menu.LiveCommand(lab, viewModelScope) { selection?.mask }
+
     fun pickTool(t: Tool) {
+        // Leaving a tool keeps what its open item did.
+        if (command.item != null) command.apply()
         tool = if (tool == t) null else t
         if (tool == Tool.Select) onSelectOpened()
     }
@@ -389,7 +397,87 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         edit("image.crop", """{"x":0,"y":0,"width":${s.width},"height":${s.height},"angle":$angle,"contentAware":false}""")
     }
 
+    // ── paint ────────────────────────────────────────────────────────────────────────────
+
+    var paintColor by mutableStateOf("#ffffff")
+    var paintSize by mutableFloatStateOf(24f)
+    var paintOpacity by mutableFloatStateOf(1f)
+    var paintHardness by mutableFloatStateOf(0.8f)
+    var eraser by mutableStateOf(false)
+    /** Paint on a new "Paint" layer (made on the first stroke) instead of the photo's pixels. */
+    var paintOnNewLayer by mutableStateOf(true)
+    private var paintLayerMade = false
+
+    /** One stroke in document pixels: [x, y, pressure]. */
+    fun paintStroke(points: List<Triple<Float, Float, Float>>) {
+        if (points.isEmpty()) return
+        viewModelScope.launch {
+            if (paintOnNewLayer && !eraser && !paintLayerMade) {
+                lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "layer.new.layer"); put("params", buildJsonObject { put("name", "Paint") }) }.toString(), refreshAfter = false)
+                paintLayerMade = true
+            }
+            val params = buildJsonObject {
+                putJsonArray("points") { points.forEach { (x, y, p) -> add(JsonArray(listOf(JsonPrimitive(x.roundToInt()), JsonPrimitive(y.roundToInt()), JsonPrimitive(p.coerceIn(0.05f, 1f).toDouble())))) } }
+                put("size", paintSize.toDouble())
+                put("opacity", paintOpacity.toDouble())
+                put("hardness", paintHardness.toDouble())
+                put("color", paintColor)
+                if (eraser) put("erase", true)
+            }
+            lab.markInteractive()
+            lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "paint.stroke"); put("params", params) }.toString())
+        }
+    }
+
+    /** The next stroke starts a new Paint layer. */
+    fun newPaintLayer() {
+        paintLayerMade = false
+    }
+
+    // ── text ─────────────────────────────────────────────────────────────────────────────
+
+    var textContent by mutableStateOf("Text")
+    var textSize by mutableFloatStateOf(72f)
+    var textColor by mutableStateOf("#ffffff")
+    /** Where the next text goes (document pixels); null: centred. */
+    var textAt by mutableStateOf<androidx.compose.ui.geometry.Offset?>(null)
+
+    fun placeText() {
+        val s = lab.state.value
+        val at = textAt ?: androidx.compose.ui.geometry.Offset(s.width / 2f, s.height / 2f)
+        val params = buildJsonObject {
+            put("x", at.x.roundToInt()); put("y", at.y.roundToInt())
+            put("text", textContent.ifBlank { "Text" })
+            put("size", textSize.toDouble()); put("color", textColor)
+        }
+        viewModelScope.launch { lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "type.create"); put("params", params) }.toString()) }
+    }
+
+    /** Change the active text layer's words, size and colour. */
+    fun updateText() = viewModelScope.launch {
+        lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "type.edit"); put("params", buildJsonObject { put("text", textContent) }) }.toString(), refreshAfter = false)
+        lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "type.setStyle"); put("params", buildJsonObject { put("size", textSize.toDouble()); put("color", textColor) }) }.toString())
+    }
+
     // ── layers ───────────────────────────────────────────────────────────────────────────
+
+    fun setLayerVisible(id: Long?, visible: Boolean) {
+        if (id != null) edit("layer.setProps", buildJsonObject { put("layer", id); put("visible", visible) }.toString())
+    }
+
+    fun renameLayer(name: String) {
+        if (name.isNotBlank()) edit("layer.renameLayer", buildJsonObject { put("name", name.trim()) }.toString())
+    }
+
+    /** The active layer's selection becomes its mask (or a full mask without a selection). */
+    fun maskFromSelection() = viewModelScope.launch {
+        val sel = selection
+        if (sel?.mask != null) {
+            lab.fn(Fn.SELECT_FROM_MASK, buildJsonObject { put("mask", sel.mask) }.toString(), refreshAfter = false)
+            editNow("layer.layerMask.revealSelection", "{}", null)
+        } else editNow("layer.layerMask.revealAll", "{}", null)
+    }
+
 
     fun selectLayer(id: Long?) {
         if (id != null) edit("layer.select", """{"layer":$id}""")

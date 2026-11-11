@@ -49,6 +49,15 @@ object Sym {
     @DrawableRes val adjust = R.drawable.ic_sym_tune
     @DrawableRes val retouch = R.drawable.ic_sym_healing
     @DrawableRes val crop = R.drawable.ic_sym_crop
+    @DrawableRes val brush = R.drawable.ic_sym_brush
+    @DrawableRes val filters = R.drawable.ic_sym_filter_vintage
+    @DrawableRes val effects = R.drawable.ic_sym_auto_fix_high
+    @DrawableRes val resize = R.drawable.ic_sym_photo_size_select_large
+    @DrawableRes val up = R.drawable.ic_sym_arrow_upward
+    @DrawableRes val down = R.drawable.ic_sym_arrow_downward
+    @DrawableRes val copy = R.drawable.ic_sym_content_copy
+    @DrawableRes val merge = R.drawable.ic_sym_merge
+    @DrawableRes val palette = R.drawable.ic_sym_palette
     @DrawableRes val close = R.drawable.ic_sym_close
     @DrawableRes val send = R.drawable.ic_sym_send
     @DrawableRes val star = R.drawable.ic_sym_star

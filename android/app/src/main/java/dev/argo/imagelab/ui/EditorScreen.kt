@@ -62,6 +62,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -225,6 +228,10 @@ private fun EditorTopBar(state: EditorState, agentOpen: Boolean, vm: EditorViewM
 private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modifier, onOpen: () -> Unit, onLibrary: () -> Unit) {
     val preview = state.preview
     val selectMode = vm.tool == Tool.Select
+    val paintMode = vm.tool == Tool.Paint
+    val textMode = vm.tool == Tool.Text
+    // The stroke being painted (screen points) and its pressures.
+    var stroke by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var box by remember { mutableStateOf(IntSize.Zero) }
     var draft by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var hover by remember { mutableStateOf<Offset?>(null) }
@@ -258,12 +265,13 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
             .clipToBounds()
             .background(CanvasBackground)
             .onSizeChanged { box = it }
-            .pointerInput(selectMode) {
+            .pointerInput(selectMode, paintMode, textMode) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     if (down.type == PointerType.Stylus) vm.stylusPressure = down.pressure
                     val start = down.position
                     val path = mutableListOf(start)
+                    val pressures = mutableListOf(if (down.type == PointerType.Stylus) down.pressure else 1f)
                     var multi = false
                     var dragged = false
                     while (true) {
@@ -273,12 +281,19 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                         if (pressed.size >= 2) {
                             multi = true
                             draft = emptyList()
+                            stroke = emptyList()
                             vm.scale = (vm.scale * event.calculateZoom()).coerceIn(0.5f, 12f)
                             vm.offset += event.calculatePan()
                         } else if (!multi) {
                             val ch = pressed[0]
                             if (ch.type == PointerType.Stylus) vm.stylusPressure = ch.pressure
-                            if (selectMode) {
+                            if (paintMode) {
+                                if ((ch.position - path.last()).getDistance() > 2f) {
+                                    path += ch.position
+                                    pressures += if (ch.type == PointerType.Stylus) ch.pressure else 1f
+                                    stroke = path.toList()
+                                }
+                            } else if (selectMode) {
                                 if ((ch.position - start).getDistance() > viewConfiguration.touchSlop) dragged = true
                                 if (dragged && (ch.position - path.last()).getDistance() > 3f) {
                                     path += ch.position
@@ -291,6 +306,12 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                         event.changes.forEach { it.consume() }
                     }
                     draft = emptyList()
+                    if (paintMode && !multi) {
+                        val pts = path.mapIndexedNotNull { i, p -> toDocOrClamp(p, clamp = true)?.let { d -> Triple(d.x, d.y, pressures.getOrElse(i) { 1f }) } }
+                        vm.paintStroke(pts)
+                        stroke = emptyList()
+                    }
+                    if (textMode && !multi) toDoc(start)?.let { vm.textAt = it }
                     if (selectMode && !multi) {
                         if (dragged) {
                             val pts = if (vm.selectMode == SelectMode.Lasso) path else listOf(path.first(), path.last())
@@ -347,6 +368,22 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
             }
         }
         Canvas(Modifier.fillMaxSize()) {
+            // The stroke being painted, at its on-screen width.
+            if (stroke.size >= 2) {
+                val bmp = preview
+                val fit = if (bmp != null && bmp.width > 0) minOf((size.width - 2 * padPx) / bmp.width, (size.height - 2 * padPx) / bmp.height) else 1f
+                val docW = if (state.width > 0) state.width.toFloat() else (bmp?.width ?: 1).toFloat()
+                val screenPerDoc = fit * (bmp?.width ?: 1) / docW * vm.scale
+                val color = if (vm.eraser) Color.White.copy(alpha = 0.5f) else Color(android.graphics.Color.parseColor(vm.paintColor)).copy(alpha = vm.paintOpacity)
+                drawPath(
+                    androidx.compose.ui.graphics.Path().apply {
+                        moveTo(stroke[0].x, stroke[0].y)
+                        stroke.drop(1).forEach { lineTo(it.x, it.y) }
+                    },
+                    color,
+                    style = Stroke(width = (vm.paintSize * screenPerDoc).coerceAtLeast(1f), cap = androidx.compose.ui.graphics.StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round),
+                )
+            }
             // The shape being drawn: box/rectangle, ellipse, or the freehand lasso path.
             if (draft.size >= 2) {
                 val a = draft.first()
@@ -455,7 +492,10 @@ fun LayerList(state: EditorState, vm: EditorViewModel, modifier: Modifier) {
                     Text(l.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
                     Text(l.kind + if (l.hasMask) " · mask" else "", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
                 }
-                SymIcon(if (l.visible) Sym.visible else Sym.hidden, if (l.visible) "Visible" else "Hidden", Modifier.size(18.dp), tint = Color.Gray)
+                SymIcon(
+                    if (l.visible) Sym.visible else Sym.hidden, if (l.visible) "Hide ${l.name}" else "Show ${l.name}",
+                    Modifier.size(32.dp).clickable { vm.setLayerVisible(l.id, !l.visible) }.padding(7.dp), tint = Color.Gray,
+                )
             }
         }
     }
@@ -494,21 +534,38 @@ private fun toolIcon(t: Tool) = when (t) {
     Tool.Layers -> Sym.layers
     Tool.Select -> Sym.select
     Tool.Adjust -> Sym.adjust
+    Tool.Filters -> Sym.filters
+    Tool.Effects -> Sym.effects
     Tool.Retouch -> Sym.retouch
+    Tool.Paint -> Sym.brush
+    Tool.Text -> Sym.text
     Tool.Crop -> Sym.crop
 }
 
+/** Nine tools: a horizontally scrolling bar on phones (more than a NavigationBar holds). */
 @Composable
 private fun ToolBar(vm: EditorViewModel) {
-    NavigationBar(Modifier.height(72.dp), windowInsets = WindowInsets(0.dp)) {
-        Tool.entries.forEach { t ->
-            NavigationBarItem(
-                selected = vm.tool == t,
-                onClick = { vm.pickTool(t) },
-                icon = { SymIcon(toolIcon(t), null) },
-                label = { Text(t.label, fontSize = 11.sp) },
-            )
+    Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
+        Row(
+            Modifier.fillMaxWidth().height(72.dp).horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Tool.entries.forEach { t -> ToolButton(t, vm.tool == t) { vm.pickTool(t) } }
         }
+    }
+}
+
+@Composable
+private fun ToolButton(t: Tool, selected: Boolean, onClick: () -> Unit) {
+    Column(
+        Modifier.width(72.dp).clickable(onClick = onClick).padding(vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            Modifier.size(width = 52.dp, height = 30.dp).background(if (selected) Accent.copy(alpha = 0.3f) else Color.Transparent, androidx.compose.foundation.shape.RoundedCornerShape(15.dp)),
+            contentAlignment = Alignment.Center,
+        ) { SymIcon(toolIcon(t), null, tint = if (selected) Accent else MaterialTheme.colorScheme.onSurface) }
+        Text(t.label, fontSize = 11.sp, maxLines = 1, color = if (selected) Accent else MaterialTheme.colorScheme.onSurface)
     }
 }
 
@@ -516,13 +573,15 @@ private fun ToolBar(vm: EditorViewModel) {
 private fun ToolRail(vm: EditorViewModel) {
     NavigationRail(windowInsets = WindowInsets(0.dp)) {
         Spacer(Modifier.height(8.dp))
+        Column(Modifier.verticalScroll(rememberScrollState())) {
         Tool.entries.forEach { t ->
             NavigationRailItem(
                 selected = vm.tool == t,
                 onClick = { vm.pickTool(t) },
                 icon = { SymIcon(toolIcon(t), null) },
-                label = { Text(t.label) },
+                label = { Text(t.label, maxLines = 1) },
             )
+        }
         }
     }
 }
