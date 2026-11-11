@@ -2040,8 +2040,12 @@ name = "imagelab-edit"
 version = "0.1.0"
 dependencies = [
  "imagelab-api",
+ "photocraft-automation",
+ "photocraft-codecs",
+ "photocraft-io",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
