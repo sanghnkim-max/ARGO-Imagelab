@@ -80,6 +80,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         if (command.item != null) command.apply()
         tool = if (tool == t) null else t
         if (tool == Tool.Select) onSelectOpened()
+        if (tool == Tool.Text) refreshFonts()
     }
 
     // ── segmentation model (MobileSAM) ───────────────────────────────────────────────────
@@ -439,6 +440,45 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     var textContent by mutableStateOf("Text")
     var textSize by mutableFloatStateOf(72f)
     var textColor by mutableStateOf("#ffffff")
+    /** Font family for new text (null: PhotoCraft's default). */
+    var textFont by mutableStateOf<String?>(null)
+    /** Families installed in this workspace (Google Fonts downloaded so far). */
+    var installedFonts by mutableStateOf<List<String>>(emptyList()); private set
+    var fontResults by mutableStateOf<List<dev.argo.imagelab.core.FontFamily>>(emptyList()); private set
+    /** The family being downloaded, if any. */
+    var fontDownloading by mutableStateOf<String?>(null); private set
+
+    fun refreshFonts() = viewModelScope.launch {
+        val r = lab.fn("fonts.list", "{}", refreshAfter = false).getOrNull() as? JsonObject ?: return@launch
+        installedFonts = (r["installed"] as? JsonArray).orEmpty().flatMap { f ->
+            ((f as? JsonObject)?.get("families") as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.take(1)
+        }.distinct()
+    }
+
+    fun searchFonts(query: String) = viewModelScope.launch {
+        fontResults = withContext(Dispatchers.IO) { dev.argo.imagelab.core.GoogleFonts.search(query) }
+        if (fontResults.isEmpty()) lab.showMessage("No Google Fonts match “$query” (or no connection).")
+    }
+
+    /** Use [family]; download and install it from Google Fonts first when needed. */
+    fun pickFont(family: String?) = viewModelScope.launch {
+        if (family == null || family in installedFonts) {
+            textFont = family
+            return@launch
+        }
+        fontDownloading = family
+        val got = withContext(Dispatchers.IO) { dev.argo.imagelab.core.GoogleFonts.download(app.workspace, family) }
+        got.onSuccess { (path, license) ->
+            val r = lab.fn("fonts.install", buildJsonObject { put("path", path); put("source", "google"); put("license", license) }.toString(), refreshAfter = false)
+            if (r.isSuccess) {
+                val fam = ((r.getOrNull() as? JsonObject)?.get("families") as? JsonArray)?.firstOrNull()?.let { (it as? JsonPrimitive)?.contentOrNull } ?: family
+                installedFonts = (installedFonts + fam).distinct()
+                textFont = fam
+            }
+        }.onFailure { lab.showMessage("Font download failed: ${it.message}") }
+        fontDownloading = null
+    }
+
     /** Where the next text goes (document pixels); null: centred. */
     var textAt by mutableStateOf<androidx.compose.ui.geometry.Offset?>(null)
 
@@ -449,6 +489,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             put("x", at.x.roundToInt()); put("y", at.y.roundToInt())
             put("text", textContent.ifBlank { "Text" })
             put("size", textSize.toDouble()); put("color", textColor)
+            textFont?.let { put("font", it) }
         }
         viewModelScope.launch { lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "type.create"); put("params", params) }.toString()) }
     }
@@ -456,7 +497,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     /** Change the active text layer's words, size and colour. */
     fun updateText() = viewModelScope.launch {
         lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "type.edit"); put("params", buildJsonObject { put("text", textContent) }) }.toString(), refreshAfter = false)
-        lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "type.setStyle"); put("params", buildJsonObject { put("size", textSize.toDouble()); put("color", textColor) }) }.toString())
+        lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "type.setStyle"); put("params", buildJsonObject { put("size", textSize.toDouble()); put("color", textColor); textFont?.let { put("font", it) } }) }.toString())
     }
 
     // ── layers ───────────────────────────────────────────────────────────────────────────

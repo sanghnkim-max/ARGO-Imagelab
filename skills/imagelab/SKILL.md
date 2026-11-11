@@ -90,3 +90,14 @@ return { done, failed };
   then summarize what changed.
 * PhotoCraft's raw MCP tools (`doc_inspect`, `command_run`, …) are at `/photocraft/mcp` when
   edits are allowed; use them only for engine commands the `lab` areas do not cover.
+
+## Fonts
+
+`lab.fonts.list()` shows installed families (Google Fonts the person downloaded in the app, plus
+system/bundled fonts). Use a family as `font` in `type.create` / `type.setStyle`:
+
+```js
+const f = await lab.fonts.list({});
+await lab.edit.run({id: "type.create", params: {x: 60, y: 200, text: "Hello", size: 96, font: f.installed[0]?.families[0], color: "#ffffff"}});
+```
+`lab.fonts.install({path})` installs a TTF/OTF already in the workspace.

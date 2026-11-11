@@ -18,6 +18,7 @@ pub mod allow;
 pub mod batch;
 pub mod doc;
 pub mod edit;
+pub mod fonts;
 pub mod ops;
 pub mod paths;
 
@@ -34,6 +35,7 @@ impl Module for EditModule {
         registry.area("doc", "The open PhotoCraft document: open, inspect, preview, save, history");
         registry.area("edit", "Edit the document: engine commands, masked adjustment layers, recipes");
         registry.area("batch", "Apply a recipe or program to many photos; export presets");
+        fonts::register_area(registry);
         doc::register(registry);
         edit::register(registry);
         batch::register(registry);

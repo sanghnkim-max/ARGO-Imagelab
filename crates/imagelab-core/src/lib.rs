@@ -134,6 +134,8 @@ impl Lab {
         let gpu_failed = false;
         #[cfg(not(feature = "gpu"))]
         let _ = options.gpu;
+        // Fonts the workspace installed (Google Fonts…) join PhotoCraft's text engine.
+        imagelab_edit::fonts::register_all(&root);
         let session = Arc::new(Mutex::new(headless));
         let sink = Arc::new(ForwardingSink::default());
         let shared = Shared { root: root.clone(), session: session.clone(), handles: Arc::new(Handles::default()), events: sink.clone() };

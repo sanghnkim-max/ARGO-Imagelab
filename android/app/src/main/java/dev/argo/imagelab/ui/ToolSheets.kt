@@ -41,6 +41,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import dev.argo.imagelab.core.EditorState
+import androidx.compose.material3.CircularProgressIndicator
+import dev.argo.imagelab.core.GoogleFonts
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.clickable
@@ -170,10 +172,44 @@ private fun TextSheet(state: EditorState, vm: EditorViewModel) {
     OutlinedTextField(vm.textContent, { vm.textContent = it }, label = { Text("Text") }, modifier = Modifier.fillMaxWidth(), maxLines = 3)
     LabeledSlider("Size", vm.textSize, 8f..400f, { vm.textSize = it }) { "${it.roundToInt()} pt" }
     Swatches(paintSwatches, vm.textColor) { vm.textColor = it }
+    FontPicker(vm)
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(onClick = vm::placeText) { Text("Add text") }
         if (activeIsText) OutlinedButton(onClick = { vm.updateText() }) { Text("Update selected text") }
     }
+}
+
+/** Fonts: the default, installed families, a starter list of Google Fonts and a search. Picking
+ *  a Google family that is not installed downloads it (once) and installs it in the workspace. */
+@Composable
+private fun FontPicker(vm: EditorViewModel) {
+    var query by rememberSaveable { mutableStateOf("") }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Font: ${vm.textFont ?: "Default"}", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+        vm.fontDownloading?.let {
+            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+            Text("  Getting $it…", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+    val families = (listOf<String?>(null) + vm.installedFonts + GoogleFonts.popular + vm.fontResults.map { it.family }).distinct()
+    ChipRow {
+        families.forEach { f ->
+            FilterChip(
+                selected = vm.textFont == f,
+                onClick = { vm.pickFont(f) },
+                label = { Text(f ?: "Default") },
+                leadingIcon = if (f != null && f !in vm.installedFonts) ({ SymIcon(Sym.download, null, Modifier.size(16.dp)) }) else null,
+            )
+        }
+    }
+    OutlinedTextField(
+        query, { query = it },
+        placeholder = { Text("Search Google Fonts") },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        keyboardActions = KeyboardActions(onSearch = { vm.searchFonts(query) }),
+        modifier = Modifier.fillMaxWidth(),
+    )
 }
 
 @Composable

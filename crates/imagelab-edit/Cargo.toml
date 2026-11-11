@@ -14,6 +14,7 @@ imagelab-api = { workspace = true }
 photocraft-automation = { workspace = true }
 photocraft-codecs = { workspace = true }
 photocraft-io = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
+photocraft-text = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

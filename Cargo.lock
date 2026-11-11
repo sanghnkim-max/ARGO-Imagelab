@@ -2802,6 +2802,7 @@ dependencies = [
  "photocraft-automation",
  "photocraft-codecs",
  "photocraft-io",
+ "photocraft-text",
  "serde",
  "serde_json",
  "tempfile",
