@@ -18,6 +18,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
@@ -85,7 +89,32 @@ private fun LayersSheet(state: EditorState, vm: EditorViewModel) {
 @Composable
 private fun SelectSheet(vm: EditorViewModel) {
     var concept by rememberSaveable { mutableStateOf("") }
-    Text("Tap the photo to select an object, drag a box, or describe it.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+    val hint = when (vm.selectMode) {
+        SelectMode.Object -> when (vm.combine) {
+            Combine.New -> "Tap an object (SAM). Drag for a box."
+            Combine.Add -> "Tap to add more of the object (include point)."
+            Combine.Subtract -> "Tap a part to leave out (exclude point)."
+        }
+        SelectMode.Box -> "Drag a box around the object (SAM)."
+        SelectMode.Rect -> "Drag a rectangle."
+        SelectMode.Ellipse -> "Drag an ellipse."
+        SelectMode.Lasso -> "Draw around the area with your finger."
+    }
+    Text(hint, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+    SegModelRow(vm)
+    ChipRow {
+        SelectMode.entries.forEach { m -> FilterChip(selected = vm.selectMode == m, onClick = { vm.selectMode = m }, label = { Text(m.label) }) }
+    }
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Combine.entries.forEachIndexed { i, c ->
+            SegmentedButton(
+                selected = vm.combine == c,
+                onClick = { vm.combine = c },
+                shape = SegmentedButtonDefaults.itemShape(i, Combine.entries.size),
+                label = { Text(when (c) { Combine.New -> "New"; Combine.Add -> "＋ Add"; Combine.Subtract -> "− Subtract" }) },
+            )
+        }
+    }
     ChipRow {
         AssistChip(onClick = vm::selectSubject, label = { Text("Subject") }, leadingIcon = { SymIcon(Sym.person, null, Modifier.size(18.dp)) })
         AssistChip(onClick = vm::selectSky, label = { Text("Sky") }, leadingIcon = { SymIcon(Sym.landscape, null, Modifier.size(18.dp)) })
@@ -111,6 +140,26 @@ private fun SelectSheet(vm: EditorViewModel) {
             AssistChip(onClick = vm::removeSelected, label = { Text("Remove") }, leadingIcon = { SymIcon(Sym.erase, null, Modifier.size(18.dp)) })
             AssistChip(onClick = vm::cutToLayer, label = { Text("Cut to layer") }, leadingIcon = { SymIcon(Sym.cut, null, Modifier.size(18.dp)) })
         }
+    }
+}
+
+/** MobileSAM status: offer the one-time download, show progress, or say it is ready. */
+@Composable
+private fun SegModelRow(vm: EditorViewModel) {
+    when (vm.segModel) {
+        "missing" -> Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 4.dp)) {
+            Text("Precise selection uses MobileSAM (40.6 MB, Apache-2.0).", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            OutlinedButton(onClick = { vm.downloadSegmentModel() }) { Text("Download") }
+        }
+        "downloading" -> Column(Modifier.padding(vertical = 4.dp)) {
+            Text("Downloading MobileSAM… ${(vm.segProgress * 100).roundToInt()}%", style = MaterialTheme.typography.bodySmall)
+            LinearProgressIndicator(progress = { vm.segProgress }, modifier = Modifier.fillMaxWidth())
+        }
+        "ready" -> Text(
+            if (vm.segPreparing) "MobileSAM: preparing this photo…" else "MobileSAM ready: taps and boxes segment precisely.",
+            style = MaterialTheme.typography.bodySmall, color = Accent,
+        )
+        else -> {}
     }
 }
 

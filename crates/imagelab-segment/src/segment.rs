@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::input::{self, Input, Source};
 use crate::mask::{self, Mode};
 use crate::select;
-use crate::{Sam, State};
+use crate::{Mobile, Sam, State};
 
 /// Most points one call takes (SAM 3's interactive decoder limit).
 pub const MAX_POINTS: usize = 64;
@@ -86,6 +86,9 @@ struct EnsureParams {
 #[serde(deny_unknown_fields)]
 struct InstallParams {
     path: String,
+    /// `sam3` (a folder, default) or `mobilesam` (the weights file).
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// A full-size mask into the arena; the JSON every single-mask result shares.
@@ -136,12 +139,32 @@ fn fallback_result(ctx: &Ctx, steps: &[(&str, Value, Mode)], sam_error: Option<S
     Ok(v)
 }
 
+/// Try MobileSAM; on success the mask result (`engine: "mobilesam"`), on failure why.
+fn mobile_try(ctx: &Ctx, mobile: &Mobile, input: &Input, clicks: &[Click], rect: Option<[f32; 4]>, clip: Option<[f64; 4]>) -> Result<Value, String> {
+    let (pred, cached) = mobile.segment(&ctx.shared.root, input, clicks, rect)?;
+    let mut m = sam_mask(input, &pred);
+    if let Some([x, y, w, h]) = clip {
+        let pad = (f64::from(input.width.max(input.height)) * 0.01) as f32;
+        mask::clip_to_box(&mut m, input.width as usize, input.height as usize, [x as f32, y as f32, w as f32, h as f32], pad);
+    }
+    let mut v = put(ctx, input.width, input.height, m, Some(pred.score)).map_err(|e| e.message)?;
+    v["engine"] = json!("mobilesam");
+    v["cached"] = json!(cached);
+    Ok(v)
+}
+
+/// Both model errors in one line, for `samError`.
+fn both(sam: String, mobile: String) -> String {
+    format!("SAM 3: {sam}; MobileSAM: {mobile}")
+}
+
 /// SAM is unusable for an image/photo input: say so (PhotoCraft works on the document only).
 fn no_fallback(kind: &str, err: String) -> ApiError {
     ApiError::unavailable(format!("SAM 3 could not segment this {kind} ({err}); the PhotoCraft fallback works on the open document only (omit image/photo)"))
 }
 
-fn point(ctx: &Ctx, sam: &Sam, p: PointParams) -> ApiResult<Value> {
+fn point(ctx: &Ctx, st: &State, p: PointParams) -> ApiResult<Value> {
+    let sam = &st.sam;
     if p.points.is_empty() || p.points.len() > MAX_POINTS {
         return Err(ApiError::bad_params(format!("points: 1..={MAX_POINTS} [x, y, label] triples")));
     }
@@ -167,6 +190,13 @@ fn point(ctx: &Ctx, sam: &Sam, p: PointParams) -> ApiResult<Value> {
         }
         Err(e) => e,
     };
+    let err = match mobile_try(ctx, &st.mobile, &input, &clicks, None, None) {
+        Ok(mut v) => {
+            v["samError"] = json!(err);
+            return Ok(v);
+        }
+        Err(m) => both(err, m),
+    };
     if !p.src.is_document() {
         return Err(no_fallback(input.kind, err));
     }
@@ -179,7 +209,8 @@ fn point(ctx: &Ctx, sam: &Sam, p: PointParams) -> ApiResult<Value> {
     fallback_result(ctx, &steps, Some(err))
 }
 
-fn boxed(ctx: &Ctx, sam: &Sam, p: BoxParams) -> ApiResult<Value> {
+fn boxed(ctx: &Ctx, st: &State, p: BoxParams) -> ApiResult<Value> {
+    let sam = &st.sam;
     let [x, y, w, h] = p.rect;
     if !(w.is_finite() && h.is_finite() && w >= 1.0 && h >= 1.0) {
         return Err(ApiError::bad_params("box is [x, y, w, h] with w, h ≥ 1"));
@@ -209,6 +240,15 @@ fn boxed(ctx: &Ctx, sam: &Sam, p: BoxParams) -> ApiResult<Value> {
             return Ok(v);
         }
         Err(e) => e,
+    };
+    // MobileSAM takes the box as a real box prompt.
+    let nbox = [(x / iw) as f32, (y / ih) as f32, ((x + w) / iw) as f32, ((y + h) / ih) as f32];
+    let err = match mobile_try(ctx, &st.mobile, &input, &[], Some(nbox), Some([x, y, w, h])) {
+        Ok(mut v) => {
+            v["samError"] = json!(err);
+            return Ok(v);
+        }
+        Err(m) => both(err, m),
     };
     if !p.src.is_document() {
         return Err(no_fallback(input.kind, err));
@@ -262,13 +302,14 @@ fn text(ctx: &Ctx, sam: &Sam, p: TextParams) -> ApiResult<Value> {
             Ok(json!({"instances": instances, "engine": "photocraft", "samError": err, "prompt": prompt}))
         }
         (true, None) => Err(ApiError::unavailable(format!(
-            "SAM 3 is needed for text concepts other than sky/subject ({err}); try select.colorRange or segment.point, or install the model (segment.models)"
+            "text concepts other than sky/subject need SAM 3 ({err}). Instead: look at a preview (doc.preview), locate the thing yourself and call segment.box {{box:[x,y,w,h]}} or segment.point (MobileSAM segments it precisely), or try select.colorRange"
         ))),
         (false, _) => Err(no_fallback(input.kind, err)),
     }
 }
 
-fn subject(ctx: &Ctx, sam: &Sam, p: SubjectParams) -> ApiResult<Value> {
+fn subject(ctx: &Ctx, st: &State, p: SubjectParams) -> ApiResult<Value> {
+    let sam = &st.sam;
     let input = input::resolve(ctx, &p.src)?;
     ctx.check_cancel()?;
     let err = match sam.subject(&ctx.shared.root, &input) {
@@ -284,7 +325,27 @@ fn subject(ctx: &Ctx, sam: &Sam, p: SubjectParams) -> ApiResult<Value> {
     if !p.src.is_document() {
         return Err(no_fallback(input.kind, err));
     }
-    fallback_result(ctx, &[("select.subject", json!({"mode": "replace"}), Mode::Replace)], Some(err))
+    // PhotoCraft's Select Subject finds *where* the subject is; MobileSAM, given that box,
+    // draws a cleaner edge. Without MobileSAM, PhotoCraft's own mask is the answer.
+    let (w, h, m) = photocraft(ctx, &[("select.subject", json!({"mode": "replace"}), Mode::Replace)])?;
+    if Mobile::installed(&ctx.shared.root)
+        && let Some([bx, by, bw, bh]) = mask::bbox(&m, w as usize, h as usize)
+    {
+        let (fw, fh) = (f64::from(input.width), f64::from(input.height));
+        let (sx, sy) = (fw / f64::from(w.max(1)), fh / f64::from(h.max(1)));
+        let r = [f64::from(bx) * sx, f64::from(by) * sy, f64::from(bw) * sx, f64::from(bh) * sy];
+        let nbox = [(r[0] / fw) as f32, (r[1] / fh) as f32, ((r[0] + r[2]) / fw) as f32, ((r[1] + r[3]) / fh) as f32];
+        if let Ok(mut v) = mobile_try(ctx, &st.mobile, &input, &[], Some(nbox), Some(r)) {
+            v["engine"] = json!("mobilesam");
+            v["guide"] = json!("photocraft select.subject");
+            v["samError"] = json!(err);
+            return Ok(v);
+        }
+    }
+    let mut v = put(ctx, w, h, m, None)?;
+    v["engine"] = json!("photocraft");
+    v["samError"] = json!(err);
+    Ok(v)
 }
 
 const SOURCE_PROPS: &str = r#"{"image":{"type":"string","description":"img:N handle"},"photo":{"type":"string","description":"workspace-relative photo path"}}"#;
@@ -306,7 +367,7 @@ pub fn register(r: &mut Registry, state: Arc<State>) {
         .description(&format!("{input_note} Returns {{mask, width, height, bbox, coverage, score, engine, cached}}."))
         .params(schema(json!({"points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"minItems":1,"maxItems":MAX_POINTS}}), &["points"]))
         .effects(Effects::ReadOnly)
-        .typed(move |ctx, p: PointParams| point(ctx, &s.sam, p))
+        .typed(move |ctx, p: PointParams| point(ctx, &s, p))
         .register();
 
     let s = state.clone();
@@ -314,7 +375,7 @@ pub fn register(r: &mut Registry, state: Arc<State>) {
         .description(&format!("{input_note} Returns {{mask, width, height, bbox, coverage, score, engine, cached}}."))
         .params(schema(json!({"box":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}}), &["box"]))
         .effects(Effects::ReadOnly)
-        .typed(move |ctx, p: BoxParams| boxed(ctx, &s.sam, p))
+        .typed(move |ctx, p: BoxParams| boxed(ctx, &s, p))
         .register();
 
     let s = state.clone();
@@ -330,15 +391,34 @@ pub fn register(r: &mut Registry, state: Arc<State>) {
         .description(&format!("{input_note} Returns {{mask, width, height, bbox, coverage, score, engine}}."))
         .params(schema(json!({}), &[]))
         .effects(Effects::ReadOnly)
-        .typed(move |ctx, p: SubjectParams| subject(ctx, &s.sam, p))
+        .typed(move |ctx, p: SubjectParams| subject(ctx, &s, p))
         .register();
 
     let s = state.clone();
-    r.function("segment", "models", "SAM 3 model status: missing | downloading | ready, size, path, licence")
-        .description("Returns {sam3: missing|downloading|ready|unavailable, sizeBytes, path, loaded, cachedEmbeddings, licence, downloadConfigured, progress?, lastError?}.")
+    r.function("segment", "prepare", "Encode an image ahead of prompts (MobileSAM), so later segment.point/box only decode")
+        .description(&format!("{input_note} The encoder is the slow part (seconds on a phone CPU); call this when segmentation is likely (the app does when the Select tool opens) and prompts on the same pixels take a fraction of a second. Returns {{engine, cached, ms}}; `engine: null` when no model is installed."))
+        .params(schema(json!({}), &[]))
+        .effects(Effects::ReadOnly)
+        .typed(move |ctx, p: SubjectParams| {
+            let input = input::resolve(ctx, &p.src)?;
+            let t = std::time::Instant::now();
+            match s.mobile.prepare(&ctx.shared.root, &input) {
+                Ok(cached) => Ok(json!({"engine": "mobilesam", "cached": cached, "ms": t.elapsed().as_millis() as u64})),
+                Err(e) => Ok(json!({"engine": null, "reason": e})),
+            }
+        })
+        .register();
+
+    let s = state.clone();
+    r.function("segment", "models", "Model status: SAM 3 (desktop) and MobileSAM (phone): missing | ready, size, licence, download URL")
+        .description("Returns {sam3: missing|downloading|ready|unavailable, sizeBytes, path, loaded, cachedEmbeddings, licence, downloadConfigured, progress?, lastError?, mobilesam: {state, sizeBytes, sha256, url, file, path, licence, loaded, cachedEmbeddings}}. MobileSAM (40.6 MB, Apache-2.0, public) is what phones use for points and boxes: the app downloads `mobilesam.url` and calls installModel {model:\"mobilesam\", path}.")
         .params(json!({"type":"object","properties":{}}))
         .effects(Effects::ReadOnly)
-        .typed(move |ctx, _: Empty| Ok(s.sam.status(&ctx.shared.root)))
+        .typed(move |ctx, _: Empty| {
+            let mut v = s.sam.status(&ctx.shared.root);
+            v["mobilesam"] = s.mobile.status(&ctx.shared.root);
+            Ok(v)
+        })
         .register();
 
     let s = state.clone();
@@ -350,13 +430,17 @@ pub fn register(r: &mut Registry, state: Arc<State>) {
         .register();
 
     let s = state.clone();
-    r.function("segment", "installModel", "Install SAM 3 files the app downloaded (a workspace folder), after checking them")
-        .description("`path`: workspace folder with model.safetensors, vocab.json, merges.txt. The weights must match the official facebook/sam3 checkpoint (size + SHA-256). Files are hard-linked into .imagelab/models/sam3, or copied.")
-        .params(json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}))
+    r.function("segment", "installModel", "Install model files the app downloaded, after checking size and SHA-256")
+        .description("model `sam3` (default): `path` is a workspace folder with model.safetensors, vocab.json, merges.txt matching the official facebook/sam3 checkpoint. model `mobilesam`: `path` is the downloaded mobile_sam-tiny-vitt.safetensors (see segment.models for URL, size, SHA-256). Files are hard-linked into .imagelab/models/<model>, or copied.")
+        .params(json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"},"model":{"type":"string","enum":["sam3","mobilesam"]}}}))
         .effects(Effects::Destructive)
         .typed(move |ctx, p: InstallParams| {
-            let dir = input::workspace_path(ctx, &p.path)?;
-            s.sam.install(ctx, &dir)
+            let path = input::workspace_path(ctx, &p.path)?;
+            match p.model.as_deref().unwrap_or("sam3") {
+                "sam3" => s.sam.install(ctx, &path),
+                "mobilesam" => s.mobile.install(ctx, &path),
+                other => Err(ApiError::bad_params(format!("model `{other}`: sam3 or mobilesam"))),
+            }
         })
         .register();
 
@@ -368,9 +452,9 @@ pub fn register(r: &mut Registry, state: Arc<State>) {
         .register();
 
     let s = state;
-    r.function("segment", "unload", "Free the SAM 3 model and cached embeddings now (it reloads on demand)")
+    r.function("segment", "unload", "Free the loaded models (SAM 3, MobileSAM) and cached embeddings now (they reload on demand)")
         .params(json!({"type":"object","properties":{}}))
         .effects(Effects::ReadOnly)
-        .typed(move |_, _: Empty| Ok(json!({"unloaded": s.sam.unload()})))
+        .typed(move |_, _: Empty| Ok(json!({"unloaded": s.sam.unload() | s.mobile.unload()})))
         .register();
 }

@@ -19,11 +19,64 @@ pub fn content_key(rgb: &[u8], w: usize, h: usize) -> u64 {
     s.finish()
 }
 
+/// Side of the fingerprint grid ([`signature`]).
+const SIG_GRID: usize = 16;
+/// A fingerprint matches when its mean absolute difference is at most this (0..255)…
+const SIG_MEAN_TOLERANCE: f64 = 1.5;
+/// …and no block differs by more than this.
+const SIG_MAX_TOLERANCE: u8 = 12;
+
+/// Coarse fingerprint of an RGB proxy: `SIG_GRID²` block means per channel, plus the size.
+pub fn signature(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut sig = Vec::with_capacity(SIG_GRID * SIG_GRID * 3 + 8);
+    sig.extend_from_slice(&(w as u32).to_le_bytes());
+    sig.extend_from_slice(&(h as u32).to_le_bytes());
+    if w == 0 || h == 0 || rgb.len() < w * h * 3 {
+        return sig;
+    }
+    for by in 0..SIG_GRID {
+        let (y0, y1) = (by * h / SIG_GRID, ((by + 1) * h / SIG_GRID).max(by * h / SIG_GRID + 1).min(h));
+        for bx in 0..SIG_GRID {
+            let (x0, x1) = (bx * w / SIG_GRID, ((bx + 1) * w / SIG_GRID).max(bx * w / SIG_GRID + 1).min(w));
+            let mut acc = [0u64; 3];
+            let mut n = 0u64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * w + x) * 3;
+                    for (c, a) in acc.iter_mut().enumerate() {
+                        *a += u64::from(rgb.get(i + c).copied().unwrap_or(0));
+                    }
+                    n += 1;
+                }
+            }
+            for a in acc {
+                sig.push((a / n.max(1)) as u8);
+            }
+        }
+    }
+    sig
+}
+
+/// Whether two fingerprints describe the same image (same size, block means within tolerance).
+pub fn similar(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() || a.len() < 8 || a.get(..8) != b.get(..8) {
+        return false;
+    }
+    let (mut sum, mut max) = (0u64, 0u8);
+    for (x, y) in a.iter().zip(b).skip(8) {
+        let d = x.abs_diff(*y);
+        sum += u64::from(d);
+        max = max.max(d);
+    }
+    let n = (a.len() - 8).max(1) as f64;
+    max <= SIG_MAX_TOLERANCE && (sum as f64 / n) <= SIG_MEAN_TOLERANCE
+}
+
 /// Least-recently-used cache of embeddings.
 pub struct EmbeddingCache<E> {
     capacity: usize,
-    /// Most recent last.
-    entries: VecDeque<(u64, E)>,
+    /// Most recent last: (exact key, fingerprint, embedding).
+    entries: VecDeque<(u64, Vec<u8>, E)>,
     pub hits: u64,
     pub misses: u64,
 }
@@ -45,11 +98,33 @@ impl<E> EmbeddingCache<E> {
         self.entries.clear();
     }
 
-    /// The embedding for `key`, encoding it with `encoder` on a miss. Returns it and whether
-    /// it was a hit.
+    /// The embedding for these exact pixels, encoding on a miss. Returns it and whether it hit.
     pub fn get_or_encode<En: Encoder<Embedding = E>>(&mut self, encoder: &mut En, rgb: &[u8], w: usize, h: usize) -> Result<(&mut E, bool), String> {
         let key = content_key(rgb, w, h);
-        let hit = if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+        self.lookup_or_encode(|k, _| k == key, key, Vec::new(), encoder, rgb, w, h)
+    }
+
+    /// The embedding for an image that *looks the same* ([`signature`] within [`similar`]
+    /// tolerance), encoding on a miss: robust to render jitter and selection-only changes.
+    pub fn get_or_encode_similar<En: Encoder<Embedding = E>>(&mut self, encoder: &mut En, rgb: &[u8], w: usize, h: usize) -> Result<(&mut E, bool), String> {
+        let sig = signature(rgb, w, h);
+        let key = content_key(rgb, w, h);
+        let probe = sig.clone();
+        self.lookup_or_encode(move |k, s| k == key || similar(s, &probe), key, sig, encoder, rgb, w, h)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_or_encode<En: Encoder<Embedding = E>>(
+        &mut self,
+        matches: impl Fn(u64, &[u8]) -> bool,
+        key: u64,
+        sig: Vec<u8>,
+        encoder: &mut En,
+        rgb: &[u8],
+        w: usize,
+        h: usize,
+    ) -> Result<(&mut E, bool), String> {
+        let hit = if let Some(pos) = self.entries.iter().position(|(k, s, _)| matches(*k, s)) {
             if let Some(e) = self.entries.remove(pos) {
                 self.entries.push_back(e);
             }
@@ -60,12 +135,12 @@ impl<E> EmbeddingCache<E> {
             while self.entries.len() >= self.capacity {
                 self.entries.pop_front();
             }
-            self.entries.push_back((key, emb));
+            self.entries.push_back((key, sig, emb));
             self.misses += 1;
             false
         };
         match self.entries.back_mut() {
-            Some((_, e)) => Ok((e, hit)),
+            Some((_, _, e)) => Ok((e, hit)),
             None => Err("embedding cache is empty after insert".into()),
         }
     }
@@ -107,6 +182,25 @@ mod tests {
         assert!(!c.get_or_encode(&mut enc, &a, 4, 1).unwrap().1);
         assert_eq!((c.hits, c.misses), (3, 5));
         assert_eq!(enc.calls, 5);
+    }
+
+    #[test]
+    fn similar_images_share_an_embedding() {
+        let mut enc = Fake { calls: 0 };
+        let mut c = EmbeddingCache::new(4);
+        let (w, h) = (64, 48);
+        let base: Vec<u8> = (0..w * h * 3).map(|i| ((i * 7) % 200) as u8).collect();
+        // Render jitter: a few values off by one.
+        let mut jitter = base.clone();
+        for i in (0..jitter.len()).step_by(97) {
+            jitter[i] = jitter[i].saturating_add(1);
+        }
+        // A real edit: everything brighter.
+        let edited: Vec<u8> = base.iter().map(|v| v.saturating_add(40)).collect();
+        assert!(!c.get_or_encode_similar(&mut enc, &base, w, h).unwrap().1);
+        assert!(c.get_or_encode_similar(&mut enc, &jitter, w, h).unwrap().1, "jitter reuses the embedding");
+        assert!(!c.get_or_encode_similar(&mut enc, &edited, w, h).unwrap().1, "an edit encodes again");
+        assert_eq!(enc.calls, 2);
     }
 
     #[test]

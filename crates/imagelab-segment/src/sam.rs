@@ -134,7 +134,7 @@ impl Sam {
         g.last_used = Instant::now();
         let Engine { model, cache, .. } = &mut *g;
         let model = model.as_mut().ok_or("model not loaded")?;
-        let (enc, cached) = cache.get_or_encode(&mut ModelEncoder(&*model), &input.rgb, input.pw as usize, input.ph as usize)?;
+        let (enc, cached) = cache.get_or_encode_similar(&mut ModelEncoder(&*model), &input.rgb, input.pw as usize, input.ph as usize)?;
         let r = f(model, enc).map_err(|e| e.to_string())?;
         Ok((r, cached))
     }

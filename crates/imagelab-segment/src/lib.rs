@@ -17,6 +17,8 @@
 pub mod cache;
 pub mod input;
 pub mod mask;
+#[cfg(feature = "mobile-sam")]
+pub mod mobile;
 #[cfg(feature = "sam3")]
 mod sam;
 pub mod segment;
@@ -37,12 +39,13 @@ pub struct SegmentModule;
 #[derive(Default)]
 pub struct State {
     sam: Sam,
+    mobile: Mobile,
 }
 
 impl Module for SegmentModule {
     fn register(&self, registry: &mut Registry) {
         registry.area("select", "Cheap PhotoCraft selections on the open document (subject, sky, object, color range, magic wand, refine edge) and selection ↔ mask:N bridges");
-        registry.area("segment", "SAM 3 masks from points, boxes, text concepts or the subject (PhotoCraft fallback); model status and download");
+        registry.area("segment", "Masks from points, boxes, text concepts or the subject: SAM 3 (desktop), MobileSAM (phone, 40 MB), PhotoCraft fallback; model status and install");
         select::register(registry);
         segment::register(registry, Arc::new(State::default()));
     }
@@ -95,3 +98,46 @@ mod nosam {
 }
 #[cfg(not(feature = "sam3"))]
 use nosam::Sam;
+
+#[cfg(feature = "mobile-sam")]
+use mobile::MobileSam as Mobile;
+
+/// Built without `mobile-sam`: the engine is never available.
+#[cfg(not(feature = "mobile-sam"))]
+mod nomobile {
+    use std::path::Path;
+
+    use imagelab_api::{ApiError, ApiResult, Ctx};
+    use serde_json::{Value, json};
+
+    use crate::input::Input;
+    use crate::segment::{Click, Pred};
+
+    const WHY: &str = "this build has no MobileSAM (feature `mobile-sam` off)";
+
+    #[derive(Default)]
+    pub struct Mobile;
+
+    impl Mobile {
+        pub fn installed(_: &Path) -> bool {
+            false
+        }
+        pub fn segment(&self, _: &Path, _: &Input, _: &[Click], _: Option<[f32; 4]>) -> Result<(Pred, bool), String> {
+            Err(WHY.into())
+        }
+        pub fn prepare(&self, _: &Path, _: &Input) -> Result<bool, String> {
+            Err(WHY.into())
+        }
+        pub fn status(&self, _: &Path) -> Value {
+            json!({"state": "unavailable", "reason": WHY})
+        }
+        pub fn install(&self, _: &Ctx, _: &Path) -> ApiResult<Value> {
+            Err(ApiError::unavailable(WHY))
+        }
+        pub fn unload(&self) -> bool {
+            false
+        }
+    }
+}
+#[cfg(not(feature = "mobile-sam"))]
+use nomobile::Mobile;

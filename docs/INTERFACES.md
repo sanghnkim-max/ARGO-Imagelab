@@ -121,14 +121,30 @@ ModelStatus { model, state: missing|downloading|ready, progress }
 
 ## 6. Segmentation, used wisely
 
-* Cheap first: PhotoCraft `select.subject` / `select.sky` / `select.object` / `colorRange` are
-  fast and need no model; `segment.*` falls back to them when SAM is unavailable.
-* SAM 3 via `lightcraft-segment` (pure Rust, candle): encoder runs **once per image** on a ≤1024
-  proxy, embedding cached by content hash; prompts (points, boxes, text concepts) only run the
-  decoder. Masks are upsampled and edge-refined to full size on demand.
-* Weights are not in the APK: `models.status` / `models.ensure("sam3")` with a ModelStatus event;
-  the person approves the download size once.
-* Batch segmentation reuses one loaded model; memory budget drops the encoder when idle.
+Three engines, cheapest that does the job first:
+
+* **Manual / PhotoCraft** (no model): rectangle, ellipse and freehand lasso (`select.rect`,
+  `select.lasso`), plus Select Subject / Sky / Object / Color Range. Instant, always available.
+* **MobileSAM** (the phone's model): points and boxes. TinyViT-5M encoder + SAM's prompt encoder and
+  mask decoder on candle (pure Rust), 40.6 MB weights, Apache-2.0, public. The app downloads it once
+  (platform TLS) and the core installs it after checking size and SHA-256 (`segment.installModel
+  {model:"mobilesam"}`). Measured with the real weights: IoU 0.99 on point and box prompts.
+* **SAM 3** (desktop, optional): text concepts and the best quality; 3.4 GB, SAM License (gated,
+  per-user acceptance); refused on low-memory devices.
+
+Used wisely:
+* The encoder (the slow part) runs **once per image** on a ≤1008 px proxy, ahead of time:
+  `segment.prepare` when the Select tool opens. Each tap or box then only runs the decoder.
+* Embeddings are cached by a coarse image fingerprint (16×16 block means, small tolerance), so a
+  selection change or render jitter reuses the embedding and a real edit encodes again.
+* Point prompts accumulate: *Add* / *Subtract* append include / exclude points to the same prompt.
+  Shapes combine with the current mask (`cv.combineMasks` union / subtract).
+* "Subject" = PhotoCraft Select Subject for *where*, then MobileSAM with that box for a clean edge.
+* Text concepts other than sky/subject need SAM 3; without it the agent looks at a preview,
+  locates the thing and calls `segment.box` (MobileSAM segments it precisely).
+
+Open: MobileSAM encoding on candle's CPU backend is single-threaded-bound (≈3 s on an M2, more on
+a phone CPU); a GPU (wgpu) or NNAPI backend is the next speed step.
 
 ## 7. `cv`: OpenCV-style, for agents
 

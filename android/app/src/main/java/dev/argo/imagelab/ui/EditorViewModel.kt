@@ -30,6 +30,12 @@ import kotlinx.serialization.json.putJsonArray
 import java.io.File
 import kotlin.math.roundToInt
 
+/** How a tap or drag on the canvas selects (Select tool). */
+enum class SelectMode(val label: String) { Object("Object"), Box("Box"), Rect("Rectangle"), Ellipse("Ellipse"), Lasso("Lasso") }
+
+/** How a new selection combines with the current one. */
+enum class Combine(val label: String) { New("New"), Add("Add"), Subtract("Subtract") }
+
 enum class Tool(val label: String) { Layers("Layers"), Select("Select"), Adjust("Adjust"), Retouch("Retouch"), Crop("Crop") }
 
 /**
@@ -65,6 +71,81 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun pickTool(t: Tool) {
         tool = if (tool == t) null else t
+        if (tool == Tool.Select) onSelectOpened()
+    }
+
+    // ── segmentation model (MobileSAM) ───────────────────────────────────────────────────
+
+    /** "ready" | "missing" | "downloading" | "unavailable" | null (not checked yet). */
+    var segModel by mutableStateOf<String?>(null); private set
+    var segProgress by mutableFloatStateOf(0f); private set
+    /** True while the photo is being encoded ahead of taps. */
+    var segPreparing by mutableStateOf(false); private set
+    private var segInfo: JsonObject? = null
+
+    /** Opening Select: check the model and, if installed, encode the photo now so taps only decode. */
+    fun onSelectOpened() = viewModelScope.launch {
+        refreshSegModel()
+        if (segModel == "ready") prepareSegmentation()
+    }
+
+    private suspend fun refreshSegModel() {
+        val models = lab.fn("segment.models", "{}", refreshAfter = false).getOrNull() as? JsonObject
+        segInfo = models?.get("mobilesam") as? JsonObject
+        if (segModel != "downloading") segModel = (segInfo?.get("state") as? JsonPrimitive)?.contentOrNull ?: "unavailable"
+    }
+
+    private suspend fun prepareSegmentation() {
+        if (lab.state.value.documents == 0) return
+        segPreparing = true
+        lab.fn("segment.prepare", "{}", refreshAfter = false)
+        segPreparing = false
+    }
+
+    /** Download MobileSAM (public, Apache-2.0) with the platform's TLS, then install it (size + SHA-256 checked by the core). */
+    fun downloadSegmentModel() = viewModelScope.launch {
+        if (segModel == "downloading") return@launch
+        if (segInfo == null) refreshSegModel()
+        val info = segInfo ?: return@launch lab.showMessage("The segmentation model is not available in this build.")
+        val url = (info["url"] as? JsonPrimitive)?.contentOrNull ?: return@launch
+        val file = (info["file"] as? JsonPrimitive)?.contentOrNull ?: "mobile_sam.safetensors"
+        val rel = "downloads/$file"
+        val dest = File(app.workspace, rel)
+        segModel = "downloading"
+        segProgress = 0f
+        val ok = withContext(Dispatchers.IO) {
+            runCatching {
+                dest.parentFile?.mkdirs()
+                val client = okhttp3.OkHttpClient()
+                client.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
+                    check(resp.isSuccessful) { "HTTP ${resp.code}" }
+                    val body = resp.body
+                    val total = body.contentLength().takeIf { it > 0 } ?: 1L
+                    body.byteStream().use { input ->
+                        dest.outputStream().use { out ->
+                            val buf = ByteArray(1 shl 16)
+                            var done = 0L
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n < 0) break
+                                out.write(buf, 0, n)
+                                done += n
+                                segProgress = (done.toFloat() / total).coerceIn(0f, 1f)
+                            }
+                        }
+                    }
+                }
+            }.onFailure { t -> lab.showMessage("Download failed: ${t.message}") }.isSuccess
+        }
+        if (ok) {
+            val installed = lab.fn("segment.installModel", buildJsonObject { put("model", "mobilesam"); put("path", rel) }.toString(), refreshAfter = false)
+            withContext(Dispatchers.IO) { dest.delete() }
+            segModel = if (installed.isSuccess) "ready" else "missing"
+            if (installed.isSuccess) prepareSegmentation()
+        } else {
+            withContext(Dispatchers.IO) { dest.delete() }
+            segModel = "missing"
+        }
     }
 
     fun resetView() {
@@ -146,13 +227,90 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun selectSubject() = select("Subject", Fn.SELECT_SUBJECT, "{}")
     fun selectSky() = select("Sky", Fn.SELECT_SKY, "{}")
 
-    fun selectPoint(x: Float, y: Float) = select("Point", Fn.SEGMENT_POINT, buildJsonObject {
-        putJsonArray("points") { add(buildJsonObject { put("x", x.roundToInt()); put("y", y.roundToInt()); put("label", 1) }) }
-    }.toString())
+    // ── selection modes ──────────────────────────────────────────────────────────────────
 
-    fun selectBox(x0: Float, y0: Float, x1: Float, y1: Float) = select("Box", Fn.SEGMENT_BOX, buildJsonObject {
-        putJsonArray("box") { listOf(minOf(x0, x1), minOf(y0, y1), maxOf(x0, x1), maxOf(y0, y1)).forEach { add(JsonPrimitive(it.roundToInt())) } }
-    }.toString())
+    var selectMode by mutableStateOf(SelectMode.Object)
+    var combine by mutableStateOf(Combine.New)
+
+    /** The SAM prompt behind the current Object selection: [x, y, label] in document pixels. */
+    private val samPoints = mutableListOf<Triple<Int, Int, Int>>()
+
+    /** Canvas tap (document pixels). Object mode: a SAM point; New starts over, Add/Subtract
+     *  add an include/exclude point to the same prompt (only the decoder runs again). */
+    fun canvasTap(x: Float, y: Float) {
+        if (selectMode != SelectMode.Object) return
+        val p = Triple(x.roundToInt(), y.roundToInt(), if (combine == Combine.Subtract) 0 else 1)
+        when (combine) {
+            Combine.New -> { samPoints.clear(); samPoints += p }
+            Combine.Add -> samPoints += p
+            Combine.Subtract -> {
+                if (samPoints.none { it.third == 1 }) return lab.showMessage("Tap the object first, then subtract parts of it.")
+                samPoints += p
+            }
+        }
+        val pts = samPoints.toList()
+        val label = if (pts.size == 1) "Object" else "Object (${pts.count { it.third == 1 }}+ ${pts.count { it.third == 0 }}−)"
+        viewModelScope.launch {
+            selecting = true
+            val params = buildJsonObject { putJsonArray("points") { pts.forEach { (px, py, l) -> add(JsonArray(listOf(JsonPrimitive(px), JsonPrimitive(py), JsonPrimitive(l)))) } } }
+            lab.fn(Fn.SEGMENT_POINT, params.toString(), refreshAfter = false).onSuccess { result -> setSelection(label, result) }
+            selecting = false
+        }
+    }
+
+    /** Canvas drag (document pixels): a box (SAM), rectangle, ellipse or freehand lasso. */
+    fun canvasDrag(path: List<androidx.compose.ui.geometry.Offset>) {
+        if (path.size < 2) return
+        val xs = path.map { it.x }
+        val ys = path.map { it.y }
+        val x = xs.min().roundToInt()
+        val y = ys.min().roundToInt()
+        val w = (xs.max() - xs.min()).roundToInt().coerceAtLeast(1)
+        val h = (ys.max() - ys.min()).roundToInt().coerceAtLeast(1)
+        val mode = selectMode
+        viewModelScope.launch {
+            selecting = true
+            val fresh: JsonElement? = when (mode) {
+                SelectMode.Object, SelectMode.Box ->
+                    lab.fn(Fn.SEGMENT_BOX, buildJsonObject { putJsonArray("box") { listOf(x, y, w, h).forEach { add(JsonPrimitive(it)) } } }.toString(), refreshAfter = false).getOrNull()
+                SelectMode.Rect, SelectMode.Ellipse -> photocraftShape(
+                    "select.rect",
+                    buildJsonObject { put("x", x); put("y", y); put("width", w); put("height", h); put("ellipse", mode == SelectMode.Ellipse) },
+                )
+                SelectMode.Lasso -> photocraftShape(
+                    "select.lasso",
+                    buildJsonObject { putJsonArray("points") { path.forEach { add(JsonArray(listOf(JsonPrimitive(it.x.roundToInt()), JsonPrimitive(it.y.roundToInt())))) } } },
+                )
+            }
+            val newMask = fresh?.let(::maskHandleIn)
+            if (newMask != null) {
+                samPoints.clear()
+                val old = selection?.mask
+                val combined = if (old != null && combine != Combine.New) {
+                    val op = if (combine == Combine.Add) "union" else "subtract"
+                    lab.fn("cv.combineMasks", buildJsonObject { put("a", old); put("b", newMask); put("op", op) }.toString(), refreshAfter = false).getOrNull()
+                } else fresh
+                val label = when {
+                    combine == Combine.New || old == null -> mode.label
+                    else -> "${selection?.label} ${if (combine == Combine.Add) "+" else "−"} ${mode.label}"
+                }
+                setSelection(label, combined)
+            }
+            selecting = false
+        }
+    }
+
+    /** Run a PhotoCraft selection command, then read the selection back as a mask handle. */
+    private suspend fun photocraftShape(id: String, params: JsonObject): JsonElement? {
+        if (lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", id); put("params", params) }.toString(), refreshAfter = false).isFailure) return null
+        return lab.fn("select.toMask", "{}", refreshAfter = false).getOrNull()
+    }
+
+    private suspend fun setSelection(label: String, result: JsonElement?) {
+        val handle = result?.let(::maskHandleIn) ?: return
+        val engine = ((result as? JsonObject)?.get("engine") as? JsonPrimitive)?.contentOrNull
+        selection = Selection(if (engine != null) "$label · $engine" else label, handle, renderOverlay(handle))
+    }
 
     fun selectConcept(text: String) {
         if (text.isBlank()) return
@@ -166,7 +324,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             r.onSuccess { result ->
                 val handle = result?.let(::maskHandleIn)
                 val overlay = handle?.let { renderOverlay(it) }
-                selection = Selection(label, handle, overlay)
+                val engine = ((result as? JsonObject)?.get("engine") as? JsonPrimitive)?.contentOrNull
+                selection = Selection(if (engine != null) "$label · $engine" else label, handle, overlay)
             }
             selecting = false
         }
@@ -175,6 +334,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun clearSelection() {
         val had = selection
         selection = null
+        samPoints.clear()
         if (had != null && had.mask == null) edit("select.deselect")
     }
 

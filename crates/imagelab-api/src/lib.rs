@@ -371,10 +371,11 @@ impl Registry {
             Ok(result) => result,
             Err(_) => Err(ApiError::internal(format!("`{id}` panicked"))),
         };
-        if result.is_ok() && f.effects != Effects::ReadOnly {
-            if let Some(hook) = &self.after_mutation {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(ctx)));
-            }
+        if result.is_ok()
+            && f.effects != Effects::ReadOnly
+            && let Some(hook) = &self.after_mutation
+        {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(ctx)));
         }
         result
     }

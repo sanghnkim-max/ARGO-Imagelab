@@ -226,11 +226,11 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
     val preview = state.preview
     val selectMode = vm.tool == Tool.Select
     var box by remember { mutableStateOf(IntSize.Zero) }
-    var draft by remember { mutableStateOf<Pair<Offset, Offset>?>(null) }
+    var draft by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var hover by remember { mutableStateOf<Offset?>(null) }
     val padPx = with(LocalDensity.current) { CANVAS_PAD.toPx() }
 
-    fun toDoc(p: Offset): Offset? {
+    fun toDocOrClamp(p: Offset, clamp: Boolean): Offset? {
         val bmp = preview ?: return null
         val c = Offset(box.width / 2f, box.height / 2f)
         val u = c + (p - c - vm.offset) / vm.scale
@@ -239,11 +239,14 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
         val dh = bmp.height * fit
         val nx = (u.x - (c.x - dw / 2)) / dw
         val ny = (u.y - (c.y - dh / 2)) / dh
-        if (nx !in 0f..1f || ny !in 0f..1f) return null
+        if (!clamp && (nx !in 0f..1f || ny !in 0f..1f)) return null
+        val (cx, cy) = nx.coerceIn(0f, 1f) to ny.coerceIn(0f, 1f)
         val docW = if (state.width > 0) state.width else bmp.width
         val docH = if (state.height > 0) state.height else bmp.height
-        return Offset(nx * docW, ny * docH)
+        return Offset(cx * docW, cy * docH)
     }
+
+    fun toDoc(p: Offset): Offset? = toDocOrClamp(p, clamp = false)
 
     // A new document starts fitted, not at the last one's zoom and pan.
     LaunchedEffect(state.name, state.width, state.height) { vm.resetView() }
@@ -260,7 +263,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                     val down = awaitFirstDown(requireUnconsumed = false)
                     if (down.type == PointerType.Stylus) vm.stylusPressure = down.pressure
                     val start = down.position
-                    var last = start
+                    val path = mutableListOf(start)
                     var multi = false
                     var dragged = false
                     while (true) {
@@ -269,7 +272,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                         if (pressed.isEmpty()) break
                         if (pressed.size >= 2) {
                             multi = true
-                            draft = null
+                            draft = emptyList()
                             vm.scale = (vm.scale * event.calculateZoom()).coerceIn(0.5f, 12f)
                             vm.offset += event.calculatePan()
                         } else if (!multi) {
@@ -277,22 +280,23 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                             if (ch.type == PointerType.Stylus) vm.stylusPressure = ch.pressure
                             if (selectMode) {
                                 if ((ch.position - start).getDistance() > viewConfiguration.touchSlop) dragged = true
-                                if (dragged) draft = start to ch.position
+                                if (dragged && (ch.position - path.last()).getDistance() > 3f) {
+                                    path += ch.position
+                                    draft = path.toList()
+                                }
                             } else {
                                 vm.offset += ch.position - ch.previousPosition
                             }
-                            last = ch.position
                         }
                         event.changes.forEach { it.consume() }
                     }
-                    draft = null
+                    draft = emptyList()
                     if (selectMode && !multi) {
                         if (dragged) {
-                            val a = toDoc(start)
-                            val b = toDoc(last)
-                            if (a != null && b != null) vm.selectBox(a.x, a.y, b.x, b.y)
+                            val pts = if (vm.selectMode == SelectMode.Lasso) path else listOf(path.first(), path.last())
+                            vm.canvasDrag(pts.mapNotNull { toDocOrClamp(it, clamp = true) })
                         } else {
-                            toDoc(start)?.let { vm.selectPoint(it.x, it.y) }
+                            toDoc(start)?.let { vm.canvasTap(it.x, it.y) }
                         }
                     }
                 }
@@ -343,8 +347,24 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
             }
         }
         Canvas(Modifier.fillMaxSize()) {
-            draft?.let { (a, b) ->
-                drawRect(Accent, topLeft = Offset(minOf(a.x, b.x), minOf(a.y, b.y)), size = Size(kotlin.math.abs(b.x - a.x), kotlin.math.abs(b.y - a.y)), style = Stroke(2.dp.toPx()))
+            // The shape being drawn: box/rectangle, ellipse, or the freehand lasso path.
+            if (draft.size >= 2) {
+                val a = draft.first()
+                val b = draft.last()
+                val tl = Offset(minOf(a.x, b.x), minOf(a.y, b.y))
+                val sz = Size(kotlin.math.abs(b.x - a.x), kotlin.math.abs(b.y - a.y))
+                val stroke = Stroke(2.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 8f)))
+                when (vm.selectMode) {
+                    SelectMode.Ellipse -> drawOval(Accent, topLeft = tl, size = sz, style = stroke)
+                    SelectMode.Lasso -> drawPath(
+                        androidx.compose.ui.graphics.Path().apply {
+                            moveTo(draft[0].x, draft[0].y)
+                            draft.drop(1).forEach { lineTo(it.x, it.y) }
+                        },
+                        Accent, style = stroke,
+                    )
+                    else -> drawRect(Accent, topLeft = tl, size = sz, style = stroke)
+                }
             }
             // A rule-of-thirds-and-finer grid while straightening, to line up horizons.
             if (vm.straightener.active) {

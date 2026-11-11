@@ -42,6 +42,8 @@ pub struct Input {
     pub kind: &'static str,
 }
 
+
+
 pub fn resolve(ctx: &Ctx, src: &Source) -> ApiResult<Input> {
     if src.image.is_some() && src.photo.is_some() {
         return Err(ApiError::bad_params("give `image` or `photo`, not both (neither = the open document)"));
