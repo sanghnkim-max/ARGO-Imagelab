@@ -117,18 +117,6 @@ private fun SelectSheet(vm: EditorViewModel) {
 // ── Adjust ───────────────────────────────────────────────────────────────────────────────────
 
 /** A slider-driven adjustment layer: `params(value)` builds its JSON. */
-private data class Adjustment(val label: String, val range: ClosedFloatingPointRange<Float>, val command: String, val params: (Int) -> String)
-
-// Adjustment layers keep each edit live and maskable (PhotoCraft's non-destructive model).
-private val adjustments = listOf(
-    Adjustment("Brightness", -150f..150f, "layer.newAdjustmentLayer.brightnessContrast") { """{"brightness":$it}""" },
-    Adjustment("Contrast", -50f..100f, "layer.newAdjustmentLayer.brightnessContrast") { """{"contrast":$it}""" },
-    Adjustment("Exposure ×10", -50f..50f, "layer.newAdjustmentLayer.exposure") { """{"exposure":${it / 10.0}}""" },
-    Adjustment("Vibrance", -100f..100f, "layer.newAdjustmentLayer.vibrance") { """{"vibrance":$it}""" },
-    Adjustment("Saturation", -100f..100f, "layer.newAdjustmentLayer.hueSaturation") { """{"saturation":$it}""" },
-    Adjustment("Hue", -180f..180f, "layer.newAdjustmentLayer.hueSaturation") { """{"hue":$it}""" },
-)
-
 private val quick = listOf(
     "Auto Tone" to "image.autoTone",
     "Auto Contrast" to "image.autoContrast",
@@ -140,7 +128,7 @@ private val quick = listOf(
 @Composable
 private fun AdjustSheet(vm: EditorViewModel) {
     var selectedIndex by rememberSaveable { mutableStateOf(0) }
-    val selected = adjustments[selectedIndex]
+    val selected = adjustSpecs[selectedIndex]
     var value by remember(selectedIndex) { mutableFloatStateOf(0f) }
     val masked = vm.selection != null
     if (masked) Text("Applies inside the selection (${vm.selection?.label}).", style = MaterialTheme.typography.bodySmall, color = Accent)
@@ -148,15 +136,22 @@ private fun AdjustSheet(vm: EditorViewModel) {
         quick.forEach { (label, id) -> AssistChip(onClick = { vm.edit(id, masked = id.startsWith("layer.")) }, label = { Text(label) }) }
     }
     ChipRow {
-        adjustments.forEachIndexed { i, a -> FilterChip(selected = i == selectedIndex, onClick = { selectedIndex = i }, label = { Text(a.label) }) }
+        adjustSpecs.forEachIndexed { i, a -> FilterChip(selected = i == selectedIndex, onClick = { selectedIndex = i }, label = { Text(a.label) }) }
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Slider(value = value, onValueChange = { value = it }, valueRange = selected.range, modifier = Modifier.weight(1f))
-        Text(value.roundToInt().toString(), Modifier.width(44.dp), fontFamily = FontFamily.Monospace)
+        // The photo follows the slider as it moves (LiveAdjust): GPU preview at once, the engine right behind.
+        Slider(
+            value = value,
+            onValueChange = { value = it; vm.live.drag(selected, it) },
+            onValueChangeFinished = { vm.live.release() },
+            valueRange = selected.range,
+            modifier = Modifier.weight(1f),
+        )
+        Text(if (selected.range.endInclusive <= 10f) "%.2f".format(value) else value.roundToInt().toString(), Modifier.width(52.dp), fontFamily = FontFamily.Monospace)
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = { vm.edit(selected.command, selected.params(value.roundToInt()), masked = true) }) { Text("Add ${selected.label} layer") }
-        TextButton(onClick = { value = 0f }) { Text("Reset") }
+        OutlinedButton(onClick = { vm.live.newLayer(); value = 0f }) { Text("New ${selected.label} layer") }
+        TextButton(onClick = { value = 0f; vm.live.drag(selected, 0f); vm.live.release() }) { Text("Reset") }
     }
 }
 

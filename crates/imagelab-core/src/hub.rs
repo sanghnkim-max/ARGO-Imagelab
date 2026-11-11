@@ -46,13 +46,38 @@ impl Drop for Busy<'_> {
     }
 }
 
+/// The active document and its revision as last reported, shared by the core and the
+/// registry's after-edit hook, so a change is announced once whoever notices it first.
+#[derive(Default)]
+pub(crate) struct DocWatch {
+    seen: Mutex<Option<(usize, u64)>>,
+}
+
+impl DocWatch {
+    /// Emit `DocChanged` attributed to `source` if the active document or its revision moved.
+    pub(crate) fn report(&self, shared: &Shared, current: Option<(usize, u64)>, source: Source) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if *seen == current {
+            return;
+        }
+        *seen = current;
+        drop(seen);
+        let (doc, revision) = current.unwrap_or((0, 0));
+        shared.events.emit(Event::DocChanged { doc, revision, source });
+    }
+
+    /// Read the session (it is free between calls) and report.
+    pub(crate) fn notice(&self, shared: &Shared, source: Source) {
+        let list = shared.session.lock().unwrap_or_else(PoisonError::into_inner).session_list();
+        self.report(shared, active_revision(&list), source);
+    }
+}
+
 pub(crate) struct Core {
     pub registry: Registry,
     pub shared: Shared,
     pub sink: Arc<ForwardingSink>,
-    /// The active document and its revision as last reported (`None`: nothing seen yet or
-    /// no document open).
-    seen: Mutex<Option<(usize, u64)>>,
+    watch: Arc<DocWatch>,
     /// Calls in flight inside the core; the watcher stays quiet while any run, so an edit is
     /// attributed to the surface that made it.
     in_flight: AtomicUsize,
@@ -61,11 +86,16 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    pub(crate) fn new(registry: Registry, shared: Shared, sink: Arc<ForwardingSink>) -> Self {
-        let core = Self { registry, shared, sink, seen: Mutex::new(None), in_flight: AtomicUsize::new(0), running: Mutex::new(Vec::new()) };
+    pub(crate) fn new(mut registry: Registry, shared: Shared, sink: Arc<ForwardingSink>) -> Self {
+        let watch = Arc::new(DocWatch::default());
+        // Live preview: every editing call (each step of a script included) announces its
+        // change as soon as it returns.
+        let w = watch.clone();
+        registry.set_after_mutation(Arc::new(move |ctx: &Ctx| w.notice(&ctx.shared, ctx.source)));
+        let core = Self { registry, shared, sink, watch, in_flight: AtomicUsize::new(0), running: Mutex::new(Vec::new()) };
         // Start from the current state, so the first event is a real change.
         let current = core.current();
-        *core.seen.lock().unwrap_or_else(PoisonError::into_inner) = current;
+        *core.watch.seen.lock().unwrap_or_else(PoisonError::into_inner) = current;
         core
     }
 
@@ -124,14 +154,7 @@ impl Core {
     }
 
     fn report(&self, current: Option<(usize, u64)>, source: Source) {
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        if *seen == current {
-            return;
-        }
-        *seen = current;
-        drop(seen);
-        let (doc, revision) = current.unwrap_or((0, 0));
-        self.shared.events.emit(Event::DocChanged { doc, revision, source });
+        self.watch.report(&self.shared, current, source);
     }
 }
 

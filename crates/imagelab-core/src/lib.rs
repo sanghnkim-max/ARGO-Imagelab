@@ -334,6 +334,33 @@ impl Lab {
         Ok(guard.render_png(None, max_side)?)
     }
 
+    /// The active document flattened to premultiplied RGBA8, longest side at most `max_side`:
+    /// the live-preview path. PhotoCraft's reduced compositor works from a downsampled proxy
+    /// (milliseconds, no full-size composite), and skipping PNG encode/decode keeps a frame
+    /// cheap enough to follow a slider. Premultiplied, so Android copies it straight into an
+    /// ARGB_8888 bitmap.
+    pub fn render_rgba(&self, max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
+        if max_side == 0 || max_side > MAX_PREVIEW_SIDE {
+            return Err(LabError::BadRequest(format!("max_side must be 1..={MAX_PREVIEW_SIDE}")));
+        }
+        let mut guard = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.sync_jobs();
+        let doc = guard.session.active().map(|d| &d.doc).ok_or_else(|| LabError::BadRequest("no document is open".into()))?;
+        let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| photocraft_compose::thumbnail(doc, max_side)))
+            .map_err(|_| LabError::Other("rendering panicked".into()))?;
+        drop(guard);
+        let mut px = img.pixels;
+        for p in px.chunks_exact_mut(4) {
+            let a = u16::from(p[3]);
+            if a < 255 {
+                for c in &mut p[..3] {
+                    *c = ((u16::from(*c) * a + 127) / 255) as u8;
+                }
+            }
+        }
+        Ok((img.width, img.height, px))
+    }
+
     /// True once the GPU renderer failed and the session fell back to the CPU compositor.
     pub fn gpu_disabled(&self) -> bool {
         self.gpu_disabled.load(Ordering::Relaxed)
@@ -523,6 +550,19 @@ mod tests {
         lab.save("exports/gpu.png", None).unwrap();
         assert!(dir.path().join("exports/gpu.png").is_file());
         eprintln!("gpu disabled: {}", lab.gpu_disabled());
+    }
+
+    #[test]
+    fn render_rgba_is_premultiplied_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = Lab::new(dir.path(), &LabOptions { gpu: false }).unwrap();
+        assert!(lab.render_rgba(256).is_err(), "no document yet");
+        lab.new_document(json!({"width": 400, "height": 200})).unwrap();
+        let (w, h, px) = lab.render_rgba(100).unwrap();
+        assert_eq!((w, h), (100, 50));
+        assert_eq!(px.len(), (w * h * 4) as usize);
+        assert_eq!(&px[..4], &[255, 255, 255, 255]);
+        assert!(lab.render_rgba(0).is_err());
     }
 
     #[test]

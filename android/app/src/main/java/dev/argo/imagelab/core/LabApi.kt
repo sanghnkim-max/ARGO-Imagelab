@@ -47,6 +47,8 @@ interface LabApi {
     fun undo(): String
     fun redo(): String
     fun renderPng(maxSide: UInt): ByteArray
+    /** Premultiplied RGBA8 of the active document (live-preview path, no PNG round trip). */
+    fun renderRgba(maxSide: UInt): RgbaFrame
     fun gpuDisabled(): Boolean
     fun stopMcpHttp()
     fun mcpHttpPort(): UShort?
@@ -81,6 +83,7 @@ class FfiLabApi(private val core: ImageLab) : LabApi {
     override fun undo(): String = core.undo()
     override fun redo(): String = core.redo()
     override fun renderPng(maxSide: UInt): ByteArray = core.renderPng(maxSide)
+    override fun renderRgba(maxSide: UInt): RgbaFrame = core.renderRgba(maxSide)
     override fun gpuDisabled(): Boolean = core.gpuDisabled()
     override fun stopMcpHttp() = core.stopMcpHttp()
     override fun mcpHttpPort(): UShort? = core.mcpHttpPort()

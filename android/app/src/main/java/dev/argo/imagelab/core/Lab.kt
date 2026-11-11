@@ -2,6 +2,7 @@ package dev.argo.imagelab.core
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import java.nio.ByteBuffer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
@@ -78,14 +79,62 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
                 })
             }.onFailure { t -> _state.update { it.copy(message = "Events unavailable: ${describe(t)}") } }
         }
-        // Debounce: a burst of edits (a batch, an agent program) renders once.
+        // Debounce: a burst of edits (a batch, an agent program) renders once. While the person
+        // is interacting (a slider drag), render at once at the interactive size instead.
         scope.launch {
             for (unit in refreshRequests) {
-                delay(REFRESH_DEBOUNCE_MS)
-                refresh()
+                if (isInteractive()) {
+                    renderInteractive()
+                    scheduleSharpen()
+                } else {
+                    delay(REFRESH_DEBOUNCE_MS)
+                    refresh()
+                }
             }
         }
     }
+
+    // ── live preview ─────────────────────────────────────────────────────────────────────
+
+    @Volatile private var interactiveUntil = 0L
+    private var sharpenJob: kotlinx.coroutines.Job? = null
+
+    private fun isInteractive() = System.currentTimeMillis() < interactiveUntil
+
+    /** The person is dragging something: render fast and small until they stop. */
+    fun markInteractive() {
+        interactiveUntil = System.currentTimeMillis() + INTERACTIVE_HOLD_MS
+    }
+
+    /** Once interaction stops, re-render at full preview size (and re-read layers). */
+    private fun scheduleSharpen() {
+        sharpenJob?.cancel()
+        sharpenJob = scope.launch {
+            delay(SHARPEN_AFTER_MS)
+            while (isInteractive()) delay(SHARPEN_AFTER_MS)
+            refresh()
+        }
+    }
+
+    /**
+     * Render the active document at [INTERACTIVE_SIDE] straight into the preview: RGBA from the
+     * reduced compositor, no PNG, no session/layer re-read. Returns whether a frame landed.
+     */
+    suspend fun renderInteractive(): Boolean = renderLock.withLock {
+        withContext(Dispatchers.IO) {
+            val api = runCatching { apiDeferred.await() }.getOrNull() ?: return@withContext false
+            val frame = runCatching { api.renderRgba(INTERACTIVE_SIDE.toUInt()) }.getOrNull() ?: return@withContext false
+            val bitmap = frame.toBitmap() ?: return@withContext false
+            _state.update { it.copy(preview = bitmap, version = it.version + 1) }
+            true
+        }
+    }
+
+    private fun RgbaFrame.toBitmap(): Bitmap? = runCatching {
+        Bitmap.createBitmap(width.toInt(), height.toInt(), Bitmap.Config.ARGB_8888).apply {
+            copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
+        }
+    }.getOrNull()
 
     /** Ask for a re-render soon (debounced). */
     fun requestRefresh() {
@@ -123,8 +172,10 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
             }
             val active = (info["active"]?.jsonPrimitive?.intOrNull ?: 0).coerceIn(0, docs.size - 1)
             val doc = docs[active] as? JsonObject
-            val png = runCatching { api.renderPng(PREVIEW_SIDE.toUInt()) }
-            val bitmap = png.getOrNull()?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+            // RGBA first (fast path); PNG only if that fails.
+            val png = runCatching { api.renderRgba(PREVIEW_SIDE.toUInt()).toBitmap() ?: error("bad frame") }
+                .recoverCatching { _ -> api.renderPng(PREVIEW_SIDE.toUInt()).let { b -> BitmapFactory.decodeByteArray(b, 0, b.size) } }
+            val bitmap = png.getOrNull()
             val detail = (runCatching { api.call(Fn.DOC_INSPECT, "{}", "ui") }.getOrNull() ?: runCatching { api.inspect() }.getOrNull())
                 ?.let(::parse) as? JsonObject
             _state.update {
@@ -167,6 +218,10 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
         /** Longest side of the on-screen preview. Exports always render at full size. */
         const val PREVIEW_SIDE = 2048
         private const val REFRESH_DEBOUNCE_MS = 120L
+        /** Longest side while interacting: a quarter of the pixels, so frames follow a slider. */
+        const val INTERACTIVE_SIDE = 1024
+        private const val INTERACTIVE_HOLD_MS = 600L
+        private const val SHARPEN_AFTER_MS = 350L
 
         fun describe(t: Throwable): String = when (t) {
             is ImageLabException.BadRequest -> t.reason

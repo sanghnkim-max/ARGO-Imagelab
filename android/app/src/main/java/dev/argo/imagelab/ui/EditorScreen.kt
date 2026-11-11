@@ -48,6 +48,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,6 +61,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -243,8 +245,14 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
         return Offset(nx * docW, ny * docH)
     }
 
+    // A new document starts fitted, not at the last one's zoom and pan.
+    LaunchedEffect(state.name, state.width, state.height) { vm.resetView() }
+
     Box(
         modifier
+            // Zoomed or panned, the photo stays inside the canvas: it never covers the top bar,
+            // the layer strip's edge or the tool sheet.
+            .clipToBounds()
             .background(CanvasBackground)
             .onSizeChanged { box = it }
             .pointerInput(selectMode) {
@@ -314,7 +322,14 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                 translationX = vm.offset.x
                 translationY = vm.offset.y
             }
-            Image(bitmap = preview.asImageBitmap(), contentDescription = "Document preview", contentScale = ContentScale.Fit, modifier = transform)
+            // While a slider moves, the GPU draws the change the engine has not rendered yet.
+            Image(
+                bitmap = preview.asImageBitmap(),
+                contentDescription = "Document preview",
+                contentScale = ContentScale.Fit,
+                colorFilter = vm.live.matrix?.let { androidx.compose.ui.graphics.ColorFilter.colorMatrix(it) },
+                modifier = transform,
+            )
             vm.selection?.overlay?.let { ov ->
                 Image(bitmap = ov.asImageBitmap(), contentDescription = "Selection mask", contentScale = ContentScale.Fit, modifier = transform)
             }

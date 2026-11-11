@@ -260,17 +260,28 @@ pub trait Module {
     fn register(&self, registry: &mut Registry);
 }
 
+/// Called after every successful call of a function that is not ReadOnly.
+pub type AfterMutation = Arc<dyn Fn(&Ctx) + Send + Sync>;
+
 /// All areas and functions.
 #[derive(Default, Clone)]
 pub struct Registry {
     areas: BTreeMap<String, Area>,
     functions: BTreeMap<String, Function>,
     pub warnings: Vec<String>,
+    after_mutation: Option<AfterMutation>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Run `f` after every successful call of a function that is not ReadOnly — each step of
+    /// a script included — so the core can announce `DocChanged` as edits land (live preview)
+    /// rather than when a whole program ends.
+    pub fn set_after_mutation(&mut self, f: AfterMutation) {
+        self.after_mutation = Some(f);
     }
 
     pub fn with(mut self, module: &dyn Module) -> Self {
@@ -356,10 +367,16 @@ impl Registry {
         }
         ctx.check_cancel()?;
         let handler = f.handler.clone();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(ctx, params))) {
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(ctx, params))) {
             Ok(result) => result,
             Err(_) => Err(ApiError::internal(format!("`{id}` panicked"))),
+        };
+        if result.is_ok() && f.effects != Effects::ReadOnly {
+            if let Some(hook) = &self.after_mutation {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(ctx)));
+            }
         }
+        result
     }
 }
 
@@ -406,6 +423,21 @@ mod tests {
         assert_eq!(r.call(&ctx, "math.add", json!({"a": "x"})).unwrap_err().code, "bad_params");
         assert_eq!(r.call(&ctx, "math.nope", json!({})).unwrap_err().code, "not_found");
         assert_eq!(r.call(&ctx, "math.boom", json!({})).unwrap_err().code, "internal");
+    }
+
+    #[test]
+    fn after_mutation_runs_for_effects_only() {
+        let mut r = registry();
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = n.clone();
+        r.set_after_mutation(Arc::new(move |_| {
+            c.fetch_add(1, Ordering::Relaxed);
+        }));
+        let ctx = Ctx::new(shared(), Source::Agent);
+        r.call(&ctx, "math.add", json!({"a": 1, "b": 1})).unwrap();
+        assert_eq!(n.load(Ordering::Relaxed), 0);
+        r.call(&ctx, "math.store", json!({})).unwrap();
+        assert_eq!(n.load(Ordering::Relaxed), 1);
     }
 
     #[test]

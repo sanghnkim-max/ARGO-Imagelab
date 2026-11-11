@@ -28,7 +28,53 @@ pub fn run_allowed(h: &mut Headless, id: &str, params: Value) -> ApiResult<Value
         return Err(ApiError::bad_params(format!("params of `{id}` must be an object")));
     }
     photocraft_automation::workspace::authorize_engine_command(id, &params).map_err(|e| ApiError::new("not_allowed", e.to_string()))?;
-    Ok(h.command_run(id, params)?)
+    match h.command_run(id, params.clone()) {
+        Ok(v) => Ok(v),
+        // Pixel commands (filters, auto tone/color, direct adjustments, retouch) refuse an
+        // adjustment/fill/text layer. People and agents mean "the photo": make the topmost
+        // visible pixel layer active and run once more, saying so in the result.
+        Err(e) if needs_pixels(&e.to_string()) => match top_pixel_layer(h) {
+            Some(layer) => {
+                h.command_run("layer.select", json!({"layer": layer}))?;
+                let mut v = h.command_run(id, params)?;
+                if let Value::Object(m) = &mut v {
+                    m.insert("retargetedLayer".into(), json!(layer));
+                } else {
+                    v = json!({"result": v, "retargetedLayer": layer});
+                }
+                Ok(v)
+            }
+            None => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// PhotoCraft's refusal for a pixel command on a layer without pixels.
+fn needs_pixels(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("has no pixels") || m.contains("need a pixel layer") || m.contains("needs a pixel layer")
+}
+
+/// The topmost visible pixel layer of the active document, from the inspect projection.
+fn top_pixel_layer(h: &Headless) -> Option<u64> {
+    fn walk(layers: &Value) -> Option<u64> {
+        for l in layers.as_array()? {
+            if l.get("visible").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            if l.get("kind").and_then(Value::as_str) == Some("Pixel") {
+                if let Some(id) = l.get("id").and_then(Value::as_u64) {
+                    return Some(id);
+                }
+            }
+            if let Some(found) = l.get("children").and_then(walk) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(h.inspect(None).ok()?.get("layers")?)
 }
 
 /// Index and revision of the active document.

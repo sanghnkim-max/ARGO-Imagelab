@@ -301,3 +301,12 @@ fn batch_honours_cancel() {
     let events = sink.1.lock().unwrap();
     assert!(matches!(events.last(), Some(Event::JobFinished { ok: false, .. })), "{events:?}");
 }
+
+#[test]
+fn pixel_commands_retarget_from_an_adjustment_layer() {
+    let e = env();
+    e.ok("doc.new", json!({"width": 32, "height": 32}));
+    e.ok("edit.adjust", json!({"kind": "vibrance", "params": {"vibrance": 10}}));
+    let v = e.ok("edit.run", json!({"id": "image.autoColor", "params": {}}));
+    assert!(v["retargetedLayer"].is_u64(), "{v}");
+}

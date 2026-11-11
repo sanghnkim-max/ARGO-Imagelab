@@ -26,6 +26,7 @@ base64 = "0.22"
 photocraft-automation = { workspace = true }
 photocraft-engine = { workspace = true }
 photocraft-cli = { workspace = true }
+photocraft-compose = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
 photocraft-io = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
 rmcp = { workspace = true, features = ["transport-async-rw"] }
 tokio = { workspace = true }

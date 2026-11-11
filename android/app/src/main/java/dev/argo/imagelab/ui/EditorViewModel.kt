@@ -54,6 +54,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     var selection by mutableStateOf<Selection?>(null); private set
     var selecting by mutableStateOf(false); private set
 
+    /** Live adjustment: the photo follows the Adjust sliders (masked by the selection's handle). */
+    val live = LiveAdjust(lab, viewModelScope) { selection?.mask }
+
     /** Last stylus pressure on the canvas (0..1): plumbed for the coming retouch brushes. */
     var stylusPressure by mutableFloatStateOf(0f)
 

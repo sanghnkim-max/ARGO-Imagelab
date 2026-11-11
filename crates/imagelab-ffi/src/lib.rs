@@ -108,6 +108,14 @@ fn text(value: &Value) -> String {
     value.to_string()
 }
 
+/// One rendered frame: premultiplied RGBA8, row-major.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RgbaFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 /// What `photocraft-cli` printed and returned.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CliResult {
@@ -246,6 +254,13 @@ impl ImageLab {
     /// The active document as PNG bytes, longest side at most `max_side` (0: full size).
     pub fn render_png(&self, max_side: u32) -> Result<Vec<u8>> {
         Ok(self.lab.render_png(max_side)?)
+    }
+
+    /// The active document as premultiplied RGBA8 (longest side ≤ `max_side`, 1..=2048): the
+    /// live-preview path, no PNG round trip. Copy into an ARGB_8888 bitmap.
+    pub fn render_rgba(&self, max_side: u32) -> Result<RgbaFrame> {
+        let (width, height, rgba) = self.lab.render_rgba(max_side)?;
+        Ok(RgbaFrame { width, height, rgba })
     }
 
     /// True once the GPU renderer failed and rendering fell back to the CPU.
