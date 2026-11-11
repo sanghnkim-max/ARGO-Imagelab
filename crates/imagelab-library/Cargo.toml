@@ -13,3 +13,12 @@ workspace = true
 imagelab-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Decoders (JPEG/PNG/WebP/TIFF/...), upright by EXIF orientation; JPEG encode for the thumbnail cache.
+photocraft-codecs = { workspace = true }
+# Face detection (libfacedetection port, ~100 KB weights, pure Rust). Already linked through
+# photocraft-engine; same rev as the workspace's PhotoCraft pin.
+photocraft-algo = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
+# EXIF tags (BSD-2-Clause, pure Rust): camera, lens, exposure, date, GPS.
+kamadak-exif = "0.6"
+# Content hash for dedupe and cache keys (MIT OR Apache-2.0).
+sha2 = "0.10"
