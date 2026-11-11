@@ -63,10 +63,10 @@ fn top_pixel_layer(h: &Headless) -> Option<u64> {
             if l.get("visible").and_then(Value::as_bool) == Some(false) {
                 continue;
             }
-            if l.get("kind").and_then(Value::as_str) == Some("Pixel") {
-                if let Some(id) = l.get("id").and_then(Value::as_u64) {
-                    return Some(id);
-                }
+            if l.get("kind").and_then(Value::as_str) == Some("Pixel")
+                && let Some(id) = l.get("id").and_then(Value::as_u64)
+            {
+                return Some(id);
             }
             if let Some(found) = l.get("children").and_then(walk) {
                 return Some(found);
