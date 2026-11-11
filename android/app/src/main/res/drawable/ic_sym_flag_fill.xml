@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Material Symbols Outlined "flag" (wght 400, GRAD 0, opsz 24, FILL 1), Apache-2.0.
+     Fetched by android/scripts/material-symbols.sh; do not edit by hand. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="960"
+    android:viewportHeight="960"
+
+    android:autoMirrored="true">
+  <path
+      android:fillColor="@android:color/white"
+      android:pathData="M200,840L200,160L560,160L576,240L800,240L800,640L520,640L504,560L280,560L280,840L200,840Z"/>
+</vector>

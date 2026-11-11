@@ -34,7 +34,8 @@ Gradle runs cargo-ndk (core + CLI) and uniffi-bindgen before compiling Kotlin.
 
 ## Try the MCP server from your laptop
 
-In the app: **MCP** tab → switch on (it shows the token; "allow edits" is off by default). Then:
+In the app: **Settings → Developer → MCP server** → switch on (it shows the token; "Allow edits"
+turns on the edit tools; off by default). Then:
 
 ```bash
 adb forward tcp:7700 tcp:7700
@@ -74,8 +75,8 @@ call or program failed. Anything else is passed to `photocraft-cli` (`imagelab i
 
 ## CLI on the phone
 
-In-app: the **CLI** tab runs `photocraft-cli` in the workspace (`commands --filter blur`,
-`info imports/<file>`). Over adb, the APK's bundled binary (its path is shown in the MCP tab):
+In-app: **Settings → Developer → CLI console** runs `photocraft-cli` in the workspace (`commands --filter blur`,
+`info imports/<file>`). Over adb, the APK's bundled binary (its path is shown under Developer):
 
 ```bash
 APK_DIR=$(adb shell pm path dev.argo.imagelab | sed 's/package://; s/base.apk//' | tr -d '\r')
@@ -90,7 +91,27 @@ the workspace, not the open document).
 
 ## In-app agent
 
-**Agent** tab → Settings → your Anthropic API key (stored in app-private storage). Default model
-`claude-opus-5-5`. The agent's tools are PhotoCraft's MCP tools plus `photocraft_cli`.
+**Settings → Agent** → your Anthropic API key (sealed with an Android Keystore AES-GCM key).
+Default model `claude-opus-5-5`. The agent writes small JS programs against the function registry:
+tools `lab_script` (may edit) and `lab_read` (read-only realm), plus `photocraft_cli`
+(docs/INTERFACES.md §3). Each program shows as a collapsible row with its code, previews and the
+photos it touched.
+
+## App UI
+
+Docs: [docs/INTERFACES.md §10](docs/INTERFACES.md). Code: `android/app/src/main/java/dev/argo/imagelab/`.
+
+* **Library** (home): photo grid with ratings/flags, long-press multi-select, rate/flag,
+  "Ask agent about these", batch export with a progress card, import from the system picker.
+* **Editor**: top bar (Library, undo, redo, export, agent, settings), pinch/pan canvas, layer strip,
+  floating add (photo layer, text, fills, adjustment), tools Layers · Select · Adjust · Retouch · Crop.
+  Select: Subject/Sky chips, tap = point, drag = box, or type a concept; the mask shows as an overlay.
+* **Adaptive**: compact → bottom tool bar + agent sheet; medium/expanded → navigation rail + right
+  pane (agent or tool options), expanded adds a layers column and a list/detail library;
+  foldables → tabletop (canvas above the hinge) and book (canvas | pane) postures.
+* The UI reaches the core only through `core/LabApi.kt`; `core/PendingFfi.kt` holds stand-ins for
+  §11 FFI calls not yet exported (delete it once the bindings have them).
+
+Screenshots: `android/docs/screenshots/`.
 
 Licence: Apache-2.0. PhotoCraft is MIT OR Apache-2.0.
