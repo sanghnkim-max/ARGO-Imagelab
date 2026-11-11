@@ -189,6 +189,17 @@ impl Handles {
         }
     }
 
+    /// Every live handle (unordered). The script runtime snapshots this before a run so it
+    /// frees only handles the run itself created.
+    pub fn ids(&self) -> Vec<HandleId> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner).0.keys().copied().collect()
+    }
+
+    /// True if `id` is live.
+    pub fn contains(&self, id: HandleId) -> bool {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner).0.contains_key(&id)
+    }
+
     pub fn used_bytes(&self) -> usize {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner).1
     }
@@ -217,7 +228,10 @@ mod tests {
         let m = h.put_mask(MaskBuf::new(4, 4, vec![255; 16]).unwrap()).unwrap();
         assert_eq!(h.used_bytes(), 32);
         assert_eq!(h.put_image(ImageBuf::new(6, 4, vec![0; 96]).unwrap()).unwrap_err().code, "too_large");
+        assert_eq!(h.ids().len(), 2);
+        assert!(h.contains(m));
         assert!(h.free(m));
+        assert!(!h.contains(m));
         assert_eq!(h.used_bytes(), 16);
         assert_eq!(h.mask(m).unwrap_err().code, "not_found");
     }

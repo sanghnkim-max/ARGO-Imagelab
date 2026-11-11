@@ -11,5 +11,15 @@ workspace = true
 
 [dependencies]
 imagelab-api = { workspace = true }
+photocraft-codecs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# QuickJS (MIT). Plain synchronous runtime: registry calls are synchronous, so the program's
+# promises are driven by QuickJS's own job queue (`Promise::finish`), no async executor.
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+
+# rquickjs-sys ships no pre-generated bindings for Android targets: generate them with bindgen
+# (needs a libclang; on macOS Xcode's is found automatically, on Linux set LIBCLANG_PATH to the
+# NDK's, as ARGO's ci-android.yml does).
+[target.'cfg(target_os = "android")'.dependencies]
+rquickjs = { version = "0.14", default-features = false, features = ["std", "bindgen"] }
