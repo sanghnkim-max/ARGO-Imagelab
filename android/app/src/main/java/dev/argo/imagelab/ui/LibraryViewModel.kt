@@ -156,8 +156,22 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                 lab.showMessage("Nothing could be imported.")
                 return@launch
             }
-            val params = buildJsonObject { putJsonArray("paths") { paths.forEach { add(JsonPrimitive(it)) } } }
-            lab.fn(Fn.LIBRARY_IMPORT, params.toString(), refreshAfter = false)
+            // library.import takes one file; a failure leaves the others importing.
+            var imported = 0
+            var duplicates = 0
+            var failure: String? = null
+            for (path in paths) {
+                val r = lab.io { it.call(Fn.LIBRARY_IMPORT, buildJsonObject { put("path", path) }.toString(), "ui") }
+                r.onSuccess { out ->
+                    val status = ((lab.parse(out) as? JsonObject)?.get("importStatus") as? JsonPrimitive)?.contentOrNull
+                    if (status == "duplicate") duplicates++ else imported++
+                }.onFailure { failure = Lab.describe(it) }
+            }
+            val failed = paths.size - imported - duplicates
+            when {
+                failed > 0 -> lab.showMessage("$failed of ${paths.size} not imported: $failure")
+                duplicates > 0 -> lab.showMessage("Imported $imported; $duplicates already in the library.")
+            }
             load()
         }
     }
