@@ -13,3 +13,12 @@ workspace = true
 imagelab-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Decode (EXIF orientation applied) and encode PNG/JPEG/WebP/TIFF: PhotoCraft's own codecs.
+photocraft-codecs = { workspace = true }
+# PatchMatch completion and membrane fill for cv.inpaint (MIT OR Apache-2.0, pure Rust, only rayon).
+lightcraft-inpaint = { git = "https://github.com/storytold/lightcraft", rev = "f786b87533e58c6d31c7f9f2897814904448f39a" }
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"
+photocraft-automation = { workspace = true }

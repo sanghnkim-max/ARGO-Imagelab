@@ -2031,8 +2031,13 @@ name = "imagelab-cv"
 version = "0.1.0"
 dependencies = [
  "imagelab-api",
+ "lightcraft-inpaint",
+ "photocraft-automation",
+ "photocraft-codecs",
+ "rayon",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2469,6 +2474,14 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "lightcraft-inpaint"
+version = "0.18.0"
+source = "git+https://github.com/storytold/lightcraft?rev=f786b87533e58c6d31c7f9f2897814904448f39a#f786b87533e58c6d31c7f9f2897814904448f39a"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "linebender_resource_handle"
