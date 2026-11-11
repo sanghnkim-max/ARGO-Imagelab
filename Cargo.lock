@@ -1991,6 +1991,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagelab-api"
+version = "0.1.0"
+dependencies = [
+ "photocraft-automation",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "imagelab-cli"
 version = "0.1.0"
 dependencies = [
@@ -2017,6 +2027,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagelab-cv"
+version = "0.1.0"
+dependencies = [
+ "imagelab-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "imagelab-edit"
+version = "0.1.0"
+dependencies = [
+ "imagelab-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "imagelab-ffi"
 version = "0.1.0"
 dependencies = [
@@ -2024,6 +2052,33 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uniffi",
+]
+
+[[package]]
+name = "imagelab-library"
+version = "0.1.0"
+dependencies = [
+ "imagelab-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "imagelab-script"
+version = "0.1.0"
+dependencies = [
+ "imagelab-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "imagelab-segment"
+version = "0.1.0"
+dependencies = [
+ "imagelab-api",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,0 +1,15 @@
+[package]
+name = "imagelab-segment"
+description = "select + segment areas: PhotoCraft selections and SAM 3 masks (point, box, text concept) with cached embeddings and model management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+imagelab-api = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

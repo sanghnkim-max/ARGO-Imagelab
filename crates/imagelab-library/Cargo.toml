@@ -1,0 +1,15 @@
+[package]
+name = "imagelab-library"
+description = "library + analyze areas: photo library (import, query, albums, ratings, flags, tags, metadata) and analysis (quality scores, duplicates, histogram, faces, contact sheet)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+imagelab-api = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

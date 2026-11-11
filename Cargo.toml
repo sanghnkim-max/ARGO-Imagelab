@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/imagelab-core", "crates/imagelab-ffi", "crates/imagelab-cli", "tools/uniffi-bindgen"]
+members = ["crates/imagelab-api", "crates/imagelab-library", "crates/imagelab-cv", "crates/imagelab-segment", "crates/imagelab-edit", "crates/imagelab-script", "crates/imagelab-core", "crates/imagelab-ffi", "crates/imagelab-cli", "tools/uniffi-bindgen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,12 @@ rust-version = "1.95"
 # merging #9781). Move forward once upstream fixes it.
 [workspace.dependencies]
 imagelab-core = { path = "crates/imagelab-core" }
+imagelab-api = { path = "crates/imagelab-api" }
+imagelab-library = { path = "crates/imagelab-library" }
+imagelab-cv = { path = "crates/imagelab-cv" }
+imagelab-segment = { path = "crates/imagelab-segment" }
+imagelab-edit = { path = "crates/imagelab-edit" }
+imagelab-script = { path = "crates/imagelab-script" }
 photocraft-automation = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
 photocraft-engine = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
 photocraft-cli = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528", default-features = false }

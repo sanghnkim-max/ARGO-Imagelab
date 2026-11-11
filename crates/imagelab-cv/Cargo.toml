@@ -1,0 +1,15 @@
+[package]
+name = "imagelab-cv"
+description = "cv area: OpenCV-style image operations on handles, pure Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+imagelab-api = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
