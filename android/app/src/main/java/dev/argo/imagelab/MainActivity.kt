@@ -3,29 +3,45 @@ package dev.argo.imagelab
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.ui.graphics.Color
+import androidx.activity.viewModels
+import androidx.compose.runtime.mutableStateOf
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
-import dev.argo.imagelab.ui.EditorScreen
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.window.layout.WindowInfoTracker
+import androidx.window.layout.WindowLayoutInfo
+import dev.argo.imagelab.core.Imports
+import dev.argo.imagelab.ui.AppRoot
+import dev.argo.imagelab.ui.AppViewModel
+import dev.argo.imagelab.ui.ImageLabTheme
+import dev.argo.imagelab.ui.Route
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val app get() = application as ImageLabApp
+    private val appModel: AppViewModel by viewModels()
+    private val windowInfo = mutableStateOf<WindowLayoutInfo?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // Light status/nav bar icons: the app is always dark.
+        enableEdgeToEdge(SystemBarStyle.dark(android.graphics.Color.TRANSPARENT), SystemBarStyle.dark(android.graphics.Color.TRANSPARENT))
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF3D7BF5), background = Color(0xFF121212), surface = Color(0xFF1C1C1E))) {
-                EditorScreen(app = app, onPick = ::importUri)
+            ImageLabTheme {
+                AppRoot(app = app, model = appModel, windowInfo = windowInfo.value, onOpenUri = ::openUri)
             }
         }
-        handleIntent(intent)
+        // Folding features (hinge position, posture) for the tabletop and book layouts.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                WindowInfoTracker.getOrCreate(this@MainActivity).windowLayoutInfo(this@MainActivity).collect { windowInfo.value = it }
+            }
+        }
+        if (savedInstanceState == null) handleIntent(intent)
         lifecycleScope.launch { app.lab.refresh() }
     }
 
@@ -41,24 +57,22 @@ class MainActivity : ComponentActivity() {
             Intent.ACTION_SEND -> intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
             else -> null
         }
-        uri?.let(::importUri)
+        uri?.let(::openUri)
     }
 
-    /** Copy the picked image into the workspace's imports/ and open it. */
-    fun importUri(uri: Uri) {
+    /** Copy the image into the workspace's imports/ and open it in the editor. */
+    fun openUri(uri: Uri) {
         lifecycleScope.launch {
-            val name = displayName(uri) ?: "photo.jpg"
-            val bytes = runCatching { contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
-            if (bytes == null) {
-                app.lab.call(refreshAfter = false) { error("cannot read the picked image") }
+            val picked = Imports.read(this@MainActivity, uri)
+            if (picked == null) {
+                app.lab.showMessage("Cannot read the picked image.")
                 return@launch
             }
-            app.lab.call { it.importBytes(name, bytes) }
+            val opened = app.lab.call { it.importBytes(picked.first, picked.second) }
+            if (opened.isSuccess) {
+                appModel.go(Route.Editor)
+                app.lab.refresh()
+            }
         }
     }
-
-    private fun displayName(uri: Uri): String? =
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-            if (c.moveToFirst()) c.getString(0) else null
-        }
 }
