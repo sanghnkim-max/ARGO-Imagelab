@@ -24,7 +24,7 @@ use crate::tiny_vit::{Ep, Norm, Pointwise, epilogue, exp_nonpositive, gelu_all, 
 const CELLS: usize = 64 * 64;
 const DIM: usize = 256;
 const HEADS: usize = 8;
-const MASK_TOKENS: usize = 4;
+pub(crate) const MASK_TOKENS: usize = 4;
 /// Output logits side (4× the embedding grid).
 pub const LOW_RES: usize = 256;
 
@@ -78,11 +78,11 @@ fn mha(q: &[f32], k: &[f32], v: &[f32], nq: usize, nk: usize, c: usize) -> Resul
     Ok(out)
 }
 
-struct Attention {
-    q: Pointwise,
-    k: Pointwise,
-    v: Pointwise,
-    out: Pointwise,
+pub(crate) struct Attention {
+    pub q: Pointwise,
+    pub k: Pointwise,
+    pub v: Pointwise,
+    pub out: Pointwise,
 }
 
 impl Attention {
@@ -107,7 +107,7 @@ impl Attention {
 }
 
 /// Linear layers with ReLU between them.
-struct Mlp(Vec<Pointwise>);
+pub(crate) struct Mlp(pub Vec<Pointwise>);
 
 impl Mlp {
     fn new(vb: VarBuilder, dims: &[usize]) -> Result<Self> {
@@ -123,17 +123,17 @@ impl Mlp {
     }
 }
 
-struct TwoWayBlock {
-    self_attn: Attention,
-    norm1: Norm,
-    t2i: Attention,
-    norm2: Norm,
-    lin1: Pointwise,
-    lin2: Pointwise,
-    norm3: Norm,
-    i2t: Attention,
-    norm4: Norm,
-    skip_first_pe: bool,
+pub(crate) struct TwoWayBlock {
+    pub self_attn: Attention,
+    pub norm1: Norm,
+    pub t2i: Attention,
+    pub norm2: Norm,
+    pub lin1: Pointwise,
+    pub lin2: Pointwise,
+    pub norm3: Norm,
+    pub i2t: Attention,
+    pub norm4: Norm,
+    pub skip_first_pe: bool,
 }
 
 impl TwoWayBlock {
@@ -175,11 +175,11 @@ impl TwoWayBlock {
 
 /// A stride-2, 2×2 transposed convolution: a gemm to the four sub-pixels, then a pixel shuffle
 /// (with bias, and GELU when asked) into the doubled grid.
-struct Up {
+pub(crate) struct Up {
     /// cin × (4·cout), columns [dy][dx][co].
-    w: Tensor,
-    b: Vec<f32>,
-    cout: usize,
+    pub w: Tensor,
+    pub b: Vec<f32>,
+    pub cout: usize,
 }
 
 impl Up {
@@ -217,15 +217,15 @@ impl Up {
 /// SAM's mask decoder (3 multimask outputs + 1, IoU head depth 3, hidden 256).
 pub struct MaskDecoder {
     /// IoU token then the four mask tokens, `5 × 256`.
-    output_tokens: Tensor,
-    iou_head: Mlp,
-    hyper: Vec<Mlp>,
-    up1: Up,
-    up_ln: Norm,
-    up2: Up,
-    layers: Vec<TwoWayBlock>,
-    final_t2i: Attention,
-    norm_final: Norm,
+    pub(crate) output_tokens: Tensor,
+    pub(crate) iou_head: Mlp,
+    pub(crate) hyper: Vec<Mlp>,
+    pub(crate) up1: Up,
+    pub(crate) up_ln: Norm,
+    pub(crate) up2: Up,
+    pub(crate) layers: Vec<TwoWayBlock>,
+    pub(crate) final_t2i: Attention,
+    pub(crate) norm_final: Norm,
 }
 
 impl MaskDecoder {

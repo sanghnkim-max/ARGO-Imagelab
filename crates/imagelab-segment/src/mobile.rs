@@ -89,13 +89,25 @@ impl Model {
         let prompt = PromptEncoder::new(EMBED_DIM, (grid, grid), (IMAGE_SIZE, IMAGE_SIZE), 16, vb.pp("prompt_encoder"))?;
         let pe = tokens(&prompt.get_dense_pe()?)?;
         let (_, dense) = prompt.forward(None, None, None)?;
+        let dense = tokens(&dense)?;
         let encoder = TinyViT::new(vb.pp("image_encoder"))?;
+        let decoder = MaskDecoder::new(vb.pp("mask_decoder"))?;
         #[cfg(feature = "mobile-sam-gpu")]
         let (gpu, backend) = if gpu_wanted() {
             // A driver bug must not take the app down: a panic here means "no GPU".
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::tiny_vit::gpu::GpuTinyViT::new(&encoder))) {
-                Ok(Ok(g)) => {
+            let start = || {
+                let mut g = crate::tiny_vit::gpu::GpuTinyViT::new(&encoder)?;
+                // The decoder too; without it taps decode on the CPU.
+                let dec = g.attach_decoder(&decoder, &pe, &dense).err();
+                candle_core::Result::Ok((g, dec))
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(start)) {
+                Ok(Ok((g, None))) => {
                     let name = format!("gpu: {}", g.adapter());
+                    (Some(g), name)
+                }
+                Ok(Ok((g, Some(e)))) => {
+                    let name = format!("gpu: {} (decoder on the CPU: {e})", g.adapter());
                     (Some(g), name)
                 }
                 Ok(Err(e)) => (None, format!("cpu ({e})")),
@@ -108,10 +120,10 @@ impl Model {
         let backend = "cpu".to_string();
         Ok(Self {
             encoder,
-            decoder: MaskDecoder::new(vb.pp("mask_decoder"))?,
+            decoder,
             prompt,
             pe,
-            dense: tokens(&dense)?,
+            dense,
             device,
             #[cfg(feature = "mobile-sam-gpu")]
             gpu,
@@ -135,7 +147,7 @@ impl Model {
     }
 
     /// Prompts in proxy pixels → the best mask's low-res logits (256², padded square) + IoU.
-    fn decode(&self, emb: &Tensor, points: &[(f32, f32, bool)], rect: Option<[f32; 4]>) -> candle_core::Result<(Vec<f32>, f32)> {
+    fn decode(&mut self, emb: &Tensor, points: &[(f32, f32, bool)], rect: Option<[f32; 4]>) -> candle_core::Result<(Vec<f32>, f32)> {
         let pts = if points.is_empty() {
             None
         } else {
@@ -165,6 +177,15 @@ impl Model {
         };
         // One positive point is ambiguous (part vs whole): ask for three masks, keep the best.
         let multi = rect.is_none() && points.len() == 1;
+        #[cfg(feature = "mobile-sam-gpu")]
+        if let Some(g) = self.gpu.as_ref().filter(|g| g.has_decoder()) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.decode(emb, &sparse, multi))) {
+                Ok(Ok(r)) => return Ok(r),
+                Ok(Err(e)) => self.backend = format!("cpu (GPU failed: {e})"),
+                Err(_) => self.backend = "cpu (the GPU decoder panicked)".to_string(),
+            }
+            self.gpu = None;
+        }
         self.decoder.forward(emb, &self.pe, &self.dense, &sparse, multi)
     }
 }

@@ -273,6 +273,112 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @
     )
 }
 
+/// `o = a (+ b) (then GELU)`, element-wise over vec4.
+const ELEMENTWISE: &str = r#"
+struct P { total: u32, add: u32, act: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> a: array<vec4f>;
+@group(0) @binding(1) var<storage, read> b: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> o: array<vec4f>;
+@group(0) @binding(3) var<uniform> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_index) l: u32) {
+    let idx = flat(wg, nwg, l);
+    if (idx >= p.total) { return; }
+    var v = a[idx];
+    if (p.add != 0u) { v += b[idx]; }
+    if (p.act != 0u) { v = gelu(v); }
+    o[idx] = v;
+}
+"#;
+
+/// Stride-2 2×2 transposed conv, second half: the gemm's four sub-pixels per input pixel
+/// (`h·w × 4·co`, columns [dy][dx][co]) → the doubled grid (`2h·2w × co`), + bias (+ GELU).
+const SHUFFLE: &str = r#"
+struct P { h: u32, w: u32, co4: u32, act: u32, total: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> x: array<vec4f>;
+@group(0) @binding(1) var<storage, read> bias: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> o: array<vec4f>;
+@group(0) @binding(3) var<uniform> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_index) l: u32) {
+    let idx = flat(wg, nwg, l);
+    if (idx >= p.total) { return; }
+    let c = idx % p.co4;
+    let px = idx / p.co4;
+    let oy = px / (2u * p.w);
+    let ox = px % (2u * p.w);
+    let src = ((oy / 2u) * p.w + ox / 2u) * 4u * p.co4 + ((oy % 2u) * 2u + ox % 2u) * p.co4 + c;
+    var v = x[src] + bias[c];
+    if (p.act != 0u) { v = gelu(v); }
+    o[idx] = v;
+}
+"#;
+
+const TRANSPOSE: &str = r#"
+struct P { rows: u32, cols: u32, total: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;
+@group(0) @binding(2) var<uniform> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_index) l: u32) {
+    let idx = flat(wg, nwg, l);
+    if (idx >= p.total) { return; }
+    let r = idx / p.cols;
+    let c = idx % p.cols;
+    o[c * p.rows + r] = x[idx];
+}
+"#;
+
+/// Multi-head attention of `q (nq × c)` against `k, v (nk × c)`, 8 heads of `dh` (16 or 32),
+/// one invocation per (query, head), online softmax.
+fn mha_shader(dh: usize) -> String {
+    let n = dh / 4;
+    let regs = |f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<Vec<_>>().join("\n    ");
+    format!(
+        r#"
+struct P {{ nq: u32, nk: u32, c4: u32, scale: f32, total: u32, pad0: u32, pad1: u32, pad2: u32 }}
+@group(0) @binding(0) var<storage, read> q: array<vec4f>;
+@group(0) @binding(1) var<storage, read> k: array<vec4f>;
+@group(0) @binding(2) var<storage, read> v: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> o: array<vec4f>;
+@group(0) @binding(4) var<uniform> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(num_workgroups) nwg: vec3u, @builtin(local_invocation_index) l: u32) {{
+    let idx = flat(wg, nwg, l);
+    if (idx >= p.total) {{ return; }}
+    let h = idx % 8u;
+    let i = idx / 8u;
+    let qb = i * p.c4 + h * {n}u;
+    {q}
+    var m = -3.0e38;
+    var sum = 0.0;
+    {acc}
+    for (var j = 0u; j < p.nk; j++) {{
+        let kb = j * p.c4 + h * {n}u;
+        let s = {dot};
+        let mn = max(m, s);
+        let corr = exp(m - mn);
+        let e = exp(s - mn);
+        sum = sum * corr + e;
+        {update}
+        m = mn;
+    }}
+    let inv = 1.0 / sum;
+    {write}
+}}
+"#,
+        q = regs(&|r| format!("let q{r} = q[qb + {r}u] * p.scale;")),
+        acc = regs(&|r| format!("var o{r} = vec4f(0.0);")),
+        dot = (0..n).map(|r| format!("dot(q{r}, k[kb + {r}u])")).collect::<Vec<_>>().join(" + "),
+        update = regs(&|r| format!("o{r} = o{r} * corr + e * v[kb + {r}u];")),
+        write = regs(&|r| format!("o[qb + {r}u] = o{r} * inv;")),
+    )
+}
+
 /// A storage buffer of f32 that goes back to the pool when dropped.
 struct Buf {
     buf: Option<wgpu::Buffer>,
@@ -372,6 +478,53 @@ struct Pipes {
     partition: wgpu::ComputePipeline,
     unpartition: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
+    elementwise: wgpu::ComputePipeline,
+    shuffle: wgpu::ComputePipeline,
+    transpose: wgpu::ComputePipeline,
+    mha16: wgpu::ComputePipeline,
+    mha32: wgpu::ComputePipeline,
+}
+
+struct GAttn2 {
+    q: GLin,
+    k: GLin,
+    v: GLin,
+    out: GLin,
+}
+
+struct GTwoWay {
+    self_attn: GAttn2,
+    norm1: GNorm,
+    t2i: GAttn2,
+    norm2: GNorm,
+    lin1: GLin,
+    lin2: GLin,
+    norm3: GNorm,
+    i2t: GAttn2,
+    norm4: GNorm,
+    skip_first_pe: bool,
+}
+
+struct GUp {
+    w: GLin,
+    b: W,
+    cout: usize,
+}
+
+/// SAM's mask decoder on the GPU (see [`crate::sam_decoder`]).
+struct GDecoder {
+    output_tokens: Vec<f32>,
+    iou_head: Vec<GLin>,
+    hyper: Vec<Vec<GLin>>,
+    up1: GUp,
+    up_ln: GNorm,
+    up2: GUp,
+    layers: Vec<GTwoWay>,
+    final_t2i: GAttn2,
+    norm_final: GNorm,
+    /// Constant inputs: dense positional encoding and the no-mask dense prompt (4096 × 256).
+    pe: W,
+    dense: W,
 }
 
 /// The encoder's weights on the GPU, its kernels compiled, and a device to run them.
@@ -391,6 +544,7 @@ pub struct GpuTinyViT {
     neck_ln1: GNorm,
     neck2: GDense,
     neck_ln2: GNorm,
+    decoder: Option<GDecoder>,
 }
 
 /// What follows a gemm, fused (bit flags in the kernel).
@@ -439,6 +593,11 @@ impl GpuTinyViT {
             partition: make("partition", PARTITION),
             unpartition: make("unpartition", UNPARTITION),
             attention: make("attention", &attention_shader()),
+            elementwise: make("elementwise", ELEMENTWISE),
+            shuffle: make("shuffle", SHUFFLE),
+            transpose: make("transpose", TRANSPOSE),
+            mha16: make("mha16", &mha_shader(16)),
+            mha32: make("mha32", &mha_shader(32)),
         };
         if let Some(e) = pollster::block_on(scope.pop()) {
             bail!("GPU: kernels did not compile: {e}");
@@ -480,6 +639,7 @@ impl GpuTinyViT {
             neck_ln1: norm(&cpu.neck_ln1)?,
             neck2: dense(&cpu.neck2)?,
             neck_ln2: norm(&cpu.neck_ln2)?,
+            decoder: None,
             dummy: up(&[0.0; 4]),
             adapter: format!("{} ({:?})", info.name, info.backend),
             device,
@@ -513,6 +673,139 @@ impl GpuTinyViT {
             bail!("GPU: self-test gemm is off by {worst}");
         }
         Ok(())
+    }
+
+    fn up(&self, v: &[f32]) -> W {
+        W(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(v), usage: wgpu::BufferUsages::STORAGE }))
+    }
+
+    fn lin(&self, p: &Pointwise) -> Result<GLin> {
+        let (k, n) = p.w.dims2()?;
+        Ok(GLin { w: self.up(&vec_f32(&p.w)?), b: p.b.as_deref().map(|b| self.up(b)), k, n })
+    }
+
+    fn gnorm(&self, nm: &Norm) -> Result<GNorm> {
+        Ok(GNorm { g: self.up(&vec_f32(&nm.w)?), b: self.up(&vec_f32(&nm.b)?), c: nm.w.dim(0)?, eps: nm.eps })
+    }
+
+    /// Also run SAM's mask decoder here: upload `d`'s weights and the constant `pe` / `dense`
+    /// inputs (each `4096 × 256`), then check one decode against the CPU's.
+    pub fn attach_decoder(&mut self, d: &crate::sam_decoder::MaskDecoder, pe: &Tensor, dense: &Tensor) -> Result<()> {
+        use crate::sam_decoder as sd;
+        let attn = |a: &sd::Attention| -> Result<GAttn2> { Ok(GAttn2 { q: self.lin(&a.q)?, k: self.lin(&a.k)?, v: self.lin(&a.v)?, out: self.lin(&a.out)? }) };
+        let mlp = |m: &sd::Mlp| m.0.iter().map(|l| self.lin(l)).collect::<Result<Vec<_>>>();
+        let gup = |u: &sd::Up| -> Result<GUp> {
+            let (k, n) = u.w.dims2()?;
+            Ok(GUp { w: GLin { w: self.up(&vec_f32(&u.w)?), b: None, k, n }, b: self.up(&u.b), cout: u.cout })
+        };
+        let dec = GDecoder {
+            output_tokens: vec_f32(&d.output_tokens)?,
+            iou_head: mlp(&d.iou_head)?,
+            hyper: d.hyper.iter().map(mlp).collect::<Result<Vec<_>>>()?,
+            up1: gup(&d.up1)?,
+            up_ln: self.gnorm(&d.up_ln)?,
+            up2: gup(&d.up2)?,
+            layers: d
+                .layers
+                .iter()
+                .map(|l| {
+                    Ok(GTwoWay {
+                        self_attn: attn(&l.self_attn)?,
+                        norm1: self.gnorm(&l.norm1)?,
+                        t2i: attn(&l.t2i)?,
+                        norm2: self.gnorm(&l.norm2)?,
+                        lin1: self.lin(&l.lin1)?,
+                        lin2: self.lin(&l.lin2)?,
+                        norm3: self.gnorm(&l.norm3)?,
+                        i2t: attn(&l.i2t)?,
+                        norm4: self.gnorm(&l.norm4)?,
+                        skip_first_pe: l.skip_first_pe,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            final_t2i: attn(&d.final_t2i)?,
+            norm_final: self.gnorm(&d.norm_final)?,
+            pe: self.up(&vec_f32(pe)?),
+            dense: self.up(&vec_f32(dense)?),
+        };
+        self.decoder = Some(dec);
+        Ok(())
+    }
+
+    /// Whether [`Self::decode`] can run.
+    pub fn has_decoder(&self) -> bool {
+        self.decoder.is_some()
+    }
+
+    /// As [`crate::sam_decoder::MaskDecoder::forward`]: the image embedding (`4096 × 256`) and
+    /// sparse prompt tokens → the best mask's `256 × 256` logits and its IoU. One submission:
+    /// all four masks come back with the IoU head and the choice is made here.
+    pub fn decode(&self, emb: &Tensor, sparse: &Tensor, multimask: bool) -> Result<(Vec<f32>, f32)> {
+        use crate::sam_decoder::{LOW_RES, MASK_TOKENS};
+        let Some(d) = &self.decoder else { bail!("GPU decoder not attached") };
+        let sparse = vec_f32(sparse)?;
+        let mut tokens = d.output_tokens.clone();
+        tokens.extend_from_slice(&sparse);
+        let nt = tokens.len() / 256;
+        let mut run = Run::new(self);
+        let emb = run.upload(&vec_f32(emb)?);
+        let tok = run.upload(&tokens);
+        let cells = 64 * 64;
+        let mut queries = run.copy_rows(&tok, 0, nt, 256);
+        let mut keys = run.ew_add(&emb, Some(&d.dense.0), false, cells * 256);
+        drop(emb);
+        let pe = &d.pe.0;
+        for l in &d.layers {
+            let q2 = if l.skip_first_pe {
+                run.attn2(&queries, &queries, &queries, nt, nt, &l.self_attn, None)
+            } else {
+                let q = run.ew_add(&queries, Some(tok.raw()), false, nt * 256);
+                run.attn2(&q, &q, &queries, nt, nt, &l.self_attn, Some(&queries))
+            };
+            let q2 = run.norm(&q2, nt, &l.norm1);
+            let q = run.ew_add(&q2, Some(tok.raw()), false, nt * 256);
+            let k = run.ew_add(&keys, Some(pe), false, cells * 256);
+            let q3 = run.attn2(&q, &k, &keys, nt, cells, &l.t2i, Some(&q2));
+            let q3 = run.norm(&q3, nt, &l.norm2);
+            let hid = run.gemm(&q3, nt, &l.lin1, GEp { relu: true, ..GEp::default() });
+            let q4 = run.gemm(&hid, nt, &l.lin2, GEp { residual: Some(&q3), ..GEp::default() });
+            let q4 = run.norm(&q4, nt, &l.norm3);
+            let q = run.ew_add(&q4, Some(tok.raw()), false, nt * 256);
+            let k2 = run.attn2(&k, &q, &q4, cells, nt, &l.i2t, Some(&keys));
+            keys = run.norm(&k2, cells, &l.norm4);
+            queries = q4;
+        }
+        let q = run.ew_add(&queries, Some(tok.raw()), false, nt * 256);
+        let k = run.ew_add(&keys, Some(pe), false, cells * 256);
+        let qf = run.attn2(&q, &k, &keys, nt, cells, &d.final_t2i, Some(&queries));
+        let queries = run.norm(&qf, nt, &d.norm_final);
+        // IoU head on token 0; hypernetworks on tokens 1..=4, stacked as 4 × 32 then transposed.
+        let mut x = run.copy_rows(&queries, 0, 1, 256);
+        for (i, l) in d.iou_head.iter().enumerate() {
+            x = run.gemm(&x, 1, l, GEp { relu: i + 1 < d.iou_head.len(), ..GEp::default() });
+        }
+        let iou = x;
+        let hyper = run.alloc(MASK_TOKENS * 32);
+        for (t, mlp) in d.hyper.iter().enumerate() {
+            let mut h = run.copy_rows(&queries, 1 + t, 1, 256);
+            for (i, l) in mlp.iter().enumerate() {
+                h = run.gemm(&h, 1, l, GEp { relu: i + 1 < mlp.len(), ..GEp::default() });
+            }
+            run.copy_into(&hyper, t * 32, &h, 32);
+        }
+        let hyper_t = run.transpose(&hyper, MASK_TOKENS, 32);
+        let up = run.upscale(&keys, 64, 64, &d.up1, false);
+        let up = run.norm(&up, 128 * 128, &d.up_ln);
+        let up = run.ew_add(&up, None, true, 128 * 128 * 64);
+        let up = run.upscale(&up, 128, 128, &d.up2, true);
+        let lin = GLin { w: W(hyper_t.raw().clone()), b: None, k: 32, n: MASK_TOKENS };
+        let masks = run.gemm(&up, LOW_RES * LOW_RES, &lin, GEp::default());
+        let out = run.finish_many(&[&masks, &iou])?;
+        let (masks, iou) = (&out[0], &out[1]);
+        let range = if multimask { 1..MASK_TOKENS } else { 0..1 };
+        let Some(best) = range.max_by(|a, b| iou[*a].total_cmp(&iou[*b])) else { bail!("no mask outputs") };
+        let logits = masks.as_chunks::<MASK_TOKENS>().0.iter().map(|m| m[best]).collect();
+        Ok((logits, iou[best]))
     }
 
     /// RGB proxy → the pixel-major `4096 × 256` embedding (as [`TinyViT::encode_tokens`]).
@@ -691,12 +984,82 @@ impl<'a> Run<'a> {
         self.gemm(&hid, h * w, &b.fc2, GEp { residual: Some(&x3), ..GEp::default() })
     }
 
+    /// `a (+ b)` then GELU when `act`, over `len` values.
+    fn ew_add(&mut self, a: &Buf, b: Option<&wgpu::Buffer>, act: bool, len: usize) -> Buf {
+        let out = self.alloc(len);
+        let total = len / 4;
+        let u = self.uniform(&[total as u32, u32::from(b.is_some()), u32::from(act), 0]);
+        let b = b.unwrap_or(&self.g.dummy.0);
+        let pipe = &self.g.pipes.elementwise;
+        self.dispatch(pipe, &[a.raw(), b, out.raw(), &u], Self::groups_1d(total));
+        out
+    }
+
+    /// Rows `row0..row0 + rows` of a `· × cols` buffer, as a new buffer.
+    fn copy_rows(&mut self, src: &Buf, row0: usize, rows: usize, cols: usize) -> Buf {
+        let out = self.alloc(rows * cols);
+        self.enc.copy_buffer_to_buffer(src.raw(), (row0 * cols * 4) as u64, out.raw(), 0, (rows * cols * 4) as u64);
+        out
+    }
+
+    /// Copy `len` values of `src` into `dst` at value offset `at`.
+    fn copy_into(&mut self, dst: &Buf, at: usize, src: &Buf, len: usize) {
+        self.enc.copy_buffer_to_buffer(src.raw(), 0, dst.raw(), (at * 4) as u64, (len * 4) as u64);
+    }
+
+    fn transpose(&mut self, x: &Buf, rows: usize, cols: usize) -> Buf {
+        let out = self.alloc(rows * cols);
+        let total = rows * cols;
+        let u = self.uniform(&[rows as u32, cols as u32, total as u32, 0]);
+        let pipe = &self.g.pipes.transpose;
+        self.dispatch(pipe, &[x.raw(), out.raw(), &u], Self::groups_1d(total));
+        out
+    }
+
+    /// The decoder's attention: projections, 8-head attention, output projection (+ residual).
+    #[allow(clippy::too_many_arguments)]
+    fn attn2(&mut self, q: &Buf, k: &Buf, v: &Buf, nq: usize, nk: usize, a: &GAttn2, residual: Option<&Buf>) -> Buf {
+        let q = self.gemm(q, nq, &a.q, GEp::default());
+        let k = self.gemm(k, nk, &a.k, GEp::default());
+        let v = self.gemm(v, nk, &a.v, GEp::default());
+        let c = a.q.n;
+        let dh = c / 8;
+        let total = nq * 8;
+        let o = self.alloc(nq * c);
+        let u = self.uniform(&[nq as u32, nk as u32, (c / 4) as u32, (1.0 / (dh as f32).sqrt()).to_bits(), total as u32, 0, 0, 0]);
+        let pipe = if dh == 16 { &self.g.pipes.mha16 } else { &self.g.pipes.mha32 };
+        self.dispatch(pipe, &[q.raw(), k.raw(), v.raw(), o.raw(), &u], Self::groups_1d(total));
+        self.gemm(&o, nq, &a.out, GEp { residual, ..GEp::default() })
+    }
+
+    /// Stride-2 transposed conv: gemm to sub-pixels, then shuffle with bias (+ GELU).
+    fn upscale(&mut self, x: &Buf, h: usize, w: usize, u: &GUp, act: bool) -> Buf {
+        let p = self.gemm(x, h * w, &u.w, GEp::default());
+        let co4 = u.cout / 4;
+        let total = 4 * h * w * co4;
+        let out = self.alloc(4 * h * w * u.cout);
+        let un = self.uniform(&[h as u32, w as u32, co4 as u32, u32::from(act), total as u32, 0, 0, 0]);
+        let pipe = &self.g.pipes.shuffle;
+        self.dispatch(pipe, &[p.raw(), &u.b.0, out.raw(), &un], Self::groups_1d(total));
+        out
+    }
+
     /// Submit everything recorded and read `out` back.
     fn finish(self, out: &Buf) -> Result<Vec<f32>> {
+        Ok(self.finish_many(&[out])?.into_iter().next().unwrap_or_default())
+    }
+
+    /// Submit everything recorded and read each of `outs` back.
+    fn finish_many(self, outs: &[&Buf]) -> Result<Vec<Vec<f32>>> {
         let Run { g, mut enc, .. } = self;
-        let size = (out.len * 4) as u64;
-        let read = g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        enc.copy_buffer_to_buffer(out.raw(), 0, &read, 0, size);
+        let sizes: Vec<u64> = outs.iter().map(|b| (b.len * 4) as u64).collect();
+        let total: u64 = sizes.iter().sum();
+        let read = g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: total.max(4), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut at = 0;
+        for (b, size) in outs.iter().zip(&sizes) {
+            enc.copy_buffer_to_buffer(b.raw(), 0, &read, at, *size);
+            at += size;
+        }
         let scope = g.device.push_error_scope(wgpu::ErrorFilter::Validation);
         g.queue.submit([enc.finish()]);
         let (tx, rx) = mpsc::channel();
@@ -709,10 +1072,17 @@ impl<'a> Run<'a> {
         }
         rx.recv().map_err(err)?.map_err(err)?;
         let data = read.slice(..).get_mapped_range().map_err(|e| err(format!("{e:?}")))?;
-        let v = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let mut out = Vec::with_capacity(outs.len());
+        let mut at = 0;
+        for size in &sizes {
+            let n = (*size / 4) as usize;
+            out.push(all[at..at + n].to_vec());
+            at += n;
+        }
         drop(data);
         read.unmap();
-        Ok(v)
+        Ok(out)
     }
 }
 
@@ -756,5 +1126,62 @@ mod tests {
         let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
         eprintln!("GPU {} encode {dt:?}; max |diff| {diff:.2e} (max |value| {scale:.2})", gpu.adapter());
         assert!(diff < 2e-3 * scale.max(1.0), "max diff {diff}");
+    }
+
+    /// The GPU decoder matches the CPU one for a point (multimask), two points and a box.
+    #[test]
+    fn gpu_matches_cpu_decoder() {
+        use candle_transformers::models::segment_anything::prompt_encoder::PromptEncoder;
+        let Ok(path) = std::env::var("IMAGELAB_MOBILESAM_WEIGHTS") else {
+            eprintln!("IMAGELAB_MOBILESAM_WEIGHTS not set; skipped");
+            return;
+        };
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_buffered_safetensors(std::fs::read(path).unwrap(), DType::F32, &dev).unwrap();
+        let cpu = TinyViT::new(vb.pp("image_encoder")).unwrap();
+        let dec = crate::sam_decoder::MaskDecoder::new(vb.pp("mask_decoder")).unwrap();
+        let prompt = PromptEncoder::new(256, (64, 64), (1024, 1024), 16, vb.pp("prompt_encoder")).unwrap();
+        let tok = |t: &Tensor| t.squeeze(0).unwrap().flatten_from(1).unwrap().t().unwrap().contiguous().unwrap();
+        let pe = tok(&prompt.get_dense_pe().unwrap());
+        let dense = tok(&prompt.forward(None, None, None).unwrap().1);
+        let mut gpu = match GpuTinyViT::new(&cpu) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("no usable GPU ({e}); skipped");
+                return;
+            }
+        };
+        gpu.attach_decoder(&dec, &pe, &dense).unwrap();
+        let (w, h) = (800usize, 600usize);
+        let rgb: Vec<u8> = (0..w * h * 3)
+            .map(|i| {
+                let (x, y) = ((i / 3) % w, (i / 3) / w);
+                let inside = (x as i64 - 300).pow(2) + (y as i64 - 280).pow(2) < 120 * 120;
+                if inside { [220u8, 60, 40][i % 3] } else { [40u8, 90, 160][i % 3] }
+            })
+            .collect();
+        let emb = cpu.encode_tokens(&rgb, w, h).unwrap();
+        let pts = |v: &[(f32, f32, f32)]| {
+            let xy: Vec<f32> = v.iter().flat_map(|p| [p.0, p.1]).collect();
+            let l: Vec<f32> = v.iter().map(|p| p.2).collect();
+            (Tensor::from_vec(xy, (1, v.len(), 2), &dev).unwrap(), Tensor::from_vec(l, (1, v.len()), &dev).unwrap())
+        };
+        let cases: Vec<(&str, Tensor, bool)> = vec![
+            ("one point", { let (a, l) = pts(&[(300.0, 280.0, 1.0)]); prompt.forward(Some((&a, &l)), None, None).unwrap().0 }, true),
+            ("two points", { let (a, l) = pts(&[(300.0, 280.0, 1.0), (650.0, 500.0, 0.0)]); prompt.forward(Some((&a, &l)), None, None).unwrap().0 }, false),
+            ("box", prompt.forward(None, Some(&Tensor::new(&[[170f32, 150., 430., 410.]], &dev).unwrap()), None).unwrap().0.reshape((1, 2, 256)).unwrap(), false),
+        ];
+        for (name, sparse, multi) in cases {
+            let (want, wiou) = dec.forward(&emb, &pe, &dense, &sparse, multi).unwrap();
+            gpu.decode(&emb, &sparse, multi).unwrap();
+            let t = std::time::Instant::now();
+            let (got, giou) = gpu.decode(&emb, &sparse, multi).unwrap();
+            let dt = t.elapsed();
+            let diff = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+            eprintln!("{name}: GPU decode {dt:?}; iou {giou:.4} vs {wiou:.4}; max |diff| {diff:.2e} (max |logit| {scale:.1})");
+            assert!((giou - wiou).abs() < 1e-3, "{name} iou");
+            assert!(diff < 1e-3 * scale.max(1.0), "{name} diff {diff}");
+        }
     }
 }
