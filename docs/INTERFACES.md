@@ -389,24 +389,58 @@ certificate on every call** (`LabService.ALLOWED`: `com.argo.android` with ARGO'
 release ARGO adds its release key). ARGO pins ImageLab's certificate the same way before binding
 (`LabLink.TRUSTED`), so neither side talks to a look-alike package.
 
-| Call | What |
+**MCP over the wire.** ImageLab is an MCP server to ARGO (`agent/CompanionMcp.kt`): ARGO's core is
+the MCP client (`companion_mcp` in `argo-android-ffi`), and each JSON-RPC message travels as
+`call("mcp", message)`, its response on the pipe (nothing for a notification). ARGO mounts it as
+the server `imagelab`, so the tools reach the model as `imagelab__<tool>`, deferred behind one
+roster line (`select:imagelab`) like every MCP server's.
+
+| Method | What |
 |---|---|
-| `call("tools/call", {name, arguments})` | ImageLab's own MCP tools (`lab_read`, `lab_script`, `lab_help`) on the in-process server: the same programs, effects and budgets as the in-app agent and the HTTP server. The MCP `CallToolResult` (text + image blocks) |
-| `call("export", {format, quality, maxSide})` | Save the open document to `exports/` and copy it to the gallery (Pictures/ImageLab): `{path, mediaId, uri}` |
-| `call("status")`, `call("tools/list")` | Contract version, open document; the tool list |
-| `importPhoto(name, fd)` | ARGO opens a gallery photo (MediaStore id from its `photos_search`) and hands the descriptor over; ImageLab copies it into `imports/` and opens it |
-| `cancel()` | Stop the running programs (the turn was cancelled) |
+| `initialize` | protocol `2025-06-18` (or the older one asked), `capabilities.tools`, `serverInfo`, `instructions` |
+| `tools/list` | the five tools below, with `annotations` (all `openWorldHint: false`, `destructiveHint: false`) |
+| `tools/call` | a `CallToolResult`: text and `image` blocks (JPEG unless transparent), `structuredContent`, `isError` |
+| `ping` | `{}` |
+| `resources/list`, `resources/templates/list`, `resources/read` | the resources below |
+| `prompts/list`, `prompts/get` | the prompts below |
+| `notifications/cancelled` | stop the running programs (the turn was stopped) |
+
+| Tool | What |
+|---|---|
+| `open {photo}` | Open a gallery photo by MediaStore id (ImageLab reads it with its own photo permission) |
+| `read {code, description, timeoutMs?}` | `lab_read`: a read-only program; ARGO declares it read-only |
+| `edit {code, description, timeoutMs?}` | `lab_script`: an editing program, one undoable step each |
+| `help {area?}` | `lab_help` |
+| `save {format?, quality?, maxSide?}` | Export to the gallery (Pictures/ImageLab): `structuredContent {photo, uri, photos:[{id,name}]}`, which ARGO's card shows |
+
+| Resource | What |
+|---|---|
+| `imagelab://document` | `doc.inspect` of the open document (JSON) |
+| `imagelab://document/history` | `doc.history` (JSON) |
+| `imagelab://document/preview` | the document now, a JPEG at most 1024 px a side (`blob`) |
+| `imagelab://reference`, `imagelab://reference/{area}` | `lab_help`: every area, or one area or function (Markdown); the second is a resource template |
+
+| Prompt | Arguments | What |
+|---|---|---|
+| `enhance` | `photo?`, `style?` | a natural overall enhancement, checked in a preview, then saved |
+| `sky` | `photo?`, `look?` | only the sky, through `select.sky` with `edgeFill`, then saved |
+| `caption` | `text`, `photo?`, `position?` | a readable caption, then saved |
+
+In ARGO the resources are read through its MCP resource tools, and each prompt is a command
+(`/imagelab-enhance`, …) where the surface has a command registry.
+
+`call("status")` answers `{"ok": {contract, version, document}}`. `importPhoto(name, fd)` and
+`cancel()` remain on the AIDL for a caller that holds a photo ImageLab cannot read itself.
 
 Results travel through a **pipe** (`ParcelFileDescriptor`), never in the Binder reply: images ride
 inline as base64 and outgrow a transaction. Images are encoded at most 1568 px a side (ARGO's
 attachment store refuses more than 2000).
 
-**In ARGO** (`com.argo.android.tools.lab`): five native tools behind the `imagelab` gate (offered
-only while ImageLab is installed and trusted): `imagelab_read`, `imagelab_edit`, `imagelab_help`,
-`imagelab_open` (a photo id from `photos_search`), `imagelab_save` (a new gallery photo, its id for
-`photos_get`). None asks first: every edit is an undoable step in ImageLab, the gallery original
-is never changed, and saving makes a new photo. Results are private (the person's photos) and
-untrusted (EXIF and text in photos).
+**In ARGO** (`com.argo.android.tools.lab`): `LabLink` binds the service, `LabMcp` carries the
+messages, and the core mounts the server at boot and when ImageLab is installed while ARGO runs.
+None of the tools asks first: every edit is an undoable step in ImageLab, the gallery original is
+never changed, and saving makes a new photo. The server is mounted person-only (refused to other
+devices and automations) with private output (the person's photos).
 
 **ARGO's core client allowlist.** ImageLab and VideoLab are listed in ARGO's
 `res/values/core_clients.xml` (debug: their shared debug key `647e1822…`) as client packages, as ARGO

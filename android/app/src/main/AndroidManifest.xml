@@ -4,6 +4,10 @@
     <!-- The in-app agent calls the Claude API; the MCP server listens on 127.0.0.1 only. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- ARGO's agent opens gallery photos by id (CompanionMcp `open`); the editor's own picker needs none. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+
     <!-- PhotoCraft's GPU renderer runs on Vulkan through wgpu; phones without it use the CPU. -->
     <!-- The ARGO app, the one caller LabService answers (its signature is checked on every call). -->
     <queries>

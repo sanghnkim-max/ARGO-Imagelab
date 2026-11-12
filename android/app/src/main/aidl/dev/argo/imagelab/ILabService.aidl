@@ -21,15 +21,14 @@ interface ILabService {
      * Binder transaction holds, so they never travel in the reply itself.
      *
      * `op` is one of:
-     * - `status`: `{contract, version, document}` (the open document, or null).
-     * - `tools/list`: ImageLab's MCP tools (`lab_read`, `lab_script`, `lab_help`) with schemas.
-     * - `tools/call`: `{name, arguments}` → the MCP `CallToolResult` (`content` with text and
-     *   image blocks, `isError`).
-     * - `export`: `{format: jpg|png|webp, quality?, maxSide?}` → save the open document and copy
-     *   it to the gallery (Pictures/ImageLab): `{path, mediaId, uri}`.
+     * - `mcp`: `argsJson` is one MCP JSON-RPC message (a request or a notification); the pipe
+     *   carries the JSON-RPC response, or nothing for a notification. ImageLab's MCP server
+     *   (`initialize`, `ping`, `tools/list`, `tools/call`, `notifications/cancelled`) with the
+     *   tools `open`, `read`, `edit`, `help` and `save`; ARGO mounts it as the server `imagelab`.
+     * - `status`: `{"ok": {contract, version, document}}` (the open document, or null).
      *
-     * The JSON is `{"ok": result}` or `{"error": message}`. Blocks a Binder thread of ImageLab
-     * only until the pipe is made; the work runs on ImageLab's own threads.
+     * Blocks a Binder thread of ImageLab only until the pipe is made; the work runs on
+     * ImageLab's own threads.
      */
     ParcelFileDescriptor call(String op, String argsJson);
 

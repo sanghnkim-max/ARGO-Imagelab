@@ -11,7 +11,6 @@ import android.util.Log
 import dev.argo.imagelab.BuildConfig
 import dev.argo.imagelab.ILabService
 import dev.argo.imagelab.ImageLabApp
-import dev.argo.imagelab.core.Gallery
 import dev.argo.imagelab.core.Lab
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -19,9 +18,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
-import java.io.FileInputStream
 import java.util.concurrent.Executors
 
 /**
@@ -30,12 +27,16 @@ import java.util.concurrent.Executors
  * [ALLOWED] and is signed by one of its pinned certificates: on Android any app can bind an
  * exported service, so the caller's signature, checked on every call, is the access control.
  *
- * The tools are ImageLab's own MCP tools (`lab_read`, `lab_script`, `lab_help`) on the in-process
- * server, the same ones the in-app agent and the HTTP server serve, so an edit ARGO makes is one
- * undoable history step the person sees live in the editor.
+ * The tools are an MCP server ([CompanionMcp]) whose JSON-RPC messages travel over the `mcp` op;
+ * ARGO mounts it as the server `imagelab`. Its `read` and `edit` are ImageLab's own `lab_read`
+ * and `lab_script`, so an edit ARGO makes is one undoable history step the person sees live in
+ * the editor.
  */
 class LabService : Service() {
     private val app get() = application as ImageLabApp
+
+    /** ImageLab's MCP server, the tools ARGO mounts as `imagelab__*`. */
+    private val mcp by lazy { CompanionMcp(app) }
 
     /** Long work (programs run up to 30 minutes) never holds a Binder thread. */
     private val workers = Executors.newCachedThreadPool { r -> Thread(r, "imagelab-companion").apply { isDaemon = true } }
@@ -54,9 +55,19 @@ class LabService : Service() {
             val refusal = refusal()
             val (read, write) = ParcelFileDescriptor.createPipe()
             workers.execute {
-                val reply = if (refusal != null) error(refusal) else runCatching { answer(op.orEmpty(), argsJson.orEmpty()) }
-                    .getOrElse { error(Lab.describe(it)) }
-                ParcelFileDescriptor.AutoCloseOutputStream(write).use { it.write(reply.toByteArray(Charsets.UTF_8)) }
+                val reply = when {
+                    refusal != null -> error(refusal)
+                    // MCP: the JSON-RPC response itself (nothing for a notification).
+                    op == "mcp" -> mcp.handle(argsJson.orEmpty()).orEmpty()
+                    else -> runCatching { answer(op.orEmpty(), argsJson.orEmpty()) }.getOrElse { error(Lab.describe(it)) }
+                }
+                // ARGO may stop reading (the call was withdrawn): a write to a closed pipe fails,
+                // and an exception escaping a worker would take the whole app down.
+                try {
+                    ParcelFileDescriptor.AutoCloseOutputStream(write).use { it.write(reply.toByteArray(Charsets.UTF_8)) }
+                } catch (gone: java.io.IOException) {
+                    Log.i(TAG, "the caller stopped reading the answer to `$op`", gone)
+                }
             }
             return read
         }
@@ -91,59 +102,16 @@ class LabService : Service() {
         }
     }
 
-    private fun answer(op: String, argsJson: String): String {
-        val args = argsJson.takeIf { it.isNotBlank() }?.let { Json.parseToJsonElement(it) as? JsonObject } ?: JsonObject(emptyMap())
-        return when (op) {
-            "status" -> {
-                val info = runBlocking { app.lab.io { it.sessionInfo() } }.getOrNull()
-                ok(buildJsonObject {
-                    put("contract", CONTRACT_VERSION)
-                    put("version", BuildConfig.VERSION_NAME)
-                    put("document", info?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } ?: JsonPrimitive(null as String?))
-                })
-            }
-            "tools/list" -> mcp("tools/list", "{}")
-            "tools/call" -> {
-                val name = (args["name"] as? JsonPrimitive)?.content ?: return error("tools/call needs `name`")
-                if (name !in TOOLS) return error("unknown tool `$name`; ImageLab serves ${TOOLS.joinToString()}")
-                val result = mcp("tools/call", args.toString())
-                // An edit changes the document under the editor: re-render it.
-                if (name == "lab_script") app.lab.requestRefresh()
-                result
-            }
-            "export" -> export(args)
-            else -> error("unknown op `$op`")
+    private fun answer(op: String, argsJson: String): String = when (op) {
+        "status" -> {
+            val info = runBlocking { app.lab.io { it.sessionInfo() } }.getOrNull()
+            ok(buildJsonObject {
+                put("contract", CONTRACT_VERSION)
+                put("version", BuildConfig.VERSION_NAME)
+                put("document", info?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() } ?: JsonPrimitive(null as String?))
+            })
         }
-    }
-
-    /**
-     * Save the open document (`format` jpg | png | webp, `quality` 1–100, `maxSide`) into
-     * exports/ and copy it to the gallery (Pictures/ImageLab): `{path, mediaId, uri}`, the
-     * mediaId being what ARGO's photo tools take.
-     */
-    private fun export(args: JsonObject): String {
-        val format = ((args["format"] as? JsonPrimitive)?.content ?: "jpg").lowercase().let { if (it == "jpeg") "jpg" else it }
-        if (format !in setOf("jpg", "png", "webp")) return error("format must be jpg, png or webp")
-        val stamp = System.currentTimeMillis()
-        val rel = "exports/imagelab-$stamp.$format"
-        val body = buildJsonObject {
-            put("path", rel)
-            put("format", format)
-            (args["quality"] as? JsonPrimitive)?.content?.toIntOrNull()?.let { put("quality", it.coerceIn(1, 100)) }
-            (args["maxSide"] as? JsonPrimitive)?.content?.toIntOrNull()?.let { put("maxSide", it.coerceIn(16, 16384)) }
-        }
-        runBlocking { app.lab.io { it.call("doc.export", body.toString(), "agent") } }.getOrThrow()
-        val saved = Gallery.save(app, java.io.File(app.workspace, rel), "imagelab-$stamp.$format")
-        return ok(buildJsonObject {
-            put("path", rel)
-            put("mediaId", saved.mediaId)
-            put("uri", saved.uri)
-        })
-    }
-
-    private fun mcp(method: String, paramsJson: String): String {
-        val result = runBlocking { app.lab.io { it.labMcpRequest(method, paramsJson) } }.getOrThrow()
-        return ok(Json.parseToJsonElement(result))
+        else -> error("unknown op `$op`; ImageLab answers status and mcp")
     }
 
     /** Why the current Binder caller is refused, or null when it is ARGO. */
@@ -165,7 +133,6 @@ class LabService : Service() {
         private const val TAG = "ImageLabCompanion"
         const val CONTRACT_VERSION = 1
         private const val MAX_PHOTO_BYTES = 200L shl 20
-        private val TOOLS = setOf("lab_read", "lab_script", "lab_help")
 
         /**
          * Who may drive ImageLab: package → SHA-256 digests of its signing certificate. ARGO's
