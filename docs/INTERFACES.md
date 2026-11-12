@@ -157,12 +157,18 @@ after each gemm. The prompt encoder stays candle's, with its constant positional
 | Tap, M2 Pro, 1 thread | 139 ms | 64 ms |
 | Tap, one-core emulator | 248 ms | 95 ms |
 
-GPU encoder (`tiny_vit/gpu.rs`, feature `mobile-sam-gpu`, opt-in with `IMAGELAB_MOBILESAM_GPU=1`
-for now): the same network as wgpu compute kernels, from the CPU encoder's folded weights, one
-submission per encode. It matches the CPU encoder to 4e-6, and a startup self-test plus any GPU
-error falls back to the CPU (`segment.models` → `mobilesam.encoder` says which runs). M2 Pro: 0.13 s,
-down from 0.23 s on the CPU. On the phone (Snapdragon SM8850, Adreno 840) the gemm kernel runs at
-~1.1 TFLOP/s, 5–15× its CPU's gemm; the full GPU encode has not completed there yet.
+GPU encoder (`tiny_vit/gpu.rs`, feature `mobile-sam-gpu`, on by default): the same network as
+wgpu compute kernels, from the CPU encoder's folded weights, one submission per encode. It matches
+the CPU encoder to 4e-6. With no usable GPU (the emulator has no Vulkan adapter), a failed startup
+self-test, or any GPU error, it falls back to the CPU. `IMAGELAB_MOBILESAM_GPU=0` forces the CPU, and
+`segment.models` → `mobilesam.encoder` says which runs.
+
+| Encode | CPU | GPU |
+|---|---|---|
+| M2 Pro | 0.23 s | 0.13 s |
+| Galaxy SM-S948N (Snapdragon SM8850, Adreno 840), on battery | 1.2–2.1 s | 0.19–0.24 s |
+
+Taps stay on the CPU (60–180 ms on that phone).
 
 On the one-core emulator an encode takes ~1.9 s with the host idle. Under heavy host load it was
 75 s with candle's encoder and 11 s with ours. What remains is mostly gemm. Open: a GPU (wgpu)

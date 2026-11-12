@@ -68,10 +68,11 @@ struct Model {
     backend: String,
 }
 
-/// The GPU encoder is opt-in (`IMAGELAB_MOBILESAM_GPU=1`) until it has run on more phones.
+/// The GPU encoder runs when a GPU is there and passes its self-test; `IMAGELAB_MOBILESAM_GPU=0`
+/// forces the CPU (to compare, or to rule the GPU out).
 #[cfg(feature = "mobile-sam-gpu")]
 fn gpu_wanted() -> bool {
-    std::env::var("IMAGELAB_MOBILESAM_GPU").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+    !std::env::var("IMAGELAB_MOBILESAM_GPU").is_ok_and(|v| matches!(v.as_str(), "0" | "off" | "false"))
 }
 
 /// `(1, 256, 64, 64)` → `4096 × 256`.
