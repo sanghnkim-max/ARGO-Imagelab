@@ -190,6 +190,12 @@ impl ImageLab {
         Ok(self.lab.render_handle(&handle, max_side)?)
     }
 
+    /// An `img:N` handle as premultiplied RGBA8 (≤ 2048 px a side): proxy previews.
+    pub fn handle_rgba(&self, handle: String) -> Result<RgbaFrame> {
+        let (width, height, rgba) = self.lab.handle_rgba(&handle)?;
+        Ok(RgbaFrame { width, height, rgba })
+    }
+
     // ------------------------------------------------------------ documents
 
     /// Open a workspace-relative file. Returns PhotoCraft's JSON (index, size, warnings).

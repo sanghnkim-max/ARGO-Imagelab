@@ -25,6 +25,12 @@ import kotlin.math.roundToInt
  *
  * The previous attempt is undone only while it is still the document's last change (revision
  * check), so an edit from elsewhere (the agent, MCP) is never undone by mistake.
+ *
+ * Fast preview: for scale-free items (looks, face shape, Camera Raw, relight) with no selection,
+ * a moving slider runs on a ≤ [PROXY_SIDE] proxy of the photo (`edit.preview`, a session of its
+ * own, the document untouched) and that frame is shown; the full-resolution run happens when
+ * the slider is released (and for discrete changes). A frame is shown only if it is newer than
+ * the one on screen, so a late full-size render never covers a newer proxy frame or vice versa.
  */
 class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskForNew: () -> String?) {
     var item by mutableStateOf<MenuItem?>(null); private set
@@ -35,9 +41,21 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
     var applied by mutableStateOf(false); private set
 
     private sealed interface Msg {
-        data class Run(val item: MenuItem, val values: Map<String, Any>) : Msg
+        data class Run(val item: MenuItem, val values: Map<String, Any>, val version: Long) : Msg
+        data class Begin(val item: MenuItem, val values: Map<String, Any>, val version: Long) : Msg
         data class End(val keep: Boolean) : Msg
     }
+
+    private data class Preview(val item: MenuItem, val values: Map<String, Any>, val version: Long)
+
+    /** The current item previews on the proxy while its sliders move. */
+    private var proxy = false
+    /** Bumped on every control change; frames carry the version they show. */
+    private var version = 0L
+    @Volatile private var shownVersion = -1L
+    /** The item whose proxy snapshot is ready (`edit.preview {begin}` done). */
+    @Volatile private var begun: MenuItem? = null
+    private val previews = Channel<Preview>(Channel.CONFLATED)
 
     private val inbox = Channel<Msg>(Channel.UNLIMITED)
     private var revisionAfter: Long? = null
@@ -46,24 +64,26 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
     init {
         scope.launch {
             while (true) {
-                var msg = inbox.receive()
-                // Keep only the newest Run before an End.
-                while (msg is Msg.Run) {
-                    val next = inbox.tryReceive().getOrNull() ?: break
-                    if (next is Msg.End) {
-                        run(msg)
-                        msg = next
-                        break
+                // Everything queued, in order, with each stretch of Runs reduced to its newest.
+                val batch = mutableListOf(inbox.receive())
+                while (true) batch += inbox.tryReceive().getOrNull() ?: break
+                batch.forEachIndexed { i, msg ->
+                    when (msg) {
+                        is Msg.Run -> if (batch.getOrNull(i + 1) !is Msg.Run) run(msg)
+                        is Msg.Begin -> begin(msg)
+                        is Msg.End -> end(msg.keep)
                     }
-                    msg = next
-                }
-                when (msg) {
-                    is Msg.Run -> run(msg)
-                    is Msg.End -> end(msg.keep)
                 }
             }
         }
+        scope.launch {
+            for (pv in previews) if (begun === pv.item) preview(pv)
+        }
     }
+
+    /** Scale-free items whose look on a small proxy matches the full-size result. */
+    private fun proxyable(it: MenuItem) = it.live && it.params.isNotEmpty() &&
+        (it.kind == Kind.Look || it.kind == Kind.Face || (it.kind == Kind.Pixels && it.command in PROXY_COMMANDS))
 
     /** Start an item (keeping whatever the previous one did). */
     fun open(next: MenuItem) {
@@ -78,18 +98,54 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
                 is ColorParam -> p.default
             }
         }
-        if (next.live && next.params.isNotEmpty()) send()
+        proxy = proxyable(next) && maskForNew() == null
+        if (proxy) {
+            version++
+            busy = true
+            inbox.trySend(Msg.Begin(next, values.toMap(), version))
+            inbox.trySend(Msg.Run(next, values.toMap(), version))
+        } else if (next.live && next.params.isNotEmpty()) {
+            send()
+        }
     }
 
+    /** A discrete change (a choice, a switch, a colour): preview and apply at once. */
     fun set(key: String, value: Any) {
         values[key] = value
-        if (item?.live == true) send()
+        if (item?.live != true) return
+        if (proxy) {
+            sendPreview()
+            release()
+        } else {
+            send()
+        }
+    }
+
+    /** A slider moving: proxy frames for proxy items, full runs otherwise. */
+    fun drag(key: String, value: Any) {
+        values[key] = value
+        if (item?.live != true) return
+        if (proxy) sendPreview() else send()
+    }
+
+    /** The slider was let go: run at full resolution (proxy items). */
+    fun release() {
+        val it = item ?: return
+        if (!proxy || !it.live) return
+        busy = true
+        inbox.trySend(Msg.Run(it, values.toMap(), version))
+    }
+
+    private fun sendPreview() {
+        val it = item ?: return
+        version++
+        previews.trySend(Preview(it, values.toMap(), version))
     }
 
     /** Keep the result (or, for a non-live item, run it now). */
     fun apply() {
         val it = item ?: return
-        if (!it.live || !applied) inbox.trySend(Msg.Run(it, values.toMap()))
+        if (!it.live || !applied) inbox.trySend(Msg.Run(it, values.toMap(), version))
         inbox.trySend(Msg.End(keep = true))
         item = null
     }
@@ -104,7 +160,41 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         val it = item ?: return
         busy = true
         lab.markInteractive()
-        inbox.trySend(Msg.Run(it, values.toMap()))
+        version++
+        inbox.trySend(Msg.Run(it, values.toMap(), version))
+    }
+
+    /** `edit.preview`'s step for [item] at [values]. */
+    private fun step(item: MenuItem, values: Map<String, Any>): JsonObject {
+        val p = params(item, values)
+        return when (item.kind) {
+            Kind.Look -> buildJsonObject { put("fn", Fn.EDIT_LOOK); put("params", buildJsonObject { put("look", item.command); p.forEach { (k, v) -> put(k, v) } }) }
+            Kind.Face -> buildJsonObject { put("fn", Fn.EDIT_FACE_LIQUIFY); put("params", p) }
+            else -> buildJsonObject { put("fn", Fn.EDIT_RUN); put("params", buildJsonObject { put("id", item.command); put("params", p) }) }
+        }
+    }
+
+    /** Show a proxy frame if nothing newer is on screen. */
+    private suspend fun showFrame(result: JsonObject?, v: Long) {
+        val image = (result?.get("image") as? JsonPrimitive)?.content ?: return
+        if (v <= shownVersion) return
+        if (lab.showHandle(image)) shownVersion = v
+    }
+
+    private suspend fun begin(msg: Msg.Begin) {
+        val body = buildJsonObject { put("begin", true); put("maxSide", PROXY_SIDE); put("step", step(msg.item, msg.values)) }
+        val r = lab.io { it.call(Fn.EDIT_PREVIEW, body.toString(), "ui") }
+        if (r.isFailure) return
+        begun = msg.item
+        showFrame(lab.parse(r.getOrThrow()) as? JsonObject, msg.version)
+        // A slider moved while the snapshot was being made: preview its newest values too.
+        if (item === msg.item && version > msg.version) previews.trySend(Preview(msg.item, values.toMap(), version))
+    }
+
+    private suspend fun preview(pv: Preview) {
+        val body = buildJsonObject { put("maxSide", PROXY_SIDE); put("step", step(pv.item, pv.values)) }
+        val r = lab.io { it.call(Fn.EDIT_PREVIEW, body.toString(), "ui") }
+        showFrame(r.getOrNull()?.let { lab.parse(it) } as? JsonObject, pv.version)
     }
 
     private fun params(item: MenuItem, values: Map<String, Any>): JsonObject = buildJsonObject {
@@ -171,7 +261,8 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         }
         applied = r.isSuccess && !nothing
         revisionAfter = if (r.isSuccess) revision() else null
-        if (r.isSuccess) {
+        if (r.isSuccess && msg.version >= shownVersion) {
+            shownVersion = msg.version
             lab.markInteractive()
             lab.renderInteractive()
         }
@@ -184,7 +275,16 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         }
         applied = false
         revisionAfter = null
+        begun = null
+        shownVersion = -1L
         busy = false
         lab.requestRefresh()
+    }
+
+    companion object {
+        /** Longest side of the proxy previews follow while a slider moves. */
+        const val PROXY_SIDE = 768
+        /** Pixel commands without pixel-unit parameters, so a proxy previews them faithfully. */
+        val PROXY_COMMANDS = setOf("filter.cameraRaw", "filter.render.relight")
     }
 }

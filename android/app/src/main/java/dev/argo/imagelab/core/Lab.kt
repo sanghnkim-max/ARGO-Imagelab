@@ -130,6 +130,14 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
         }
     }
 
+    /** Show an `img:N` handle (a proxy preview from `edit.preview`) as the preview. */
+    suspend fun showHandle(handle: String): Boolean = withContext(Dispatchers.IO) {
+        val api = runCatching { apiDeferred.await() }.getOrNull() ?: return@withContext false
+        val bitmap = runCatching { api.handleRgba(handle) }.getOrNull()?.toBitmap() ?: return@withContext false
+        _state.update { it.copy(preview = bitmap, version = it.version + 1) }
+        true
+    }
+
     private fun RgbaFrame.toBitmap(): Bitmap? = runCatching {
         Bitmap.createBitmap(width.toInt(), height.toInt(), Bitmap.Config.ARGB_8888).apply {
             copyPixelsFromBuffer(ByteBuffer.wrap(rgba))

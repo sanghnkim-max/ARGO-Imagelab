@@ -233,6 +233,26 @@ impl Lab {
         Ok(imagelab_script::encode_handle_png(&self.core.shared.handles, id, max_side)?)
     }
 
+    /// An `img:N` handle as premultiplied RGBA8 at full size (≤ 2048 px a side): the fast
+    /// path for proxy previews (`edit.preview`), no PNG round trip.
+    pub fn handle_rgba(&self, handle: &str) -> Result<(u32, u32, Vec<u8>)> {
+        let id = imagelab_api::parse_handle(handle)?;
+        let img = self.core.shared.handles.image(id)?;
+        if img.width.max(img.height) > MAX_PREVIEW_SIDE {
+            return Err(LabError::BadRequest(format!("{handle} is larger than {MAX_PREVIEW_SIDE} px")));
+        }
+        let mut px = img.rgba.clone();
+        for [r, g, b, a] in px.as_chunks_mut::<4>().0 {
+            let alpha = u16::from(*a);
+            if alpha < 255 {
+                for c in [r, g, b] {
+                    *c = ((u16::from(*c) * alpha + 127) / 255) as u8;
+                }
+            }
+        }
+        Ok((img.width, img.height, px))
+    }
+
     // ---------------------------------------------------------------- documents
 
     /// Open a file beneath the workspace and make it the active document.

@@ -78,7 +78,7 @@ private fun ParamControl(p: Param, live: LiveCommand) {
             val v = (live.values[p.key] as? Float) ?: p.default
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(p.label, Modifier.width(96.dp), style = MaterialTheme.typography.bodySmall)
-                Slider(value = v, onValueChange = { live.set(p.key, it) }, valueRange = p.min..p.max, modifier = Modifier.weight(1f))
+                Slider(value = v, onValueChange = { live.drag(p.key, it) }, onValueChangeFinished = live::release, valueRange = p.min..p.max, modifier = Modifier.weight(1f))
                 Text(if (p.integer) v.roundToInt().toString() else "%.2f".format(v), Modifier.width(52.dp), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
             }
         }

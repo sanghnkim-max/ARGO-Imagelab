@@ -21,6 +21,7 @@ object Fn {
     const val EDIT_LOOK = "edit.look"
     const val EDIT_LOOK_SUGGEST = "edit.lookSuggest"
     const val EDIT_FACE_LIQUIFY = "edit.faceLiquify"
+    const val EDIT_PREVIEW = "edit.preview"
     const val EDIT_STRAIGHTEN = "edit.straighten"
 
     const val SELECT_SUBJECT = "select.subject"

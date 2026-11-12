@@ -235,6 +235,11 @@ pub fn register(r: &mut Registry) {
         .effects(Effects::Revertible)
         .typed(|ctx: &Ctx, p: crate::face::FaceParams| mutate(ctx, |h| crate::face::apply(h, &p)))
         .register();
+    r.function("edit", "preview", "Preview an edit on a small proxy of the photo (the document is not changed)")
+        .description("{begin?, maxSide? (256..2048, default 1024), step?: {fn: 'edit.look' | 'edit.faceLiquify' | 'edit.run', params}}. begin snapshots the active document (flattened) as the proxy; later calls reuse it and replace the previous preview. Returns {image: img:N, width, height, ms, result}. For sliders: preview while dragging, then apply with the real function. Pixel-unit params (blur radius) are not rescaled for the proxy.")
+        .params(json!({"type":"object","properties":{"begin":{"type":"boolean"},"maxSide":{"type":"integer","minimum":256,"maximum":2048},"step":{"type":"object","properties":{"fn":{"type":"string"},"params":{"type":"object"}},"required":["fn"]}}}))
+        .typed(crate::preview::preview)
+        .register();
     r.function("edit", "saveRecipe", "Store steps as a named recipe (recipes/<name>.json)")
         .description("{name, steps, description?, replace?}. Steps as edit.steps takes them; validated against the allowlist when saved. Replay with edit.applyRecipe or batch.apply.")
         .params(json!({"type":"object","required":["name","steps"],"properties":{"name":{"type":"string"},"steps":{"type":"array","maxItems":MAX_STEPS,"items":step_schema()},"description":{"type":"string"},"replace":{"type":"boolean"}}}))

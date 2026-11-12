@@ -32,6 +32,9 @@ interface LabApi {
     /** PNG of an `img:N` / `mask:N` handle, for overlays. */
     fun renderHandle(handle: String, maxSide: UInt): ByteArray
 
+    /** Premultiplied RGBA8 of an `img:N` handle (proxy previews, no PNG round trip). */
+    fun handleRgba(handle: String): RgbaFrame
+
     /** Serve MCP on 127.0.0.1:[port] with a bearer [token]; edit tools only when [allowEdits]. */
     fun startMcpHttp(port: UShort, token: String, allowEdits: Boolean): UShort
 
@@ -70,6 +73,7 @@ class FfiLabApi(private val core: ImageLab) : LabApi {
     override fun cancelScripts() = core.cancelScripts()
     override fun setEventListener(listener: EventListener) = core.setEventListener(listener)
     override fun renderHandle(handle: String, maxSide: UInt): ByteArray = core.renderHandle(handle, maxSide)
+    override fun handleRgba(handle: String): RgbaFrame = core.handleRgba(handle)
     override fun startMcpHttp(port: UShort, token: String, allowEdits: Boolean): UShort = core.startMcpHttp(port, token, allowEdits)
 
     override fun workspaceRoot(): String = core.workspaceRoot()

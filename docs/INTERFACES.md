@@ -270,6 +270,15 @@ step ("Action: Enhance"); the action is deleted afterwards. Enhance measures the
 revision) and only corrects what it finds. Sky and face looks return `applied:false` with
 `skipped` when there is no sky or face, and change nothing.
 
+**Fast preview** (`edit.preview`): while a slider of a scale-free item moves (looks, face shape,
+Camera Raw, relight; no selection), the app runs the step on a ≤ 768 px flattened proxy of the
+photo in a session of its own and shows that frame; the full-resolution edit runs once, when the
+slider is released. The proxy is snapshotted when the tool opens (`begin`), so the tool's own
+full-size run landing meanwhile is never previewed on top of itself. Each frame carries a
+version and is shown only if newer than the one on screen. On the Mac, proxy previews of
+Enhance take ~0.7 s (shadows/highlights are the costly sliders, ~180 ms each), Dramatic 0.35 s,
+plain Camera Raw 30 ms, versus 1.6–3 s at 3000×4000.
+
 Face shape sliders (eyes, nose, mouth, smile, face width, chin, forehead; −100..100) become
 `filter.liquify` strokes sized from each face's width: bloat/pucker held at the eye, nose and
 mouth landmarks, forward-warp drags for the smile corners, five rows along each cheek and jaw,

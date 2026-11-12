@@ -23,6 +23,7 @@ pub mod looks;
 pub mod face;
 pub mod ops;
 pub mod paths;
+pub mod preview;
 
 #[cfg(test)]
 mod tests;

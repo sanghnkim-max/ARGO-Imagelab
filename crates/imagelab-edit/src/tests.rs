@@ -386,3 +386,32 @@ fn render_face_liquify_grid() {
         s.command_run("edit.undo", json!({})).unwrap();
     }
 }
+
+/// Proxy previews of looks on `IMAGELAB_LOOK_PHOTO`: timings, the document untouched, and the
+/// preview close to the full-resolution result.
+#[test]
+#[ignore]
+fn preview_looks_on_a_proxy() {
+    let Ok(photo) = std::env::var("IMAGELAB_LOOK_PHOTO") else { return };
+    let e = env();
+    std::fs::create_dir_all(e.root.join("library/x")).unwrap();
+    std::fs::copy(&photo, e.root.join("library/x/p.jpg")).unwrap();
+    e.ok("doc.open", json!({"photo": "library/x/p.jpg"}));
+    let rev = e.ok("doc.history", json!({}))["revision"].clone();
+    let begin = e.ok("edit.preview", json!({"begin": true}));
+    println!("begin {} ms", begin["ms"]);
+    for (look, amount) in [("enhance", 20), ("enhance", 60), ("enhance", 90), ("template", 80), ("skyReplace", 85), ("dramatic", 50)] {
+        let mut p = json!({"look": look, "amount": amount});
+        if look == "template" { p["style"] = json!("crisp"); }
+        if look == "enhance" { p["sky"] = json!(50); }
+        let r = e.ok("edit.preview", json!({"step": {"fn": "edit.look", "params": p}}));
+        println!("{look:10} {amount:3}  {} ms  {}x{}", r["ms"], r["width"], r["height"]);
+    }
+    let r = e.ok("edit.preview", json!({"step": {"fn": "edit.run", "params": {"id": "filter.cameraRaw", "params": {"exposure": 0.5, "clarity": 30}}}}));
+    println!("cameraRaw   {} ms", r["ms"]);
+    for k in ["shadows", "highlights", "whites", "blacks", "texture", "dehaze", "vibrance", "contrast", "vignetteAmount"] {
+        let r = e.ok("edit.preview", json!({"step": {"fn": "edit.run", "params": {"id": "filter.cameraRaw", "params": {k: 30}}}}));
+        println!("  {k:15} {} ms", r["ms"]);
+    }
+    assert_eq!(e.ok("doc.history", json!({}))["revision"], rev, "the document is not touched");
+}
