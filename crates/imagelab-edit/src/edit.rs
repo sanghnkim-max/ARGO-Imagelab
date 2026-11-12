@@ -199,7 +199,7 @@ fn step_schema() -> Value {
 
 pub fn register(r: &mut Registry) {
     r.function("edit", "commands", "Allowlisted PhotoCraft engine commands with their param docs")
-        .description("Searches the engine commands edit.run may run (id, label or keywords contain `filter`; default limit 40), with each command's params. With neither filter nor limit: an index of the command groups (id prefix, count, example labels) to search next. The list is generated from PhotoCraft's registry: image.*, layer.*, filter.*, select.*, paint.* and in-document edit.* (undo/redo, fill, stroke, transform, content-aware); never file, export, preferences, plugin, script, print, view or tool-state commands.")
+        .description("Searches the engine commands edit.run may run (id, label or keywords contain `filter`, `a|b` for either; default limit 40), with each command's params. With neither filter nor limit: an index of the command groups (id prefix, count, example labels) to search next. The list is generated from PhotoCraft's registry: image.*, layer.*, filter.*, select.*, paint.* and in-document edit.* (undo/redo, fill, stroke, transform, content-aware); never file, export, preferences, plugin, script, print, view or tool-state commands.")
         .params(json!({"type":"object","properties":{"filter":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}}}))
         .typed(|_: &Ctx, p: CommandsParams| Ok(commands(p)))
         .register();

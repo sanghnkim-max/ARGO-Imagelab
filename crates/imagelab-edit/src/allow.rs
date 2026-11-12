@@ -120,14 +120,19 @@ pub fn len() -> usize {
     list().ids.len()
 }
 
-/// The allowlisted entries whose id, label or keywords contain `filter` (case-insensitive).
+/// Allowlisted entries whose id, label or keywords contain `filter` (case-insensitive);
+/// `a|b` matches either.
 pub fn entries(filter: Option<&str>) -> Vec<&'static Value> {
-    let needle = filter.map(str::to_lowercase).filter(|n| !n.trim().is_empty());
+    let needles: Vec<String> = filter.map(|f| f.split('|').map(|n| n.trim().to_lowercase()).filter(|n| !n.is_empty()).collect()).unwrap_or_default();
     list()
         .entries
         .iter()
         .filter(|e| {
-            needle.as_deref().is_none_or(|n| ["id", "label", "keywords"].iter().any(|k| e.get(*k).and_then(Value::as_str).is_some_and(|v| v.to_lowercase().contains(n))))
+            needles.is_empty()
+                || ["id", "label", "keywords"].iter().any(|k| e.get(*k).and_then(Value::as_str).is_some_and(|v| {
+                    let v = v.to_lowercase();
+                    needles.iter().any(|n| v.contains(n))
+                }))
         })
         .collect()
 }

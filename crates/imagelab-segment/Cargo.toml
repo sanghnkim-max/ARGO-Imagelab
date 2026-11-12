@@ -23,6 +23,8 @@ workspace = true
 
 [dependencies]
 imagelab-api = { workspace = true }
+# The full-size render, Lab conversion and mask growth select.sky's edge completion uses.
+imagelab-cv = { workspace = true }
 photocraft-engine = { workspace = true }
 photocraft-codecs = { workspace = true }
 # Region renders of the open document for the detail pass (render_reduced_rect).

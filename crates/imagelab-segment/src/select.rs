@@ -134,12 +134,6 @@ pub fn register(r: &mut imagelab_api::Registry) {
             json!({"type":"object","properties":{"mode":{"enum":["replace","add","subtract","intersect"]},"sampleAllLayers":{"type":"boolean"}}}),
         ),
         (
-            "sky",
-            "select.sky",
-            "Select the sky (PhotoCraft, no model)",
-            json!({"type":"object","properties":{"mode":{"enum":["replace","add","subtract","intersect"]},"threshold":{"type":"number","minimum":0,"maximum":100},"softness":{"type":"number","minimum":0,"maximum":100},"sampleAllLayers":{"type":"boolean"}}}),
-        ),
-        (
             "object",
             "select.object",
             "Select the object in a rect [x,y,w,h] or under a point [x,y] (PhotoCraft Object Finder)",
@@ -177,6 +171,55 @@ pub fn register(r: &mut imagelab_api::Registry) {
             })
             .register();
     }
+
+    r.function("select", "sky", "Select the sky (PhotoCraft, no model), its edge completed to the skyline")
+        .description("Runs PhotoCraft `select.sky` on the open document, then (edgeFill, default true) completes its edge: PhotoCraft's mask stops short of the skyline, and an edit through it leaves a band of the old sky along ridges and treetops (a halo). edgeFill grows the mask into sky-coloured pixels next to it (CIELAB distance to the sky's mean colour) and feathers it 1.5 px, so the selection reaches the skyline without crossing it. One undoable step per command. Returns {selected, coverage 0..1, bounds [x,y,w,h], result, edgeFill}.")
+        .params(json!({"type":"object","properties":{"mode":{"enum":["replace","add","subtract","intersect"]},"threshold":{"type":"number","minimum":0,"maximum":100},"softness":{"type":"number","minimum":0,"maximum":100},"sampleAllLayers":{"type":"boolean"},"edgeFill":{"type":"boolean","description":"Complete the edge to the skyline (default true)."}}}))
+        .effects(Revertible)
+        .handler(|ctx, params| {
+            let mut params = if params.is_null() { json!({}) } else { params };
+            let obj = params.as_object_mut().ok_or_else(|| ApiError::bad_params("params must be an object"))?;
+            let fill = match obj.remove("edgeFill") {
+                None | Some(Value::Null) => true,
+                Some(Value::Bool(b)) => b,
+                Some(_) => return Err(ApiError::bad_params("edgeFill must be true or false")),
+            };
+            // Completing the edge works on the sky alone: run PhotoCraft's select.sky as a fresh
+            // selection, complete it, then combine with what was selected by `mode`.
+            let mode: Mode = match obj.remove("mode") {
+                None | Some(Value::Null) => Mode::default(),
+                Some(m) => serde_json::from_value(m).map_err(|e| ApiError::bad_params(format!("mode: {e}")))?,
+            };
+            if !fill {
+                obj.insert("mode".into(), json!(mode.as_str()));
+                let out = run_command(ctx, "select.sky", params)?;
+                let mut v = summary(ctx, out)?;
+                v["edgeFill"] = json!(false);
+                return Ok(v);
+            }
+            let (changed, filled) = ctx.with_session(|h| {
+                let (w, ht, before) = read_selection(h)?;
+                let (_, _, sky) = probe(h, "select.sky", params.clone())?;
+                let Some(sky) = sky else {
+                    return Ok((None, json!({"grown": 0.0, "note": "no sky found"})));
+                };
+                let (pw, ph, rgba) = imagelab_cv::io::document_rgba(ctx, h)?;
+                if pw != w as usize || ph != ht as usize {
+                    return Err(ApiError::internal("the render and the document differ in size"));
+                }
+                let (completed, grown) = complete_sky_edge(&sky, &rgba, w as usize, ht as usize);
+                let out = mask::combine(before.as_deref(), &completed, mode);
+                write_selection(h, "Select Sky", w, ht, &out)?;
+                Ok((revision(h), json!({"grown": grown})))
+            })?;
+            if let Some((doc, revision)) = changed {
+                ctx.emit(Event::DocChanged { doc, revision, source: ctx.source });
+            }
+            let mut v = summary(ctx, json!({"mode": mode.as_str()}))?;
+            v["edgeFill"] = filled;
+            Ok(v)
+        })
+        .register();
 
     r.function("select", "refineEdge", "Refine the selection's edge (radius, smooth, feather, contrast, shiftEdge)")
         .description("Runs PhotoCraft `select.refineEdge` with output `selection` (other outputs belong to `edit`). Params: radius, smartRadius, smooth 0..100, feather px, contrast 0..100, shiftEdge -100..100, decontaminate, amount, sampleAllLayers, refineStrokes.")
@@ -232,4 +275,82 @@ pub fn register(r: &mut imagelab_api::Registry) {
             summary(ctx, json!({"mode": p.mode.as_str()}))
         })
         .register();
+}
+
+/// How far past PhotoCraft's sky mask the edge may grow, as a share of the long side.
+const SKY_REACH: f32 = 0.015;
+/// CIELAB ΔE76 to the sky's mean colour that still counts as sky, and the ramp after it.
+const SKY_TOLERANCE: f32 = 22.0;
+const SKY_SOFTNESS: f32 = 10.0;
+
+/// `sky` (GRAY8 coverage) grown into the sky-coloured pixels of `rgba` next to it, feathered
+/// 1.5 px. Returns the completed mask and the coverage it added (0..1).
+pub fn complete_sky_edge(sky: &[u8], rgba: &[u8], w: usize, h: usize) -> (Vec<u8>, f64) {
+    let lab_of = |i: usize| imagelab_cv::color::rgb_to_lab(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+    let (mut sum, mut n) = ((0f64, 0f64, 0f64), 0f64);
+    for (i, &c) in sky.iter().enumerate() {
+        if c >= 128 {
+            let (l, a, b) = lab_of(i);
+            sum = (sum.0 + l as f64, sum.1 + a as f64, sum.2 + b as f64);
+            n += 1.0;
+        }
+    }
+    if n == 0.0 {
+        return (sky.to_vec(), 0.0);
+    }
+    let mean = ((sum.0 / n) as f32, (sum.1 / n) as f32, (sum.2 / n) as f32);
+    let reach = (w.max(h) as f32 * SKY_REACH).max(4.0);
+    let near = imagelab_cv::morph::grow_buf(sky, w, h, reach);
+    let mut out = sky.to_vec();
+    for i in 0..out.len() {
+        if out[i] == 255 || near[i] == 0 {
+            continue;
+        }
+        let (l, a, b) = lab_of(i);
+        let de = ((l - mean.0).powi(2) + (a - mean.1).powi(2) + (b - mean.2).powi(2)).sqrt();
+        let like = ((SKY_TOLERANCE + SKY_SOFTNESS - de) / SKY_SOFTNESS).clamp(0.0, 1.0);
+        let band = (like * near[i] as f32).round() as u8;
+        out[i] = out[i].max(band);
+    }
+    mask::feather(&mut out, w, h, 1.5);
+    // Feathering must not eat into the sky PhotoCraft found.
+    for (o, &s) in out.iter_mut().zip(sky) {
+        *o = (*o).max(s);
+    }
+    let added = (mask::coverage(&out) - mask::coverage(sky)).max(0.0);
+    (out, added)
+}
+
+#[cfg(test)]
+mod sky_edge_tests {
+    use super::complete_sky_edge;
+
+    /// A 100×100 picture (reach 4 px): blue sky rows 0..40, a band of slightly lighter sky rows 40..44 that
+    /// PhotoCraft's mask missed, then brown ground. The completed mask covers the band, not the
+    /// ground.
+    #[test]
+    fn the_edge_grows_into_sky_coloured_pixels_only() {
+        let (w, h) = (100usize, 100usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        let mut sky = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let px: [u8; 4] = if y < 40 {
+                    sky[i] = 255;
+                    [90, 140, 230, 255]
+                } else if y < 44 {
+                    [120, 165, 240, 255]
+                } else {
+                    [110, 80, 50, 255]
+                };
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&px);
+            }
+        }
+        let (out, added) = complete_sky_edge(&sky, &rgba, w, h);
+        assert!(added > 0.03, "the band was added: {added}");
+        assert!(out[42 * w + 50] > 200, "inside the band: {}", out[42 * w + 50]);
+        assert!(out[60 * w + 50] == 0, "the ground stays out: {}", out[60 * w + 50]);
+        assert!(out.iter().zip(&sky).all(|(o, s)| o >= s), "never less than PhotoCraft's sky");
+    }
 }

@@ -18,6 +18,8 @@ photocraft-codecs = { workspace = true }
 # PatchMatch completion and membrane fill for cv.inpaint (MIT OR Apache-2.0, pure Rust, only rayon).
 lightcraft-inpaint = { git = "https://github.com/storytold/lightcraft", rev = "f786b87533e58c6d31c7f9f2897814904448f39a" }
 rayon = "1"
+# ExportOptions for full-size document renders (cv.fromDocument past the compositor's 2048 px).
+photocraft-io = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
 
 [dev-dependencies]
 tempfile = "3"

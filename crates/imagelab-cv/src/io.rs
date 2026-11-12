@@ -204,10 +204,56 @@ pub fn from_document(ctx: &Ctx, p: FromDocument) -> ApiResult<Value> {
     if max_side > MAX_SIDE {
         return Err(ApiError::bad_params(format!("maxSide must be at most {MAX_SIDE} (0 = full size)")));
     }
-    let png = ctx.with_session(|h| Ok(h.render_png(p.document, max_side)?))?;
+    // The headless compositor renders at most PREVIEW_SIDE a side; past that (and for full
+    // size) the document is written to a temporary PNG and decoded, as an export would.
+    let png = ctx.with_session(|h| {
+        let (w, hgt) = match p.document {
+            Some(i) => h.session.documents().get(i).map(|d| (d.doc.size.width, d.doc.size.height)),
+            None => h.session.active().map(|d| (d.doc.size.width, d.doc.size.height)),
+        }
+        .ok_or_else(|| ApiError::not_found("no open document"))?;
+        let side = if max_side == 0 { w.max(hgt) } else { max_side.min(w.max(hgt)) };
+        if side <= PREVIEW_SIDE {
+            return Ok(h.render_png(p.document, max_side)?);
+        }
+        full_size_png(ctx, h, p.document)
+    })?;
     let img = decode_image(&png)?;
     let (w, h) = (img.width as usize, img.height as usize);
+    if max_side != 0 && w.max(h) > max_side as usize {
+        let scale = max_side as f64 / w.max(h) as f64;
+        let (nw, nh) = (((w as f64 * scale).round() as usize).max(1), ((h as f64 * scale).round() as usize).max(1));
+        let rgba = crate::geom::resize_buf(&img.rgba, w, h, 4, nw, nh, crate::geom::Interp::Area);
+        return put_img(ctx, nw, nh, rgba);
+    }
     put_img(ctx, w, h, img.rgba)
+}
+
+/// The largest side PhotoCraft's headless compositor renders.
+pub const PREVIEW_SIDE: u32 = 2048;
+
+/// The active document flattened at full size as RGBA8 (straight alpha): `(width, height, rgba)`.
+/// For callers already inside `with_session`.
+pub fn document_rgba(ctx: &Ctx, h: &mut imagelab_api::Headless) -> ApiResult<(usize, usize, Vec<u8>)> {
+    let (w, hgt) = h.session.active().map(|d| (d.doc.size.width, d.doc.size.height)).ok_or_else(|| ApiError::not_found("no open document"))?;
+    let png = if w.max(hgt) <= PREVIEW_SIDE { h.render_png(None, 0)? } else { full_size_png(ctx, h, None)? };
+    let img = decode_image(&png)?;
+    Ok((img.width as usize, img.height as usize, img.rgba))
+}
+
+/// The document flattened at full size, through a temporary PNG under `.imagelab/tmp/`.
+pub fn full_size_png(ctx: &Ctx, h: &mut imagelab_api::Headless, document: Option<usize>) -> ApiResult<Vec<u8>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rel = format!(".imagelab/tmp/cv-document-{}-{n}.png", std::process::id());
+    let abs = ctx.shared.root.join(&rel);
+    if let Some(dir) = abs.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| ApiError::internal(format!("cannot make the temp folder: {e}")))?;
+    }
+    let saved = h.save(document, Some(Path::new(&rel)), Some("png"), &photocraft_io::ExportOptions::default());
+    let bytes = saved.map_err(ApiError::from).and_then(|_| std::fs::read(&abs).map_err(|e| ApiError::internal(format!("cannot read the render: {e}"))));
+    let _ = std::fs::remove_file(&abs);
+    bytes
 }
 
 #[derive(Deserialize)]
