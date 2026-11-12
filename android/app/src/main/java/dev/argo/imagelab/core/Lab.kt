@@ -40,6 +40,8 @@ data class EditorState(
     val preview: Bitmap? = null,
     val documents: Int = 0,
     val name: String? = null,
+    /** The open document's file (identity: two photos can share a name and size). */
+    val path: String? = null,
     val width: Int = 0,
     val height: Int = 0,
     val layers: List<LayerInfo> = emptyList(),
@@ -132,9 +134,11 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
     }
 
     /** Show an `img:N` handle (a proxy preview from `edit.preview`) as the preview. */
-    suspend fun showHandle(handle: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun showHandle(handle: String, accept: () -> Boolean = { true }): Boolean = withContext(Dispatchers.IO) {
         val api = runCatching { apiDeferred.await() }.getOrNull() ?: return@withContext false
         val bitmap = runCatching { api.handleRgba(handle) }.getOrNull()?.toBitmap() ?: return@withContext false
+        // [accept] is asked once the pixels are here: the caller may have moved on meanwhile.
+        if (!accept()) return@withContext false
         _state.update { it.copy(preview = bitmap, version = it.version + 1) }
         true
     }
@@ -182,7 +186,7 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
             val info = runCatching { json.parseToJsonElement(api.sessionInfo()) }.getOrNull()
             val docs = (info as? JsonObject)?.get("documents") as? JsonArray
             if (docs.isNullOrEmpty()) {
-                _state.update { it.copy(preview = null, documents = 0, name = null, width = 0, height = 0, layers = emptyList(), version = it.version + 1) }
+                _state.update { it.copy(preview = null, documents = 0, name = null, path = null, width = 0, height = 0, layers = emptyList(), version = it.version + 1) }
                 return@withContext
             }
             val active = (info["active"]?.jsonPrimitive?.intOrNull ?: 0).coerceIn(0, docs.size - 1)
@@ -198,6 +202,7 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
                     preview = bitmap ?: it.preview,
                     documents = docs.size,
                     name = doc?.string("name"),
+                    path = doc?.string("path"),
                     width = doc?.int("width") ?: 0,
                     height = doc?.int("height") ?: 0,
                     layers = detail?.let(::layersOf) ?: it.layers,

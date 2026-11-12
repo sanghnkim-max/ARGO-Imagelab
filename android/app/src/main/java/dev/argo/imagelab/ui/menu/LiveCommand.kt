@@ -47,13 +47,19 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         data class End(val keep: Boolean) : Msg
     }
 
-    private data class Preview(val item: MenuItem, val values: Map<String, Any>, val version: Long)
+    private data class Preview(val item: MenuItem, val values: Map<String, Any>, val version: Long, val generation: Long)
 
     /** The current item previews on the proxy while its sliders move. */
     private var proxy = false
     /** Bumped on every control change; frames carry the version they show. */
     private var version = 0L
     @Volatile private var shownVersion = -1L
+    /** Bumped when an item opens or closes: a frame from an earlier generation is never shown. */
+    @Volatile private var generation = 0L
+    /** Newest version sent as a full-resolution Run. */
+    private var sentVersion = -1L
+    /** Re-editing: the params the person changed (only those are sent; the rest keep the layer's values). */
+    private val touched = mutableSetOf<String>()
     /** The item whose proxy snapshot is ready (`edit.preview {begin}` done). */
     @Volatile private var begun: MenuItem? = null
     private val previews = Channel<Preview>(Channel.CONFLATED)
@@ -93,6 +99,8 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
     fun open(next: MenuItem) {
         if (item != null) apply()
         item = next
+        generation++
+        touched.clear()
         values.clear()
         next.params.forEach { p ->
             values[p.key] = next.initial[p.key] ?: when (p) {
@@ -109,14 +117,18 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
             busy = true
             inbox.trySend(Msg.Begin(next, values.toMap(), version))
             inbox.trySend(Msg.Run(next, values.toMap(), version))
-        } else if (next.live && next.params.isNotEmpty()) {
+        } else if (next.live && next.params.isNotEmpty() && next.kind != Kind.AdjustmentEdit) {
+            // (Re-editing waits for a change: running at once would rewrite the layer with
+            // whatever the controls could not read back.)
             send()
         }
     }
 
     /** A discrete change (a choice, a switch, a colour): preview and apply at once. */
     fun set(key: String, value: Any) {
+        if (item == null) return
         values[key] = value
+        touched += key
         if (item?.live != true) return
         if (proxy) {
             sendPreview()
@@ -128,7 +140,9 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
 
     /** A slider moving: proxy frames for proxy items, full runs otherwise. */
     fun drag(key: String, value: Any) {
+        if (item == null) return
         values[key] = value
+        touched += key
         if (item?.live != true) return
         if (proxy) sendPreview() else send()
     }
@@ -138,27 +152,32 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         val it = item ?: return
         if (!proxy || !it.live) return
         busy = true
+        sentVersion = version
         inbox.trySend(Msg.Run(it, values.toMap(), version))
     }
 
     private fun sendPreview() {
         val it = item ?: return
         version++
-        previews.trySend(Preview(it, values.toMap(), version))
+        previews.trySend(Preview(it, values.toMap(), version, generation))
     }
 
     /** Keep the result (or, for a non-live item, run it now). */
     fun apply() {
         val it = item ?: return
-        if (!it.live || !applied) inbox.trySend(Msg.Run(it, values.toMap(), version))
+        // Run when nothing ran yet, or when the newest values were only previewed on the proxy.
+        val untouchedEdit = it.kind == Kind.AdjustmentEdit && touched.isEmpty()
+        if (!untouchedEdit && (!it.live || !applied || sentVersion < version)) inbox.trySend(Msg.Run(it, values.toMap(), version))
         inbox.trySend(Msg.End(keep = true))
         item = null
+        generation++
     }
 
     /** Undo the preview and close. */
     fun cancel() {
         inbox.trySend(Msg.End(keep = false))
         item = null
+        generation++
     }
 
     private fun send() {
@@ -166,6 +185,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         busy = true
         lab.markInteractive()
         version++
+        sentVersion = version
         inbox.trySend(Msg.Run(it, values.toMap(), version))
     }
 
@@ -181,26 +201,30 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
     }
 
     /** Show a proxy frame if nothing newer is on screen. */
-    private suspend fun showFrame(result: JsonObject?, v: Long) {
+    private suspend fun showFrame(result: JsonObject?, v: Long, gen: Long) {
         val image = (result?.get("image") as? JsonPrimitive)?.content ?: return
-        if (v <= shownVersion) return
-        if (lab.showHandle(image)) shownVersion = v
+        if (v <= shownVersion || gen != generation) return
+        // Checked again after the pixels are fetched, right before they are shown: a full-size
+        // render or a Cancel/Apply in the meantime wins.
+        if (lab.showHandle(image) { v > shownVersion && gen == generation }) shownVersion = v
     }
 
     private suspend fun begin(msg: Msg.Begin) {
         val body = buildJsonObject { put("begin", true); put("maxSide", PROXY_SIDE); put("step", step(msg.item, msg.values)) }
         val r = lab.io { it.call(Fn.EDIT_PREVIEW, body.toString(), "ui") }
         if (r.isFailure) return
+        val gen = generation
+        showFrame(lab.parse(r.getOrThrow()) as? JsonObject, msg.version, gen)
         begun = msg.item
-        showFrame(lab.parse(r.getOrThrow()) as? JsonObject, msg.version)
         // A slider moved while the snapshot was being made: preview its newest values too.
-        if (item === msg.item && version > msg.version) previews.trySend(Preview(msg.item, values.toMap(), version))
+        if (item === msg.item && version > msg.version) previews.trySend(Preview(msg.item, values.toMap(), version, gen))
     }
 
     private suspend fun preview(pv: Preview) {
+        if (pv.generation != generation) return
         val body = buildJsonObject { put("maxSide", PROXY_SIDE); put("step", step(pv.item, pv.values)) }
         val r = lab.io { it.call(Fn.EDIT_PREVIEW, body.toString(), "ui") }
-        showFrame(r.getOrNull()?.let { lab.parse(it) } as? JsonObject, pv.version)
+        showFrame(r.getOrNull()?.let { lab.parse(it) } as? JsonObject, pv.version, pv.generation)
     }
 
     /**
@@ -212,7 +236,12 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
     private fun params(item: MenuItem, values: Map<String, Any>): JsonObject {
         val flat = linkedMapOf<String, JsonElement>()
         item.fixed.forEach { (k, v) -> flat[k] = element(v) }
+        // Re-editing sends only what changed (whole arrays/objects of a changed part), so the
+        // layer keeps every setting the controls could not read back.
+        val bases = touched.map(::baseKey).toSet()
         item.params.forEach { p ->
+            if (p.key.startsWith("_")) return@forEach // controls that only steer the sheet
+            if (item.kind == Kind.AdjustmentEdit && baseKey(p.key) !in bases) return@forEach
             val v = values[p.key] ?: return@forEach
             if (v is CurveSet) { flat.putAll(v.json()); return@forEach }
             flat[p.key] = if (v is Float) {
@@ -224,9 +253,11 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         }
         // Values set for keys that are not controls (a sampled colour's `points`).
         val keys = item.params.map { it.key }.toSet()
-        values.forEach { (k, v) -> if (k !in keys) flat[k] = element(v) }
+        values.forEach { (k, v) -> if (k !in keys && !k.startsWith("_")) flat[k] = element(v) }
         return nest(flat)
     }
+
+    private fun baseKey(k: String) = k.substringBefore('[').substringBefore('.')
 
     private fun element(v: Any): JsonElement = when (v) {
         is JsonElement -> v
@@ -289,6 +320,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
             maskForNew()?.let { mask -> lab.io { it.call(Fn.SELECT_FROM_MASK, buildJsonObject { put("mask", mask) }.toString(), "ui") } }
         }
         val p = params(item, msg.values)
+        val revisionBefore = revision()
         val r = when (item.kind) {
             Kind.AdjustmentLayer -> lab.io { it.call(Fn.EDIT_ADJUST, buildJsonObject { put("kind", item.command); put("params", p) }.toString(), "ui") }
             Kind.Look -> lab.io { it.call(Fn.EDIT_LOOK, buildJsonObject { put("look", item.command); p.forEach { (k, v) -> put(k, v) } }.toString(), "ui") }
@@ -308,8 +340,11 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         } else {
             lastSkipped = null
         }
-        applied = r.isSuccess && !nothing
-        revisionAfter = if (r.isSuccess) revision() else null
+        val after = if (r.isSuccess) revision() else null
+        // Applied only if the run made a step of its own: undoing one that made none would
+        // undo the person's earlier edit.
+        applied = r.isSuccess && !nothing && after != null && after != revisionBefore
+        revisionAfter = if (applied) after else null
         if (r.isSuccess && msg.version >= shownVersion) {
             shownVersion = msg.version
             lab.markInteractive()
@@ -324,8 +359,9 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         }
         applied = false
         revisionAfter = null
+        lastSkipped = null
         begun = null
-        shownVersion = -1L
+        shownVersion = version // monotonic: no frame from before this point can show
         busy = false
         lab.requestRefresh()
     }

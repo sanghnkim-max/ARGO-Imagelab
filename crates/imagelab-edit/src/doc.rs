@@ -62,6 +62,7 @@ pub(crate) fn resolve_open(root: &Path, photo: &str, original: bool) -> ApiResul
 }
 
 fn open(ctx: &Ctx, p: OpenParams) -> ApiResult<Value> {
+    forget_document_caches(ctx);
     let photo = p.photo.or(p.path).ok_or_else(|| ApiError::bad_params("pass `photo` (a library id) or `path`"))?;
     let (file, from_sidecar) = resolve_open(&ctx.shared.root, &photo, p.original)?;
     let photo = paths::relative(&photo)?;
@@ -92,6 +93,7 @@ struct NewParams {
 }
 
 fn new_doc(ctx: &Ctx, p: NewParams) -> ApiResult<Value> {
+    forget_document_caches(ctx);
     if p.width == 0 || p.height == 0 || p.width > MAX_SIDE || p.height > MAX_SIDE {
         return Err(ApiError::bad_params(format!("width and height must be 1..{MAX_SIDE}")));
     }
@@ -307,6 +309,7 @@ struct CloseParams {
 }
 
 fn close(ctx: &Ctx, p: CloseParams) -> ApiResult<Value> {
+    forget_document_caches(ctx);
     mutate(ctx, |h| {
         let i = p.index.or_else(|| h.session.active_index()).ok_or_else(|| ApiError::not_found("no open document"))?;
         let dirty = h.session.documents().get(i).map(|d| d.is_dirty()).ok_or_else(|| ApiError::not_found(format!("no document at index {i}")))?;
@@ -380,16 +383,36 @@ struct OriginalParams {
 
 /// The document as it was at its oldest history state (the photo as opened, unless the
 /// history has dropped its oldest states), rendered into an image handle: before/after.
+/// Per-document caches dropped when a document is opened, created or closed: the looks'
+/// measurements, the preview proxy (session, frame, temp file) and the before/after render.
+/// (The app also calls `segment.forgetImages` for SAM's embeddings.)
+fn forget_document_caches(ctx: &Ctx) {
+    crate::looks::forget_caches();
+    crate::preview::forget(ctx);
+    if let Some(old) = LAST_ORIGINAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+        ctx.shared.handles.free(old);
+    }
+}
+
+/// The last `doc.original` handle, freed by the next call (one at a time, never a pile-up).
+static LAST_ORIGINAL: std::sync::Mutex<Option<imagelab_api::HandleId>> = std::sync::Mutex::new(None);
+
 fn original(ctx: &Ctx, p: OriginalParams) -> ApiResult<Value> {
     let side = p.max_side.unwrap_or(1024).clamp(64, MAX_PREVIEW_SIDE);
     let img = ctx.with_session(|h| {
         let d = h.session.active().ok_or_else(|| ApiError::not_found("no open document"))?;
-        let doc = d.history.state(0);
+        // The automatic snapshot taken at open (id 0) is the photo as opened even after the
+        // history drops old states or is cleared; else the oldest state still held.
+        let snap = d.snapshots.iter().find(|s| s.id == 0).map(|s| s.doc.clone());
+        let doc = snap.or_else(|| d.history.state(0));
         let doc = doc.as_deref().unwrap_or(&d.doc);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| photocraft_compose::thumbnail(doc, side))).map_err(|_| ApiError::internal("rendering the original panicked"))
     })?;
     let (width, height) = (img.width, img.height);
     let handle = ctx.shared.handles.put_image(ImageBuf::new(width, height, img.pixels)?)?;
+    if let Some(old) = LAST_ORIGINAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(handle) {
+        ctx.shared.handles.free(old);
+    }
     Ok(json!({"image": handle.to_string(), "width": width, "height": height}))
 }
 

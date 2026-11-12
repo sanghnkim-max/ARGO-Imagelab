@@ -294,6 +294,14 @@ impl MobileSam {
         g.model.as_ref().map(|m| m.backend.clone())
     }
 
+    /// Drop cached image embeddings (another photo is being edited); the model stays loaded.
+    pub fn forget_images(&self) -> usize {
+        let mut g = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = g.cache.len();
+        g.cache.clear();
+        n
+    }
+
     pub fn unload(&self) -> bool {
         let mut g = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
         let was = g.model.is_some();

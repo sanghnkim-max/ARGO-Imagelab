@@ -19,6 +19,7 @@ import dev.argo.imagelab.core.Fn
 import dev.argo.imagelab.core.Imports
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -112,6 +113,44 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     /** Last stylus pressure on the canvas (0..1): plumbed for the coming retouch brushes. */
     var stylusPressure by mutableFloatStateOf(0f)
 
+    /**
+     * Per-document state (selection mask, SAM prompt, clone source, handles, text spot, paint
+     * layer) belongs to one document at one size: when the document or its size changes (another
+     * photo, a crop or rotate from anywhere — undo, history, the agent), it is dropped.
+     */
+    private var docKey: String? = null
+
+    init {
+        viewModelScope.launch {
+            lab.state.collect { st ->
+                val key = "${st.documents}:${st.path ?: st.name}:${st.width}x${st.height}"
+                if (docKey != null && key != docKey) resetDocumentState()
+                docKey = key
+            }
+        }
+    }
+
+    private fun resetDocumentState() {
+        selection = null
+        samPoints.clear()
+        cloneSource = null
+        cloneOffset = null
+        settingSource = false
+        handles.clear()
+        handleMode = HandleMode.None
+        textAt = null
+        paintLayerMade = false
+        maskEnsuredFor = null
+        before = null
+        beforeFor = null
+        // SAM's cached encodings belong to the previous photo (or size).
+        viewModelScope.launch { lab.fn("segment.forgetImages", "{}", refreshAfter = false) }
+    }
+
+    /** Serialises selection round trips (fromMask → run, run → toMask → deselect), so two quick
+     *  taps or a tap during a masked edit never read or clear each other's document selection. */
+    private val selectionLock = kotlinx.coroutines.sync.Mutex()
+
     /** Any catalog item (filters, effects, light & color, size, layer properties), live. */
     val command = dev.argo.imagelab.ui.menu.LiveCommand(lab, viewModelScope) { selection?.mask }
 
@@ -156,7 +195,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val brush = retouchBrush ?: return
         if (points.isEmpty()) return
         when (brush.use) {
-            BrushUse.Source -> if (settingSource || cloneSource == null || points.size == 1) {
+            BrushUse.Source -> if (settingSource || cloneSource == null) {
                 cloneSource = Offset(points[0].first, points[0].second)
                 cloneOffset = null
                 settingSource = false
@@ -183,10 +222,11 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                     RetouchBrush.Remove -> put("hardness", 50)
                     RetouchBrush.Clone, RetouchBrush.HealFrom -> {
                         put("hardness", 50); put("aligned", true); put("opacity", strength)
-                        val off = cloneOffset
+                        // Aligned: the first stroke fixes the offset (source − first point); every
+                        // later stroke keeps it, even one started before the first returns.
                         val src = cloneSource
+                        val off = cloneOffset ?: src?.let { Offset(it.x - points[0].first, it.y - points[0].second) }?.also { cloneOffset = it }
                         if (off != null) putJsonArray("offset") { add(JsonPrimitive(off.x.roundToInt())); add(JsonPrimitive(off.y.roundToInt())) }
-                        else if (src != null) putJsonArray("source") { add(JsonPrimitive(src.x.roundToInt())); add(JsonPrimitive(src.y.roundToInt())) }
                     }
                     RetouchBrush.Saturate, RetouchBrush.Desaturate -> { put("mode", if (brush == RetouchBrush.Saturate) "saturate" else "desaturate"); put("flow", strength); put("hardness", 0) }
                     RetouchBrush.Soften, RetouchBrush.Crisp, RetouchBrush.Smudge -> { put("strength", strength); put("hardness", 0) }
@@ -196,12 +236,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
         viewModelScope.launch {
             lab.markInteractive()
-            val r = lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", brush.command); put("params", params) }.toString()).getOrNull() as? JsonObject
-            // Aligned cloning: later strokes keep the first stroke's offset to the source.
-            val off = r?.get("offset") as? JsonArray
-            if (brush.use == BrushUse.Source && off != null && off.size == 2) {
-                cloneOffset = Offset((off[0] as JsonPrimitive).content.toFloat(), (off[1] as JsonPrimitive).content.toFloat())
-            }
+            lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", brush.command); put("params", params) }.toString())
         }
     }
 
@@ -225,6 +260,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 """{"offset":[$dx,$dy],"mode":"move"}"""
             }
             val r = editNow(brush.command, params, sel.mask)
+            if (r.isFailure) { editNow("select.deselect", "{}", null); return@launch }
             // The engine moved (or used up) the selection; the mask handle no longer matches it.
             selection = null
             editNow("select.deselect", "{}", null)
@@ -318,7 +354,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { editNow(id, params, if (masked) selection?.mask else mask) }
     }
 
-    private suspend fun editNow(id: String, params: String, mask: String?): Result<JsonElement?> {
+    private suspend fun editNow(id: String, params: String, mask: String?): Result<JsonElement?> = selectionLock.withLock { editUnlocked(id, params, mask) }
+
+    private suspend fun editUnlocked(id: String, params: String, mask: String?): Result<JsonElement?> {
         // A mask becomes the document selection first; PhotoCraft's filters and new adjustment
         // layers then apply to it (the selection becomes the adjustment layer's mask).
         if (mask != null) {
@@ -383,7 +421,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 val resolver = app.contentResolver
                 val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: error("no gallery")
-                resolver.openOutputStream(uri)?.use { out -> File(app.workspace, rel).inputStream().use { it.copyTo(out) } }
+                val out = resolver.openOutputStream(uri) ?: run { resolver.delete(uri, null, null); error("gallery refused the file") }
+                out.use { o -> File(app.workspace, rel).inputStream().use { it.copyTo(o) } }
             }
         }
         lab.showMessage(if (copied.isSuccess) "Exported to Pictures/ImageLab" else "Saved to $rel")
@@ -426,6 +465,22 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun canvasTap(x: Float, y: Float) {
         if (selectMode == SelectMode.Wand || selectMode == SelectMode.Color) return colorTap(x.roundToInt(), y.roundToInt())
         if (selectMode != SelectMode.Object) return
+        // Add / Subtract onto a selection that is not this SAM prompt (a rectangle, the subject,
+        // a wand area): segment the tapped object alone and combine its mask with the selection.
+        if (combine != Combine.New && samPoints.isEmpty() && selection?.mask != null) {
+            val seq = ++tapSeq
+            viewModelScope.launch {
+                selecting = true
+                val params = buildJsonObject {
+                    putJsonArray("points") { add(JsonArray(listOf(JsonPrimitive(x.roundToInt()), JsonPrimitive(y.roundToInt()), JsonPrimitive(1)))) }
+                    if (detail) put("refine", true)
+                }
+                val r = lab.fn(Fn.SEGMENT_POINT, params.toString(), refreshAfter = false).getOrNull()
+                if (seq == tapSeq) combineWith(r, "Object")
+                selecting = false
+            }
+            return
+        }
         val p = Triple(x.roundToInt(), y.roundToInt(), if (combine == Combine.Subtract) 0 else 1)
         when (combine) {
             Combine.New -> { samPoints.clear(); samPoints += p }
@@ -443,10 +498,14 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 putJsonArray("points") { pts.forEach { (px, py, l) -> add(JsonArray(listOf(JsonPrimitive(px), JsonPrimitive(py), JsonPrimitive(l)))) } }
                 if (detail) put("refine", true)
             }
-            lab.fn(Fn.SEGMENT_POINT, params.toString(), refreshAfter = false).onSuccess { result -> setSelection(label + detailNote(result), result) }
+            val seq = ++tapSeq
+            lab.fn(Fn.SEGMENT_POINT, params.toString(), refreshAfter = false).onSuccess { result -> if (seq == tapSeq) setSelection(label + detailNote(result), result) }
             selecting = false
         }
     }
+
+    /** Newest selection tap; an older tap's result arriving late is dropped. */
+    private var tapSeq = 0
 
     /** Canvas drag (document pixels): a box (SAM), rectangle, ellipse or freehand lasso. */
     fun canvasDrag(path: List<androidx.compose.ui.geometry.Offset>) {
@@ -539,11 +598,10 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     /** `select.modify.<op>` (feather, expand, contract, smooth, border) or `select.similar` on the current selection. */
     fun modifySelection(op: String, amount: Float) = viewModelScope.launch {
         val sel = selection ?: return@launch
-        sel.mask?.let { m -> if (lab.fn(Fn.SELECT_FROM_MASK, buildJsonObject { put("mask", m) }.toString(), refreshAfter = false).isFailure) return@launch }
         selecting = true
         val (id, params) = if (op == "similar") "select.similar" to buildJsonObject { put("tolerance", amount.roundToInt()); put("sampleAllLayers", true) }
         else "select.modify.$op" to buildJsonObject { put("radius", amount.roundToInt().coerceAtLeast(1)) }
-        val r = photocraftShape(id, params)
+        val r = photocraftShape(id, params, loadMask = sel.mask)
         val what = mapOf("feather" to "feathered", "expand" to "expanded", "contract" to "contracted", "smooth" to "smoothed", "border" to "border", "similar" to "+ similar")[op] ?: op
         if (r != null) setSelection("${sel.label.substringBefore(" · ")} · $what", r)
         selecting = false
@@ -555,11 +613,13 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     /** Run a PhotoCraft selection command, then read the selection back as a mask handle. The
      *  document selection is dropped again: the handle is the selection from here on (edits
      *  load it back), so a stale document selection never limits a later edit. */
-    private suspend fun photocraftShape(id: String, params: JsonObject): JsonElement? {
-        if (lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", id); put("params", params) }.toString(), refreshAfter = false).isFailure) return null
+    private suspend fun photocraftShape(id: String, params: JsonObject, loadMask: String? = null): JsonElement? = selectionLock.withLock {
+        // [loadMask]: start from this selection (refining it).
+        if (loadMask != null && lab.fn(Fn.SELECT_FROM_MASK, buildJsonObject { put("mask", loadMask) }.toString(), refreshAfter = false).isFailure) return@withLock null
+        if (lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", id); put("params", params) }.toString(), refreshAfter = false).isFailure) return@withLock null
         val mask = lab.fn("select.toMask", "{}", refreshAfter = false).getOrNull()
         lab.fn(Fn.EDIT_RUN, """{"id":"select.deselect","params":{}}""", refreshAfter = false)
-        return mask
+        mask
     }
 
     private suspend fun setSelection(label: String, result: JsonElement?) {
@@ -633,11 +693,13 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     /** Centered crop to [aspect] (w/h); null = keep the document's own proportions. */
     fun cropTo(aspect: Float?) {
-        val s = lab.state.value
-        if (s.width <= 0 || s.height <= 0 || aspect == null) return
-        val docAspect = s.width.toFloat() / s.height
-        val (w, h) = if (docAspect > aspect) (s.height * aspect).roundToInt() to s.height else s.width to (s.width / aspect).roundToInt()
-        edit("image.crop", """{"x":${(s.width - w) / 2},"y":${(s.height - h) / 2},"width":$w,"height":$h,"deleteCroppedPixels":true}""")
+        if (aspect == null) return
+        // The engine centres the crop on the document's current size (never a stale one).
+        val ratio = when {
+            kotlin.math.abs(aspect - 1f) < 0.01f -> "1:1"
+            else -> { val w = (aspect * 1000).roundToInt(); "$w:1000" }
+        }
+        viewModelScope.launch { lab.fn("edit.cropTo", """{"aspect":"$ratio"}""") }
     }
 
     fun straighten(angle: Float) {
@@ -680,9 +742,16 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     private suspend fun ensureMask(): Boolean {
         val st = lab.state.value
         val active = st.layers.firstOrNull { it.id == st.activeLayer }
-        if (active?.hasMask == true) return true
-        return lab.fn(Fn.EDIT_RUN, """{"id":"layer.layerMask.revealAll","params":{}}""", refreshAfter = false).isSuccess
+        // `layers` lags a stroke by up to a second: remember the layer a mask was added to, so a
+        // second quick stroke never adds (and wipes) it again.
+        if (active?.hasMask == true || (active?.id != null && active.id == maskEnsuredFor)) return true
+        maskEnsuredFor = active?.id
+        val ok = lab.fn(Fn.EDIT_RUN, """{"id":"layer.layerMask.revealAll","params":{}}""", refreshAfter = false).isSuccess
+        if (!ok) maskEnsuredFor = null
+        return ok
     }
+
+    private var maskEnsuredFor: Long? = null
 
     /** One stroke in document pixels: [x, y, pressure]. */
     fun paintStroke(points: List<Triple<Float, Float, Float>>) {
@@ -691,8 +760,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             if (paintOnMask) {
                 if (!ensureMask()) return@launch
             } else if (paintOnNewLayer && !eraser && !paintLayerMade && paintMode != PaintMode.Bucket) {
-                lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "layer.new.layer"); put("params", buildJsonObject { put("name", "Paint") }) }.toString(), refreshAfter = false)
-                paintLayerMade = true
+                paintLayerMade = true // before suspending: a second quick stroke must not make another layer
+                val made = lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "layer.new.layer"); put("params", buildJsonObject { put("name", "Paint") }) }.toString(), refreshAfter = false)
+                if (made.isFailure) { paintLayerMade = false; return@launch }
             }
             val color = if (paintOnMask) maskColor() else paintColor
             val (a, b) = points.first() to points.last()
@@ -753,8 +823,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun snapshot(name: String) = viewModelScope.launch {
         val body = buildJsonObject { if (name.isNotBlank()) put("name", name.trim()) }
-        history = lab.fn(Fn.DOC_SNAPSHOT, body.toString(), refreshAfter = false).getOrNull() as? JsonObject ?: history
-        lab.showMessage("Snapshot kept.")
+        val r = lab.fn(Fn.DOC_SNAPSHOT, body.toString(), refreshAfter = false)
+        history = r.getOrNull() as? JsonObject ?: history
+        if (r.isSuccess) lab.showMessage("Snapshot kept.")
     }
 
     fun restoreSnapshot(id: JsonElement) = viewModelScope.launch {
@@ -775,9 +846,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun compare(on: Boolean) {
         comparing = on
         if (!on) return
-        val st = lab.state.value
-        val key = "${st.name}"
+        val key = docKey
         if (before != null && beforeFor == key) return
+        before = null // never show another document's original while this one loads
         viewModelScope.launch {
             val r = lab.fn(Fn.DOC_ORIGINAL, """{"maxSide":${Lab.PREVIEW_SIDE}}""", refreshAfter = false).getOrNull() as? JsonObject ?: return@launch
             val handle = (r["image"] as? JsonPrimitive)?.content ?: return@launch
@@ -816,8 +887,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun applyPerspectiveCrop() {
         if (handles.size != 4) return
         val corners = JsonArray(handles.map { pt(it.second) })
-        edit("image.perspectiveCrop", buildJsonObject { put("corners", corners) }.toString())
-        cancelHandles()
+        viewModelScope.launch {
+            if (editNow("image.perspectiveCrop", buildJsonObject { put("corners", corners) }.toString(), null).isSuccess) cancelHandles()
+        }
     }
 
     /** Straighten what the quad outlines (a building, a page) into a rectangle, keeping the canvas (`edit.perspectiveWarp`). */
@@ -832,8 +904,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
         viewModelScope.launch {
             if (!movable()) return@launch
-            editNow("edit.perspectiveWarp", body.toString(), null)
-            cancelHandles()
+            if (editNow("edit.perspectiveWarp", body.toString(), null).isSuccess) cancelHandles()
         }
     }
 
@@ -845,8 +916,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
         viewModelScope.launch {
             if (!movable()) return@launch
-            editNow("edit.puppetWarp", body.toString(), null)
-            cancelHandles()
+            if (editNow("edit.puppetWarp", body.toString(), null).isSuccess) cancelHandles()
         }
     }
 

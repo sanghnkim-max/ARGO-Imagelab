@@ -75,6 +75,7 @@ fun CommandSheet(groups: List<MenuGroup>, live: LiveCommand, note: String? = nul
 private fun ParamControl(p: Param, live: LiveCommand) {
     when (p) {
         is Slider -> {
+            p.showWhen?.let { (k, want) -> if (live.values[k] != want) return }
             val v = (live.values[p.key] as? Float) ?: p.default
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(p.label, Modifier.width(96.dp), style = MaterialTheme.typography.bodySmall)

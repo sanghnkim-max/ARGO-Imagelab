@@ -90,7 +90,8 @@ private val presets: List<Pair<String, CurveSet>> = listOf(
 
 /** Natural cubic spline through [c], sampled at 0..255 and clamped (how the curve is drawn). */
 fun sample(c: Curve): IntArray {
-    val pts = c.sortedBy { it.first }
+    // Duplicate inputs would divide by zero below.
+    val pts = c.sortedBy { it.first }.distinctBy { it.first }
     val out = IntArray(256)
     if (pts.size < 2) { for (i in 0..255) out[i] = i; return out }
     val n = pts.size

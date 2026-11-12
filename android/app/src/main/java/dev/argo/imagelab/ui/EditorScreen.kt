@@ -58,6 +58,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -296,8 +297,13 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
     var hover by remember { mutableStateOf<Offset?>(null) }
     val padPx = with(LocalDensity.current) { CANVAS_PAD.toPx() }
 
+    // The gesture handler outlives compositions: read the current preview and size through these.
+    val previewNow by rememberUpdatedState(preview)
+    val stateNow by rememberUpdatedState(state)
+
     fun toDocOrClamp(p: Offset, clamp: Boolean): Offset? {
-        val bmp = preview ?: return null
+        val state = stateNow
+        val bmp = previewNow ?: return null
         val c = Offset(box.width / 2f, box.height / 2f)
         val u = c + (p - c - vm.offset) / vm.scale
         val fit = minOf((box.width - 2 * padPx) / bmp.width, (box.height - 2 * padPx) / bmp.height)
@@ -316,7 +322,8 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
 
     /** Document px → screen (the inverse of [toDocOrClamp]). */
     fun toScreen(d: Offset): Offset? {
-        val bmp = preview ?: return null
+        val state = stateNow
+        val bmp = previewNow ?: return null
         val c = Offset(box.width / 2f, box.height / 2f)
         val fit = minOf((box.width - 2 * padPx) / bmp.width, (box.height - 2 * padPx) / bmp.height)
         val dw = bmp.width * fit
@@ -413,7 +420,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                         if (retouchMode) vm.retouchStroke(pts) else vm.paintStroke(pts)
                         stroke = emptyList()
                     }
-                    if (textMode && !multi) toDoc(start)?.let { vm.textAt = it }
+                    if (textMode && !multi && !dragged) toDoc(start)?.let { vm.textAt = it }
                     if (sampleMode && !multi && !dragged) toDoc(start)?.let { vm.sampleAt(it.x, it.y) }
                     if (selectMode && !multi) {
                         if (dragged) {
@@ -454,7 +461,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
             // Straightening rotates the frame inside the photo's own rectangle (clipped), so the
             // drag shows exactly what the crop will keep.
             Box(transform.graphicsLayer { clip = vm.straightener.active; shape = FitRect(preview.width, preview.height) }) {
-                val shown = if (vm.comparing) vm.before ?: preview else preview
+                val shown = if (vm.comparing) vm.before ?: preview else preview // until the original loads, the edit stays
                 Image(
                     bitmap = shown.asImageBitmap(),
                     contentDescription = "Document preview",
@@ -550,7 +557,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                 }
             }
         }
-        if (vm.comparing) Text("Before", color = Color.White, modifier = Modifier.align(Alignment.TopStart).padding(12.dp).background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 4.dp))
+        if (vm.comparing && vm.before != null) Text("Before", color = Color.White, modifier = Modifier.align(Alignment.TopStart).padding(12.dp).background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 4.dp))
         if (vm.selecting) CircularProgressIndicator(Modifier.align(Alignment.TopCenter).padding(12.dp).size(24.dp), strokeWidth = 2.dp)
     }
 }

@@ -301,6 +301,10 @@ Reference: a mobile layered editor — full-bleed canvas, chrome at the edges, o
   with `layer.setAdjustment` (one "Modify Adjustment" step).
 * **Export**: format (JPEG, PNG, WebP, TIFF), quality, longest side (`doc.export`), copied to
   Pictures/ImageLab.
+* **Per-document state**: opening, creating or closing a document drops the looks' measurements,
+  the preview proxy (session, frame, temp file) and the before/after render (`doc.*`); the app
+  also clears its selection, SAM prompt, clone source, handles and paint layer, and calls
+  `segment.forgetImages` (SAM embeddings), whenever the document's file or size changes.
 
 #### Looks (`edit.look`) and face liquify (`edit.faceLiquify`)
 

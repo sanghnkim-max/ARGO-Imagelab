@@ -23,6 +23,8 @@ data class Slider(
     val integer: Boolean = true,
     /** Multiplies the shown value before sending (e.g. 0.01 for a % shown, 0..1 sent). */
     val sendScale: Float = 1f,
+    /** Shown only while the value of key `first` is `second` (one set of sliders per choice). */
+    val showWhen: Pair<String, String>? = null,
 ) : Param
 
 /** A choice among PhotoCraft's values: (value, label). */
@@ -92,6 +94,8 @@ private fun look(label: String, id: String, default: Float, min: Float = 0f, ext
 private fun template(label: String, id: String) =
     MenuItem(label, "template", Kind.Look, listOf(Slider("amount", "Strength", 0f, 100f, 80f)), fixed = mapOf("style" to id))
 
+private val selectiveRanges = listOf("reds" to "Reds", "yellows" to "Yellows", "greens" to "Greens", "cyans" to "Cyans", "blues" to "Blues", "magentas" to "Magentas", "whites" to "Whites", "neutrals" to "Neutrals", "blacks" to "Blacks")
+
 private val bands = listOf("Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta")
 
 /** Eight HSL band sliders for one of Camera Raw's `hslHue` / `hslSat` / `hslLum` arrays. */
@@ -122,7 +126,9 @@ object Catalog {
     fun editorFor(layer: Long, adjustment: kotlinx.serialization.json.JsonObject): MenuItem? {
         val kind = (adjustment["kind"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return null
         val params = adjustment["params"] as? kotlinx.serialization.json.JsonObject ?: kotlinx.serialization.json.JsonObject(emptyMap())
-        val item = (adjustmentLayers.items + light.items).firstOrNull { it.kind == Kind.AdjustmentLayer && it.command == kind } ?: return null
+        val found = (adjustmentLayers.items + light.items).firstOrNull { it.kind == Kind.AdjustmentLayer && it.command == kind } ?: return null
+        // Strength is the layer's opacity, not an adjustment setting: Layers › Opacity changes it.
+        val item = found.copy(params = found.params.filter { it.key != "opacity" })
         val initial = mutableMapOf<String, Any>()
         item.params.forEach { p -> initialValue(p, params)?.let { initial[p.key] = it } }
         return item.copy(label = "Edit ${item.label}", kind = Kind.AdjustmentEdit, fixed = item.fixed + ("layer" to layer), initial = initial)
@@ -141,10 +147,10 @@ object Catalog {
         if (p is CurveParam) {
             fun curve(ch: String): Curve? = (params[ch] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { pt ->
                 val a = pt as? kotlinx.serialization.json.JsonArray ?: return@mapNotNull null
-                val i = (a.getOrNull(0) as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.toInt() ?: return@mapNotNull null
-                val o = (a.getOrNull(1) as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.toInt() ?: return@mapNotNull null
+                val i = (a.getOrNull(0) as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.let { kotlin.math.round(it).toInt().coerceIn(0, 255) } ?: return@mapNotNull null
+                val o = (a.getOrNull(1) as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.let { kotlin.math.round(it).toInt().coerceIn(0, 255) } ?: return@mapNotNull null
                 i to o
-            }?.takeIf { it.size >= 2 }
+            }?.sortedBy { it.first }?.distinctBy { it.first }?.takeIf { it.size >= 2 }
             return CurveSet(CurveSet.CHANNELS.associate { (ch, _) -> ch to (curve(ch) ?: LINEAR) })
         }
         val v = lookup(params, p.key) ?: return null
@@ -154,11 +160,23 @@ object Catalog {
             is Toggle -> prim?.content?.toBooleanStrictOrNull()
             is ColorParam -> prim?.content
             is Choice -> {
-                val s = if (prim != null && prim.isString) prim.content else "json:$v"
-                p.options.firstOrNull { (value, _) -> value == s || (value.startsWith("json:") && value.removePrefix("json:").replace(" ", "") == v.toString().replace(" ", "")) }?.first
+                val s = if (prim != null && prim.isString) prim.content else null
+                p.options.firstOrNull { (value, _) ->
+                    value == s || (value.startsWith("json:") && runCatching { jsonEq(kotlinx.serialization.json.Json.parseToJsonElement(value.removePrefix("json:")), v) }.getOrDefault(false))
+                }?.first
             }
             is CurveParam -> null
         }
+    }
+
+    /** JSON equal up to number formatting (0 vs 0.0, f32 rounding) and hex case. */
+    private fun jsonEq(a: kotlinx.serialization.json.JsonElement, b: kotlinx.serialization.json.JsonElement): Boolean = when {
+        a is kotlinx.serialization.json.JsonArray && b is kotlinx.serialization.json.JsonArray -> a.size == b.size && a.indices.all { jsonEq(a[it], b[it]) }
+        a is kotlinx.serialization.json.JsonPrimitive && b is kotlinx.serialization.json.JsonPrimitive -> {
+            val x = a.content.toDoubleOrNull(); val y = b.content.toDoubleOrNull()
+            if (x != null && y != null) kotlin.math.abs(x - y) < 1e-3 else a.content.equals(b.content, ignoreCase = true)
+        }
+        else -> a == b
     }
 
     /** Warp the active layer to a shape (`edit.transform.warp`); on a text layer it is Warp Text. */
@@ -419,14 +437,11 @@ object Catalog {
             ),
             MenuItem(
                 "Selective color", "selectiveColor", Kind.AdjustmentLayer,
-                listOf(
-                    Choice("colors", "Colors", listOf("reds" to "Reds", "yellows" to "Yellows", "greens" to "Greens", "cyans" to "Cyans", "blues" to "Blues", "magentas" to "Magentas", "whites" to "Whites", "neutrals" to "Neutrals", "blacks" to "Blacks"), "reds"),
-                    Slider("cyan", "Cyan", -100f, 100f, 0f),
-                    Slider("magenta", "Magenta", -100f, 100f, 0f),
-                    Slider("yellow", "Yellow", -100f, 100f, 0f),
-                    Slider("black", "Black", -100f, 100f, 0f),
+                // One set of CMYK sliders per range (`reds: [c, m, y, k]` …): switching ranges
+                // keeps what the others were set to.
+                listOf<Param>(Choice("_colors", "Colors", selectiveRanges, "reds")) +
+                    selectiveRanges.flatMap { (r, _) -> listOf("Cyan", "Magenta", "Yellow", "Black").mapIndexed { i, l -> Slider("$r[$i]", l, -100f, 100f, 0f, showWhen = "_colors" to r) } } +
                     Choice("method", "Method", listOf("relative" to "Relative", "absolute" to "Absolute"), "relative"),
-                ),
             ),
             MenuItem(
                 "Channel mixer", "channelMixer", Kind.AdjustmentLayer,

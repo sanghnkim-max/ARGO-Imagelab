@@ -2799,6 +2799,7 @@ name = "imagelab-edit"
 version = "0.1.0"
 dependencies = [
  "imagelab-api",
+ "photocraft-algo",
  "photocraft-automation",
  "photocraft-codecs",
  "photocraft-compose",

@@ -83,13 +83,13 @@ pub fn active_revision(h: &Headless) -> Option<(usize, u64)> {
     h.session.documents().get(i).map(|d| (i, d.revision))
 }
 
-fn history_mark(h: &Headless) -> (usize, u64) {
+pub(crate) fn history_mark(h: &Headless) -> (usize, u64) {
     h.session.active().map_or((0, 0), |d| (d.history.entries().len(), d.revision))
 }
 
 /// How many history steps a change from `before` to now made (at least one when the revision
 /// moved, so a history at its undo limit still counts).
-fn steps_since(h: &Headless, before: (usize, u64)) -> usize {
+pub(crate) fn steps_since(h: &Headless, before: (usize, u64)) -> usize {
     let after = history_mark(h);
     let grown = after.0.saturating_sub(before.0);
     if grown > 0 {

@@ -170,6 +170,14 @@ impl Sam {
         self.run(root, input, |m, enc| Ok(m.segment_subject(enc, None, 0.5)?.map(|p| Pred { logits: p.logits, side: MASK_SIDE, score: p.score })))
     }
 
+    /// Drop cached image embeddings (another photo is being edited); the model stays loaded.
+    pub fn forget_images(&self) -> usize {
+        let mut g = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = g.cache.len();
+        g.cache.clear();
+        n
+    }
+
     pub fn unload(&self) -> bool {
         let mut g = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
         g.cache.clear();

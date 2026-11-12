@@ -222,12 +222,19 @@ type Key = (String, u64);
 static STATS: Mutex<Option<(Key, Stats)>> = Mutex::new(None);
 static SCENE: Mutex<Option<(Key, Scene)>> = Mutex::new(None);
 
+/// Forget the measured stats and scene (a document was opened, created or closed: history row
+/// ids restart per open document, so a reopened sidecar could otherwise match a stale entry).
+pub fn forget_caches() {
+    *STATS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *SCENE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 fn key(h: &Headless) -> ApiResult<Key> {
     let d = h.session.active().ok_or_else(|| ApiError::not_found("no open document; doc.open a photo first"))?;
     // The current history state's id: unlike the revision, it is the same again after a
     // preview is undone, so a slider that re-runs a look measures the photo once.
     let state = d.history.row_id(d.history.past_len()).unwrap_or(d.revision);
-    Ok((format!("{:?}", d.doc.id), state))
+    Ok((format!("{:?}:{}x{}", d.doc.id, d.doc.size.width, d.doc.size.height), state))
 }
 
 fn cached<T: Clone>(cell: &Mutex<Option<(Key, T)>>, k: &Key) -> Option<T> {
@@ -256,7 +263,9 @@ fn stats(h: &Headless) -> ApiResult<Stats> {
     Ok(s)
 }
 
-/// Faces and the sky's share. Select Sky is measured and undone (selection and history as before).
+/// Faces and the sky's share, measured without touching the document: the sky with PhotoCraft's
+/// Select Sky model run on a small render (running `select.sky` and undoing it would clear the
+/// redo states and could evict the oldest undo state).
 fn scene(h: &mut Headless) -> ApiResult<Scene> {
     let k = key(h)?;
     if let Some(s) = cached(&SCENE, &k) {
@@ -280,19 +289,26 @@ fn scene(h: &mut Headless) -> ApiResult<Scene> {
             out.faces.push(Face { rect: [r[0], r[1], r[2], r[3]], eyes, nose: point("nose"), mouth });
         }
     }
-    let before = ops::active_revision(h);
-    let len = h.session.active().map_or(0, |d| d.history.entries().len());
-    if let Ok(v) = h.command_run("select.sky", json!({})) {
-        if v.get("selected").and_then(Value::as_bool) == Some(true) {
-            out.sky = v.get("coverage").and_then(Value::as_f64).unwrap_or(0.0);
-        }
-        if ops::active_revision(h) != before {
-            let grown = h.session.active().map_or(0, |d| d.history.entries().len()).saturating_sub(len).max(1);
-            ops::undo_n(h, grown)?;
-        }
-    }
+    out.sky = sky_coverage(h).unwrap_or(0.0);
     store(&SCENE, k, out.clone());
     Ok(out)
+}
+
+/// The sky's share of the canvas (0..1), from PhotoCraft's sky model on a ≤ 160 kpx render at
+/// Select Sky's default threshold; None without a plausible sky.
+fn sky_coverage(h: &Headless) -> Option<f64> {
+    let d = h.session.active()?;
+    let (w, hh) = (d.doc.size.width, d.doc.size.height);
+    if w < 4 || hh < 4 {
+        return None;
+    }
+    let scale = (photocraft_algo::segment::sky::WORK_PX as f64 / (f64::from(w) * f64::from(hh))).sqrt().min(1.0);
+    let (pw, ph) = (((f64::from(w) * scale).round() as u32).max(2), ((f64::from(hh) * scale).round() as u32).max(2));
+    let px = photocraft_compose::render_reduced_rect(&d.doc, photocraft_geom::Rect::from_xywh(0, 0, w, hh), pw, ph).to_rgba8().pixels;
+    let rgba: Vec<[f32; 4]> = px.as_chunks::<4>().0.iter().map(|p| p.map(|c| f32::from(c) / 255.0)).collect();
+    let img = photocraft_algo::segment::RgbImage::from_rgba(&rgba, pw as usize, ph as usize);
+    let mask = photocraft_algo::segment::sky::sky_mask_low(&img, 50.0)?;
+    Some(mask.iter().filter(|m| **m).count() as f64 / mask.len().max(1) as f64)
 }
 
 /// Faces in the active document (cached per revision).
@@ -682,7 +698,7 @@ fn run_grouped(h: &mut Headless, name: &str, steps: &[Step]) -> ApiResult<Value>
         action = format!("{name} {n}");
         n += 1;
     }
-    let before = ops::active_revision(h);
+    let before = ops::history_mark(h);
     h.command_run("actions.record", json!({"name": action}))?;
     let played = (|| -> ApiResult<Value> {
         h.command_run("actions.stop", json!({}))?;
@@ -694,9 +710,11 @@ fn run_grouped(h: &mut Headless, name: &str, steps: &[Step]) -> ApiResult<Value>
     let _ = h.command_run("actions.delete", json!({"action": action}));
     let v = played?;
     if let Some(f) = v.get("failed") {
-        // Playback keeps the steps before the failure as one history step: take it back.
-        if ops::active_revision(h) != before {
-            ops::undo_n(h, 1)?;
+        // Playback keeps the steps before the failure (one grouped step, or several when the
+        // engine does not group actions): take them all back.
+        let n = ops::steps_since(h, before);
+        if n > 0 {
+            ops::undo_n(h, n)?;
         }
         let msg = f.get("error").and_then(Value::as_str).unwrap_or("a step failed");
         let id = f.get("id").and_then(Value::as_str).unwrap_or("?");

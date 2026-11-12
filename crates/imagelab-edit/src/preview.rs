@@ -53,11 +53,28 @@ struct Proxy {
     base: usize,
     /// The handle of the last preview, freed when the next one lands.
     last: Option<HandleId>,
+    /// The document the proxy was made from (`doc.id` and open index); another one re-snapshots.
+    source: String,
+}
+
+fn source_of(ctx: &Ctx) -> String {
+    ctx.with_session(|h| Ok(h.session.active().map(|d| format!("{:?}:{:?}", d.doc.id, h.session.active_index())).unwrap_or_default())).unwrap_or_default()
 }
 
 static PROXY: Mutex<Option<Proxy>> = Mutex::new(None);
 
 const DEFAULT_SIDE: u32 = 1024;
+const PROXY_FILE: &str = ".imagelab/tmp/preview-proxy.png";
+
+/// Drop the proxy (its session, its last frame's handle and the temp file): another document
+/// is being edited, and the proxy's memory should not linger.
+pub fn forget(ctx: &Ctx) {
+    let old = PROXY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(h) = old.and_then(|p| p.last) {
+        ctx.shared.handles.free(h);
+    }
+    let _ = std::fs::remove_file(ctx.shared.root.join(PROXY_FILE));
+}
 
 fn history_len(h: &Headless) -> usize {
     h.session.active().map_or(0, |d| d.history.entries().len())
@@ -72,8 +89,7 @@ fn snapshot(ctx: &Ctx, side: u32) -> ApiResult<Proxy> {
     let image = Image::from_u8(img.width, img.height, ChannelLayout::Rgba, img.pixels).map_err(|e| ApiError::internal(format!("proxy image: {e}")))?;
     let png = photocraft_codecs::encode(&image, Format::Png, &EncodeOptions::default()).map_err(|e| ApiError::internal(format!("proxy encode: {e}")))?;
     let root = &ctx.shared.root;
-    let rel = ".imagelab/tmp/preview-proxy.png";
-    let path = root.join(rel);
+    let path = root.join(PROXY_FILE);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ApiError::internal(format!("proxy dir: {e}")))?;
     }
@@ -81,8 +97,10 @@ fn snapshot(ctx: &Ctx, side: u32) -> ApiResult<Proxy> {
     let ws = AuthorizedWorkspace::new(Some(root), Some(root))?;
     let mut session = Headless::with_workspace(ws);
     session.open(&path)?;
+    // The pixels are in the session now; the file is not needed.
+    let _ = std::fs::remove_file(&path);
     let base = history_len(&session);
-    Ok(Proxy { session, base, last: None })
+    Ok(Proxy { session, base, last: None, source: source_of(ctx) })
 }
 
 fn run_step(h: &mut Headless, step: &PreviewStep) -> ApiResult<Value> {
@@ -108,7 +126,8 @@ pub fn preview(ctx: &Ctx, p: PreviewParams) -> ApiResult<Value> {
     let t = Instant::now();
     let side = p.max_side.unwrap_or(DEFAULT_SIDE).clamp(256, 2048);
     let mut guard = PROXY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if p.begin || guard.is_none() {
+    let stale = guard.as_ref().is_some_and(|pr| pr.source != source_of(ctx));
+    if p.begin || stale || guard.is_none() {
         if let Some(old) = guard.take().and_then(|o| o.last) {
             ctx.shared.handles.free(old);
         }
@@ -121,10 +140,20 @@ pub fn preview(ctx: &Ctx, p: PreviewParams) -> ApiResult<Value> {
     if extra > 0 {
         ops::undo_n(h, extra)?;
     }
+    let docs = h.session.documents().len();
     let result = match &p.step {
         Some(step) => Some(run_step(h, step)?),
         None => None,
     };
+    // A step that opened another document (image.duplicate …) must not pile documents up in
+    // the proxy session: close the extras and come back to the proxy.
+    while h.session.documents().len() > docs {
+        let last = h.session.documents().len() - 1;
+        let _ = h.close(Some(last));
+    }
+    if h.session.active_index() != Some(0) {
+        let _ = h.select(0);
+    }
     let d = h.session.active().ok_or_else(|| ApiError::internal("the proxy document is gone"))?;
     let img = photocraft_compose::thumbnail(&d.doc, side);
     let (w, hh) = (img.width, img.height);
