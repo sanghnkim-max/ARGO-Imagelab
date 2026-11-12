@@ -243,16 +243,19 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     var selectMode by mutableStateOf(SelectMode.Object)
     var combine by mutableStateOf(Combine.New)
 
-    /** SAM's detail pass: re-segment a full-resolution crop around the object (sharper edges on
-     *  large photos, ~0.2 s more on a phone GPU). */
-    var detail by mutableStateOf(false)
+    /** SAM's detail pass (on by default): re-segment a full-resolution crop around the object
+     *  (sharper edges on large photos, ~0.2 s more on a phone GPU). */
+    var detail by mutableStateOf(true)
 
     /** " · detail ×3.2" when the detail pass ran, else "". */
     private fun detailNote(result: JsonElement?): String {
         val d = (result as? JsonObject)?.get("detail") as? JsonObject ?: return ""
         val refined = (d["refined"] as? JsonPrimitive)?.booleanOrNull == true
         if (!refined) {
-            (d["reason"] as? JsonPrimitive)?.contentOrNull?.let { lab.showMessage("Fine detail skipped: $it") }
+            // On by default, so a skip for a large object (nothing to gain) stays quiet; say so
+            // only when the detailed look disagreed or failed.
+            val gainOnly = d["detail"] != null && d["agreement"] == null
+            if (!gainOnly) (d["reason"] as? JsonPrimitive)?.contentOrNull?.let { lab.showMessage("Fine detail kept the first mask: $it") }
             return ""
         }
         val gain = (d["detail"] as? JsonPrimitive)?.doubleOrNull ?: return " · detail"
