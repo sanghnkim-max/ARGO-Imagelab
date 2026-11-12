@@ -62,7 +62,7 @@ const INSTRUCTIONS: &str = "ImageLab: a photo editor on the person's phone (Phot
 const PROGRAM_RULES: &str = "The program is the body of an async JavaScript function: use `await`, and `return` the result (JSON). \
 Call functions as `await lab.<area>.<fn>({...params})`; `lab.help('<area>')` returns that area's functions with descriptions and parameter schemas, `lab.help()` lists every area. \
 Images and masks are handles (\"img:N\", \"mask:N\"), never bytes; any object `{image: \"img:N\"}` in the returned value comes back to you as an image. \
-Handles made during the program are freed when it ends unless the result mentions them or you call `lab.keep(handle)`. \
+Handles made during the program are freed when it ends unless the result mentions them (other than as a shown `{image}`, which is encoded and then freed) or you call `lab.keep(handle)`. \
 console.log is captured. A failed call throws LabCallError {code, message}; catch it to branch on `code`. No fetch, timers or file system.";
 
 /// ImageLab's MCP server. Cheap to clone (one per HTTP session).
@@ -310,7 +310,12 @@ async fn read_line(reader: &mut BufReader<ReadHalf<DuplexStream>>) -> Result<Str
 pub struct HttpServer {
     port: u16,
     cancel: CancellationToken,
+    /// Signalled when the serve task has ended and the listener is closed.
+    done: std::sync::mpsc::Receiver<()>,
 }
+
+/// How long [`HttpServer::stop`] waits for the listener to close (so the port can be bound again).
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
 impl HttpServer {
     pub async fn start(photocraft: PhotocraftMcp, lab: LabMcp, port: u16, token: String, allow_edits: bool) -> Result<Self> {
@@ -341,18 +346,23 @@ impl HttpServer {
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
         let port = listener.local_addr()?.port();
         let shutdown = cancel.clone();
+        let (done_tx, done) = std::sync::mpsc::channel();
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).with_graceful_shutdown(shutdown.cancelled_owned()).await;
+            let _ = done_tx.send(());
         });
-        Ok(Self { port, cancel })
+        Ok(Self { port, cancel, done })
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
 
+    /// Stop serving and wait (bounded) until the listener is closed, so a restart on the same
+    /// port can bind it. Must not be called from inside the runtime's own worker threads.
     pub fn stop(self) {
         self.cancel.cancel();
+        let _ = self.done.recv_timeout(STOP_WAIT);
     }
 }
 

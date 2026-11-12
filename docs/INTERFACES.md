@@ -76,8 +76,10 @@ return { picked: best.slice(0, 10), sheet: await lab.analyze.contactSheet({ phot
 ```js
 // Targeted edit: blur the background of the open photo
 const subject = await lab.segment.subject({});                     // SAM 3, cached embedding
-const bg = await lab.cv.invertMask({ mask: subject.mask });
-await lab.edit.run({ id: "filter.blur.gaussianBlur", params: { radius: 12 }, mask: bg });
+const bg = await lab.cv.invertMask({ mask: subject.mask });        // {mask: "mask:N", coverage, …}
+await lab.select.fromMask({ mask: bg.mask, feather: 2 });          // the background is the selection
+await lab.edit.run({ id: "filter.blur.gaussianBlur", params: { radius: 12 } });  // applies inside it
+await lab.select.none({});
 return await lab.doc.preview({ maxSide: 768 });
 ```
 
@@ -100,9 +102,12 @@ effects declared in code, not by words.
   fits). Originals are never modified; edits live in a `.pcraft` sidecar (`edits/<id>.pcraft`).
 * **Handles** — images and masks inside a run or session live in a handle arena
   (`img:12`, `mask:3`), never as bytes in JS. `ImageBuf` = 8-bit RGBA (16-bit later);
-  `MaskBuf` = 8-bit coverage. Handles from a run are freed when it ends unless `keep`.
-* **Document** — the PhotoCraft session's documents (layers, history). `edit.*` with `mask`
-  turns the mask into the layer mask of an adjustment layer (non-destructive by default).
+  `MaskBuf` = 8-bit coverage. Handles from a run are freed when it ends unless the result names
+  them or the program keeps them (`lab.keep`); an image the result only shows is freed once
+  encoded.
+* **Document** — the PhotoCraft session's documents (layers, history). To edit part of a photo,
+  load a mask as the selection (`select.fromMask`); `edit.*` calls then apply inside it, and a
+  new adjustment layer takes it as its layer mask. `select.none` ends it.
 * **Recipe** — a list of `{fn, params}` steps (or a JS program) stored in `recipes/`; replayable.
 
 ## 5. Events: push, not poll

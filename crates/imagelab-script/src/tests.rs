@@ -163,9 +163,20 @@ fn images_are_extracted_and_handles_freed() {
     assert_eq!(o.value["preview"], json!({"image": "img:1", "note": "x", "attached": 0}));
     assert_eq!(o.value["again"]["attached"], json!(0));
     assert_eq!(o.value["mask"]["attached"], json!(1));
-    // img:2 (unreferenced) is freed; img:1, mask:3 (in the result) and img:4 (kept) live.
+    // img:2 (unreferenced) is freed; img:1 and mask:3 were only shown, so they are freed once
+    // encoded; img:4 (kept) lives.
     let live: HashSet<String> = ctx.shared.handles.ids().iter().map(ToString::to_string).collect();
-    assert_eq!(live, ["img:1", "mask:3", "img:4"].iter().map(|s| s.to_string()).collect());
+    assert_eq!(live, ["img:4"].iter().map(|s| s.to_string()).collect());
+}
+
+#[test]
+fn a_shown_image_also_named_elsewhere_survives() {
+    let ctx = Ctx::new(shared(), Source::Agent);
+    let o = ScriptRuntime::run(&registry(), &ctx, "const a = await lab.img.make(); return {view: {image: a.img}, handle: a.img};", Budget::default());
+    assert_eq!(o.error, None, "{o:?}");
+    assert_eq!(o.images.len(), 1);
+    let live: HashSet<String> = ctx.shared.handles.ids().iter().map(ToString::to_string).collect();
+    assert_eq!(live, ["img:1"].iter().map(|s| s.to_string()).collect());
 }
 
 #[test]
@@ -183,4 +194,45 @@ fn handles_from_before_the_run_survive() {
 fn oversized_code_is_refused() {
     let o = run(&"x".repeat(MAX_CODE_BYTES + 1));
     assert_eq!(o.error.unwrap().code, "too_large");
+}
+
+#[test]
+fn cv_free_in_a_program_only_frees_its_own_handles() {
+    let ctx = Ctx::new(shared(), Source::Agent);
+    let old = ctx.shared.handles.put_image(ImageBuf::new(2, 2, vec![0; 16]).unwrap()).unwrap();
+    let mut r = registry();
+    r.area("cv", "test cv");
+    r.function("cv", "free", "free handles")
+        .handler(|ctx, p| {
+            let mut freed = Vec::new();
+            for h in p["handles"].as_array().cloned().unwrap_or_default() {
+                if let Some(id) = h.as_str().and_then(HandleId::parse) {
+                    ctx.shared.handles.free(id);
+                    freed.push(h);
+                }
+            }
+            Ok(json!({"freed": freed}))
+        })
+        .register();
+    let code = format!("const a = await lab.img.make(); return await lab.cv.free({{handles: [a.img, '{old}']}});");
+    let o = ScriptRuntime::run(&r, &ctx, &code, Budget::default());
+    assert_eq!(o.error, None, "{o:?}");
+    assert_eq!(o.value["freed"].as_array().map(Vec::len), Some(1), "{o:?}");
+    assert!(ctx.shared.handles.ids().contains(&old), "a handle from before the run is not the program's to free");
+}
+
+#[test]
+fn calls_past_the_budget_are_refused_at_once() {
+    let ctx = Ctx::new(shared(), Source::Agent);
+    let mut r = registry();
+    r.function("math", "slow", "sleeps 100 ms").handler(|_, _| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        Ok(json!(1))
+    }).register();
+    let started = std::time::Instant::now();
+    let budget = Budget { wall: std::time::Duration::from_millis(250), ..Budget::default() };
+    let o = ScriptRuntime::run(&r, &ctx, "for (let i = 0; i < 50; i++) await lab.math.slow(); return 'done';", budget);
+    assert!(started.elapsed() < std::time::Duration::from_millis(1500), "took {:?}", started.elapsed());
+    let e = o.error.expect("timed out");
+    assert!(e.code == "timeout" || e.code == "cancelled", "{e:?}");
 }

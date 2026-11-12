@@ -32,7 +32,9 @@
 //! index there) added. The same handle twice is attached once.
 //!
 //! Handles a run creates are freed when it ends, unless the result mentions them (any string
-//! equal to the handle, anywhere in the returned value) or the program called `lab.keep`.
+//! equal to the handle, anywhere in the returned value) or the program called `lab.keep`. A
+//! handle the result only shows as `{image: h}` is freed once encoded (the PNG is the result).
+//! Inside a program, `cv.free` frees only handles its own run made.
 //! "Created by the run" = a handle that appears in some `lab.*` call result of this run and
 //! did not exist when the run started. Concurrent runs therefore never free each other's
 //! handles, and handles that existed before the run are never freed by it.
@@ -62,6 +64,8 @@ pub const MAX_WALL: Duration = Duration::from_secs(30 * 60);
 /// After the wall budget, how long the host waits for a realm that does not stop on its own
 /// (a registry call that ignores cancellation) before it reports a timeout without it.
 const STOP_GRACE: Duration = Duration::from_secs(10);
+/// How often the host loop wakes to relay the caller's cancel flag to the run.
+const TICK: Duration = Duration::from_millis(50);
 
 /// Limits for one run.
 #[derive(Debug, Clone)]
@@ -152,7 +156,7 @@ pub struct ScriptOutcome {
 }
 
 impl ScriptOutcome {
-    fn failed(error: ScriptError) -> Self {
+    pub fn failed(error: ScriptError) -> Self {
         Self { value: Value::Null, logs: Vec::new(), images: Vec::new(), error: Some(error), calls: 0, elapsed: Duration::ZERO }
     }
 
@@ -194,6 +198,14 @@ impl ScriptRuntime {
         budget.wall = if budget.wall.is_zero() { Budget::default().wall } else { budget.wall.min(MAX_WALL) };
         let handles = ctx.shared.handles.clone();
         let before: HashSet<HandleId> = handles.ids().into_iter().collect();
+        // This run's own cancel flag: set when the caller cancels (its flag may be shared with
+        // other runs, so it is only read) or when the wall budget runs out, so a long registry
+        // call in progress (`analyze.quality`, a batch) stops at its next check too.
+        let caller_cancel = ctx.cancel.clone();
+        let run_cancel = Arc::new(AtomicBool::new(false));
+        let mut run_ctx = ctx.clone();
+        run_ctx.cancel = run_cancel.clone();
+        let ctx = &run_ctx;
 
         let mut spec: Vec<(String, Vec<String>)> = Vec::new();
         for area in registry.areas() {
@@ -229,9 +241,21 @@ impl ScriptRuntime {
                 abandoned = true;
                 break;
             };
-            match rx.recv_timeout(wait) {
+            // Wake at least every TICK to relay the caller's cancel to this run.
+            match rx.recv_timeout(wait.min(TICK)) {
                 Ok(realm::ToHost::Call { id, args, reply }) => {
-                    let answer = Self::dispatch(registry, ctx, &id, &args, &before, &mut created);
+                    // Past the budget (or cancelled): refuse further calls at once instead of
+                    // dispatching them; the realm stops at its next interrupt check.
+                    let answer = if Instant::now() >= deadline {
+                        stop.store(true, Ordering::Relaxed);
+                        run_cancel.store(true, Ordering::Relaxed);
+                        reply_err("timeout", &format!("the program ran past its {} ms budget", budget.wall.as_millis()))
+                    } else if caller_cancel.load(Ordering::Relaxed) {
+                        run_cancel.store(true, Ordering::Relaxed);
+                        reply_err("cancelled", "the program was cancelled")
+                    } else {
+                        Self::dispatch(registry, ctx, &id, &args, &before, &mut created)
+                    };
                     let _ = reply.send(answer);
                 }
                 Ok(realm::ToHost::Keep(handle)) => {
@@ -239,7 +263,15 @@ impl ScriptRuntime {
                         kept.insert(id);
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => stop.store(true, Ordering::Relaxed),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if caller_cancel.load(Ordering::Relaxed) {
+                        run_cancel.store(true, Ordering::Relaxed);
+                    }
+                    if Instant::now() >= deadline {
+                        stop.store(true, Ordering::Relaxed);
+                        run_cancel.store(true, Ordering::Relaxed);
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -263,6 +295,10 @@ impl ScriptRuntime {
         };
         free_unreferenced(ctx, &created, &kept, &value);
         let images = if error.is_none() { attach_images(ctx, &mut value, &budget) } else { Vec::new() };
+        // An image the result only shows (`{image: h}`) is encoded now and needs no handle
+        // afterwards: free it unless kept or mentioned elsewhere in the value. Otherwise every
+        // "look" call would leave its preview in the arena until it filled.
+        free_shown_images(ctx, &created, &kept, &value, &images);
         ScriptOutcome { value, logs: done.logs, images, error, calls: done.calls, elapsed: Duration::ZERO }
     }
 
@@ -272,6 +308,10 @@ impl ScriptRuntime {
             Ok(v) => v,
             Err(e) => return reply(Err(ApiError::bad_params(format!("arguments are not JSON: {e}")))),
         };
+        // A program may only free handles its own run made: the UI's selection mask, another
+        // run's images and the live preview are not its to drop (and a read-only run must not
+        // change anything the person can see).
+        let params = if id == "cv.free" { own_handles_only(params, created) } else { params };
         let result = if id == "$help" {
             match &params {
                 Value::Null => registry.help(None),
@@ -290,6 +330,10 @@ impl ScriptRuntime {
     }
 }
 
+fn reply_err(code: &str, message: &str) -> String {
+    json!({"err": {"code": code, "message": message}}).to_string()
+}
+
 fn reply(result: Result<Value, ApiError>) -> String {
     let v = match result {
         Ok(v) => json!({"ok": v}),
@@ -299,6 +343,15 @@ fn reply(result: Result<Value, ApiError>) -> String {
 }
 
 /// Every string in `v` that parses as a handle.
+/// `cv.free` params with `handles` narrowed to those in `created`; the rest are reported back
+/// by the function as `missing` (it never sees them).
+fn own_handles_only(mut params: Value, created: &HashSet<HandleId>) -> Value {
+    if let Some(Value::Array(list)) = params.get_mut("handles") {
+        list.retain(|h| h.as_str().and_then(HandleId::parse).is_some_and(|id| created.contains(&id)));
+    }
+    params
+}
+
 fn collect_handles(v: &Value, out: &mut HashSet<HandleId>) {
     match v {
         Value::String(s) => {
@@ -321,6 +374,42 @@ fn free_unreferenced(ctx: &Ctx, created: &HashSet<HandleId>, kept: &HashSet<Hand
         if !kept.contains(h) && !referenced.contains(h) {
             ctx.shared.handles.free(*h);
         }
+    }
+}
+
+fn free_shown_images(ctx: &Ctx, created: &HashSet<HandleId>, kept: &HashSet<HandleId>, value: &Value, images: &[ScriptImage]) {
+    if images.is_empty() {
+        return;
+    }
+    let mut rest = value.clone();
+    strip_attached_images(&mut rest, 0);
+    let mut mentioned = HashSet::new();
+    collect_handles(&rest, &mut mentioned);
+    for image in images {
+        if let Some(h) = HandleId::parse(&image.handle)
+            && created.contains(&h)
+            && !kept.contains(&h)
+            && !mentioned.contains(&h)
+        {
+            ctx.shared.handles.free(h);
+        }
+    }
+}
+
+/// Remove the `image` member of every object that got an `attached` index.
+fn strip_attached_images(value: &mut Value, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(|i| strip_attached_images(i, depth + 1)),
+        Value::Object(map) => {
+            if map.get("attached").is_some_and(Value::is_u64) {
+                map.remove("image");
+            }
+            map.values_mut().for_each(|i| strip_attached_images(i, depth + 1));
+        }
+        _ => {}
     }
 }
 

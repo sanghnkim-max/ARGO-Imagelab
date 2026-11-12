@@ -140,7 +140,7 @@ fn register_io(r: &mut Registry) {
         .typed(io::info)
         .register();
     r.function(AREA, "free", "Free handles you no longer need")
-        .description("Releases images/masks from the arena (it is bounded; a full arena makes calls fail with too_large). Handles made in a script run are freed when it ends anyway. Returns {freed, missing, usedBytes}.")
+        .description("Releases images/masks from the arena (it is bounded; a full arena makes calls fail with too_large). Handles made in a script run are freed when it ends anyway; inside a program only handles that run made can be freed (others come back as `missing`). Returns {freed, missing, usedBytes}.")
         .params(obj(json!({"handles": {"type": "array", "items": {"type": "string"}, "maxItems": 10000}}), &["handles"]))
         .typed(io::free)
         .register();

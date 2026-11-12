@@ -515,6 +515,7 @@ pub fn register(r: &mut Registry) {
         .register();
     r.function("doc", "snapshot", "Keep a named snapshot of the document for this session (not a history step)")
         .params(json!({"type":"object","properties":{"name":{"type":"string"}}}))
+        .effects(Effects::Revertible)
         .typed(|ctx: &Ctx, p: SnapshotParams| {
             let mut params = json!({});
             if let Some(n) = p.name.filter(|n| !n.trim().is_empty()) {
@@ -528,8 +529,9 @@ pub fn register(r: &mut Registry) {
         .effects(Effects::Revertible)
         .typed(|ctx: &Ctx, p: SnapshotParams| history_cmd(ctx, "history.selectSnapshot", json!({"snapshot": p.snapshot.unwrap_or(Value::Null)})))
         .register();
-    r.function("doc", "deleteSnapshot", "Delete snapshot `snapshot` (the document is unchanged)")
+    r.function("doc", "deleteSnapshot", "Delete snapshot `snapshot` (the document is unchanged; it cannot be brought back)")
         .params(json!({"type":"object","required":["snapshot"],"properties":{"snapshot":{}}}))
+        .effects(Effects::Destructive)
         .typed(|ctx: &Ctx, p: SnapshotParams| history_cmd(ctx, "history.deleteSnapshot", json!({"snapshot": p.snapshot.unwrap_or(Value::Null)})))
         .register();
     r.function("doc", "original", "Render the document as first opened (its oldest history state) to an image handle {image, width, height}: before/after")

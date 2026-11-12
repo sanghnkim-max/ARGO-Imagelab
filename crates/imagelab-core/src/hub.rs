@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use imagelab_api::{ApiResult, Ctx, Event, EventSink, NoEvents, Registry, Shared, Source};
-use imagelab_script::{Budget, ScriptOutcome, ScriptRuntime};
+use imagelab_script::{Budget, ScriptError, ScriptOutcome, ScriptRuntime};
 use serde_json::Value;
 
 /// How often the watcher looks for edits made through PhotoCraft's HTTP MCP endpoint.
@@ -83,6 +83,10 @@ pub(crate) struct Core {
     in_flight: AtomicUsize,
     /// Cancel flags of the scripts running now.
     running: Mutex<Vec<Arc<AtomicBool>>>,
+    /// Held by an editing (not read-only) program for its whole run: every step works on the
+    /// active document, so two editing programs at once (the in-app agent and an MCP client,
+    /// say) would land steps on each other's photo. Read-only programs never wait.
+    editing: Mutex<()>,
 }
 
 impl Core {
@@ -92,7 +96,7 @@ impl Core {
         // change as soon as it returns.
         let w = watch.clone();
         registry.set_after_mutation(Arc::new(move |ctx: &Ctx| w.notice(&ctx.shared, ctx.source)));
-        let core = Self { registry, shared, sink, watch, in_flight: AtomicUsize::new(0), running: Mutex::new(Vec::new()) };
+        let core = Self { registry, shared, sink, watch, in_flight: AtomicUsize::new(0), running: Mutex::new(Vec::new()), editing: Mutex::new(()) };
         // Start from the current state, so the first event is a real change.
         let current = core.current();
         *core.watch.seen.lock().unwrap_or_else(PoisonError::into_inner) = current;
@@ -119,11 +123,41 @@ impl Core {
         if read_only {
             ctx = ctx.read_only();
         }
+        let _editing = if read_only {
+            None
+        } else {
+            match self.wait_to_edit(timeout, &cancel) {
+                Some(guard) => Some(guard),
+                None => {
+                    return ScriptOutcome::failed(ScriptError::new(
+                        "busy",
+                        "another editing program is running on this photo and did not finish in time; try again when it is done",
+                    ));
+                }
+            }
+        };
         self.running.lock().unwrap_or_else(PoisonError::into_inner).push(cancel.clone());
         let outcome = ScriptRuntime::run(&self.registry, &ctx, code, Budget::with_wall(timeout));
         self.running.lock().unwrap_or_else(PoisonError::into_inner).retain(|c| !Arc::ptr_eq(c, &cancel));
         self.notice(source);
         outcome
+    }
+
+    /// The editing lock, waiting at most the run's own budget (or until it is cancelled).
+    fn wait_to_edit(&self, timeout: Duration, cancel: &AtomicBool) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let budget = if timeout.is_zero() { Budget::default().wall } else { timeout };
+        let give_up = std::time::Instant::now() + budget;
+        loop {
+            match self.editing.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= give_up {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     pub(crate) fn cancel_scripts(&self) {

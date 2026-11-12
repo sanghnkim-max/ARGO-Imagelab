@@ -606,14 +606,14 @@ pub fn register(r: &mut Registry, state: Arc<State>) {
     let s = state.clone();
     r.function("segment", "forgetImages", "Drop cached image embeddings (call when another photo is opened); the models stay loaded")
         .params(json!({"type":"object","properties":{}}))
-        .effects(Effects::ReadOnly)
+        .effects(Effects::Revertible)
         .typed(move |_, _: Empty| Ok(json!({"forgotten": s.sam.forget_images() + s.mobile.forget_images()})))
         .register();
 
     let s = state;
     r.function("segment", "unload", "Free the loaded models (SAM 3, MobileSAM) and cached embeddings now (they reload on demand)")
         .params(json!({"type":"object","properties":{}}))
-        .effects(Effects::ReadOnly)
+        .effects(Effects::Revertible)
         .typed(move |_, _: Empty| Ok(json!({"unloaded": s.sam.unload() | s.mobile.unload()})))
         .register();
 }

@@ -106,6 +106,11 @@ fn call(args: &[String]) -> i32 {
         Ok(l) => l,
         Err(code) => return code,
     };
+    // `--read-only` as a `lab_read` realm would apply it: only ReadOnly functions run.
+    if f.read_only && lab.registry().get(&id).is_some_and(|fun| fun.effects != imagelab_core::imagelab_api::Effects::ReadOnly) {
+        eprintln!("imagelab: read_only: {id} changes things; drop --read-only to run it");
+        return 1;
+    }
     match lab.call(&id, params, Source::Cli) {
         Ok(v) => {
             print_json(&v);

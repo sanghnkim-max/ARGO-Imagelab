@@ -529,6 +529,37 @@ fn unique_name(dir: &Path, name: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// Every function a read-only realm (`lab_read`) may call, reviewed by hand. A function
+    /// that forgets `.effects(..)` defaults to ReadOnly; this list makes that visible: add a
+    /// function here only after checking it changes nothing the person or another run holds
+    /// (document, history, snapshots, files, library, other handles, caches the UI relies on).
+    #[test]
+    fn read_only_functions_are_the_reviewed_list() {
+        const REVIEWED: &[&str] = &[
+            "analyze.contactSheet", "analyze.duplicates", "analyze.histogram", "analyze.quality", "analyze.thumbnail",
+            "batch.presets",
+            "cv.adaptiveThreshold", "cv.adjust", "cv.applyMask", "cv.bilateralFilter", "cv.canny", "cv.combineMasks", "cv.composite",
+            "cv.connectedComponents", "cv.crop", "cv.cvtColor", "cv.denoise", "cv.dominantAngle", "cv.extractChannel", "cv.featherMask",
+            "cv.findContours", "cv.flip", "cv.free", "cv.fromDocument", "cv.gaussianBlur", "cv.growMask", "cv.histogram", "cv.houghLines",
+            "cv.info", "cv.inpaint", "cv.invertMask", "cv.laplacianVariance", "cv.maskBounds", "cv.maskFromColor", "cv.matchTemplate",
+            "cv.meanStd", "cv.medianBlur", "cv.morphology", "cv.read", "cv.resize", "cv.rotate", "cv.shrinkMask", "cv.sobel", "cv.threshold",
+            "cv.warpAffine", "cv.warpPerspective",
+            "doc.history", "doc.inspect", "doc.list", "doc.original", "doc.preview",
+            "edit.commands", "edit.getRecipe", "edit.listRecipes", "edit.lookSuggest", "edit.looks", "edit.preview",
+            "fonts.list",
+            "library.albumList", "library.get", "library.list", "library.query",
+            "segment.box", "segment.models", "segment.point", "segment.prepare", "segment.subject", "segment.text",
+            "select.toMask",
+        ];
+        use imagelab_api::Effects;
+        let registry = build_registry();
+        let mut actual: Vec<String> = registry.functions().filter(|f| f.effects == Effects::ReadOnly).map(|f| format!("{}.{}", f.area, f.name)).collect();
+        actual.sort();
+        let mut expected: Vec<String> = REVIEWED.iter().map(|s| (*s).to_string()).collect();
+        expected.sort();
+        assert_eq!(actual, expected, "read-only functions changed: review the new ones (see the comment)");
+    }
+
     #[test]
     fn sanitize_keeps_names_safe() {
         assert_eq!(sanitize_file_name("../../etc/passwd"), "passwd");
