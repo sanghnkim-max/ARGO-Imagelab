@@ -84,7 +84,10 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
 
     /** Scale-free items whose look on a small proxy matches the full-size result. */
     private fun proxyable(it: MenuItem) = it.live && it.params.isNotEmpty() &&
-        (it.kind == Kind.Look || it.kind == Kind.Face || (it.kind == Kind.Pixels && it.command in PROXY_COMMANDS))
+        (it.kind == Kind.Look || it.kind == Kind.Face || it.kind == Kind.AdjustmentLayer || (it.kind == Kind.Pixels && it.command in PROXY_COMMANDS))
+
+    /** The photo on screen (histograms for Curves). */
+    fun previewBitmap() = lab.state.value.preview
 
     /** Start an item (keeping whatever the previous one did). */
     fun open(next: MenuItem) {
@@ -97,6 +100,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
                 is Choice -> p.default
                 is Toggle -> p.default
                 is ColorParam -> p.default
+                is CurveParam -> CurveSet()
             }
         }
         proxy = proxyable(next) && maskForNew() == null
@@ -171,6 +175,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         return when (item.kind) {
             Kind.Look -> buildJsonObject { put("fn", Fn.EDIT_LOOK); put("params", buildJsonObject { put("look", item.command); p.forEach { (k, v) -> put(k, v) } }) }
             Kind.Face -> buildJsonObject { put("fn", Fn.EDIT_FACE_LIQUIFY); put("params", p) }
+            Kind.AdjustmentLayer -> buildJsonObject { put("fn", Fn.EDIT_RUN); put("params", buildJsonObject { put("id", "layer.newAdjustmentLayer.${item.command}"); put("params", p) }) }
             else -> buildJsonObject { put("fn", Fn.EDIT_RUN); put("params", buildJsonObject { put("id", item.command); put("params", p) }) }
         }
     }
@@ -209,6 +214,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         item.fixed.forEach { (k, v) -> flat[k] = element(v) }
         item.params.forEach { p ->
             val v = values[p.key] ?: return@forEach
+            if (v is CurveSet) { flat.putAll(v.json()); return@forEach }
             flat[p.key] = if (v is Float) {
                 val s = p as? Slider
                 val shown = if (s?.integer == true) v.roundToInt().toFloat() else v

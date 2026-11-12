@@ -96,6 +96,12 @@ private fun ParamControl(p: Param, live: LiveCommand) {
                 Switch(checked = v, onCheckedChange = { live.set(p.key, it) })
             }
         }
+        is CurveParam -> {
+            val v = (live.values[p.key] as? CurveSet) ?: CurveSet()
+            // The histogram of the photo as Curves opened, not of each preview.
+            val hist = androidx.compose.runtime.remember(live.item) { histograms(live.previewBitmap()) }
+            CurveEditor(v, hist, onChange = { live.drag(p.key, it) }, onRelease = live::release, onSet = { live.set(p.key, it) })
+        }
         is ColorParam -> {
             val v = (live.values[p.key] as? String) ?: p.default
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(vertical = 4.dp)) {

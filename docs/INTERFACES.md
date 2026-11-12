@@ -261,7 +261,11 @@ Reference: a mobile layered editor — full-bleed canvas, chrome at the edges, o
   effects, tone curve, HSL hue/saturation/luminance, color grading, detail, vignette & grain;
   Shadows/Highlights, HDR toning); adjustment layers (Levels, Hue/Saturation, Vibrance, Color
   balance, Selective color, Channel mixer, Gradient map, Photo filter, Look, B&W, Posterize,
-  Threshold, Invert). Applies to the selection if one exists. Catalog keys may address part of a
+  Threshold, Invert). **Curves**: a Curves adjustment layer edited on a draggable curve (RGB,
+  red, green, blue; up to 19 points each; presets), drawn with the same natural cubic spline the
+  engine applies (checked level by level), over the photo's histogram; a point is added only by
+  touching the line, the end points move too, and dragging a middle point out of the box removes
+  it. Adjustment layers preview on the proxy while dragging. Applies to the selection if one exists. Catalog keys may address part of a
   structured param (`hslSat[2]`, `gradeShadows.hue`; a `json:` choice value is sent as JSON).
 * **Filters**: Blur (incl. lens, spin, field, smart, box), Sharpen, Noise, Lens (Lens
   correction), Painting / Sketch / Texture (PhotoCraft's Filter Gallery, picture frames),

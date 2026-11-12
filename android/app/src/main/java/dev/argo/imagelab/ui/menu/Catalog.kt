@@ -110,6 +110,9 @@ private val gradients = listOf(
 )
 
 object Catalog {
+    /** Curves: a non-destructive Curves adjustment layer edited on a draggable curve. */
+    val curves = MenuItem("Curves", "curves", Kind.AdjustmentLayer, listOf(CurveParam()))
+
     /** Lens correction: geometry, chromatic aberration and lens vignetting (scale-free, so it previews on the proxy). */
     val lensCorrection = MenuItem(
         "Lens correction", "filter.lensCorrection", Kind.Pixels,
@@ -211,6 +214,7 @@ object Catalog {
                     Slider("blacks", "Blacks", -100f, 100f, 0f),
                 ),
             ),
+            curves,
             MenuItem(
                 "Color", "filter.cameraRaw", Kind.Pixels,
                 listOf(
@@ -306,6 +310,7 @@ object Catalog {
     val adjustmentLayers = MenuGroup(
         "Adjustment layers",
         listOf(
+            curves,
             MenuItem(
                 "Levels", "levels", Kind.AdjustmentLayer,
                 listOf(
