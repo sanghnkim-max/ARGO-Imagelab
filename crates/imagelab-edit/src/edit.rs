@@ -215,6 +215,26 @@ pub fn register(r: &mut Registry) {
         .effects(Effects::Revertible)
         .typed(|ctx: &Ctx, p: CropParams| mutate(ctx, |h| ops::crop_to(h, &p)))
         .register();
+    r.function("edit", "looks", "One-slider looks and templates: ids, groups, ranges, styles")
+        .description("The catalog edit.look takes: Essentials (enhance, sky, structure, details, denoise, bw, vignette), Landscape (goldenHour, foliage, atmosphere, skyReplace), Creative (dramatic, glow, matte, toning, grain), Portrait (faceLight, skin, eyes, redEye, bokeh) and templates that combine them.")
+        .typed(|_: &Ctx, _: Value| Ok(crate::looks::catalog()))
+        .register();
+    r.function("edit", "look", "Apply a one-slider look or template as one history step")
+        .description("{look, amount?, sky?, style?}. amount is the look's range (see edit.looks; default its default). enhance measures the photo and corrects exposure, shadows, highlights, contrast and colour; sky (0..100) with enhance also enhances the sky. style: toning colours, skyReplace sky, or the template id (look: 'template'). Sky looks need a sky (Select Sky) and portrait looks a face (image.detectFaces); when there is none the result says skipped and nothing changes. Returns {applied, steps, skipped}. Global looks apply inside the active selection; region looks (sky, faces, background) replace it and deselect.")
+        .params(json!({"type":"object","required":["look"],"properties":{"look":{"type":"string"},"amount":{"type":"number"},"sky":{"type":"number","minimum":0,"maximum":100},"style":{"type":"string"}}}))
+        .effects(Effects::Revertible)
+        .typed(|ctx: &Ctx, p: crate::looks::LookParams| mutate(ctx, |h| crate::looks::apply(h, &p)))
+        .register();
+    r.function("edit", "lookSuggest", "The photo's scene (portrait, landscape, general) and templates that suit it")
+        .description("{scene, faces, sky (share of the canvas), brightness (median), templates:[{id,label}]}. Leaves the document as it was.")
+        .typed(|ctx: &Ctx, _: Value| ctx.with_session(crate::looks::suggest))
+        .register();
+    r.function("edit", "faceLiquify", "Face-aware liquify: eyes, nose, mouth, smile, face width, chin, forehead")
+        .description("{eyes?, nose?, mouth?, smile?, faceWidth?, chin?, forehead?: -100..100 (0 = unchanged), face?: index (default every face)}. Strokes are placed and sized from image.detectFaces (box + eyes, nose, mouth corners). One Liquify history step. {applied:false, skipped} when no face is found.")
+        .params(json!({"type":"object","properties":{"face":{"type":"integer","minimum":0},"eyes":{"type":"number"},"nose":{"type":"number"},"mouth":{"type":"number"},"smile":{"type":"number"},"faceWidth":{"type":"number"},"chin":{"type":"number"},"forehead":{"type":"number"}}}))
+        .effects(Effects::Revertible)
+        .typed(|ctx: &Ctx, p: crate::face::FaceParams| mutate(ctx, |h| crate::face::apply(h, &p)))
+        .register();
     r.function("edit", "saveRecipe", "Store steps as a named recipe (recipes/<name>.json)")
         .description("{name, steps, description?, replace?}. Steps as edit.steps takes them; validated against the allowlist when saved. Replay with edit.applyRecipe or batch.apply.")
         .params(json!({"type":"object","required":["name","steps"],"properties":{"name":{"type":"string"},"steps":{"type":"array","maxItems":MAX_STEPS,"items":step_schema()},"description":{"type":"string"},"replace":{"type":"boolean"}}}))

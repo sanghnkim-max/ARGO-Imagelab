@@ -2801,6 +2801,8 @@ dependencies = [
  "imagelab-api",
  "photocraft-automation",
  "photocraft-codecs",
+ "photocraft-compose",
+ "photocraft-geom",
  "photocraft-io",
  "photocraft-text",
  "serde",

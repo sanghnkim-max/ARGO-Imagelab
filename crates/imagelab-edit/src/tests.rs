@@ -310,3 +310,79 @@ fn pixel_commands_retarget_from_an_adjustment_layer() {
     let v = e.ok("edit.run", json!({"id": "image.autoColor", "params": {}}));
     assert!(v["retargetedLayer"].is_u64(), "{v}");
 }
+
+/// Renders every look (and template) on `IMAGELAB_LOOK_PHOTO` into `IMAGELAB_LOOK_OUT` for a
+/// visual check, with timings; each look must be exactly one history step.
+#[test]
+#[ignore]
+fn render_looks() {
+    let (Ok(photo), Ok(out)) = (std::env::var("IMAGELAB_LOOK_PHOTO"), std::env::var("IMAGELAB_LOOK_OUT")) else { return };
+    let e = env();
+    std::fs::create_dir_all(e.root.join("library/x")).unwrap();
+    std::fs::copy(&photo, e.root.join("library/x/p.jpg")).unwrap();
+    e.ok("doc.open", json!({"photo": "library/x/p.jpg"}));
+    println!("suggest {}", e.ok("edit.lookSuggest", json!({})));
+    let mut runs: Vec<(String, Value)> = crate::looks::looks().iter().filter(|l| l.id != "template").map(|l| (l.id.to_string(), json!({"look": l.id}))).collect();
+    for (id, ..) in crate::looks::TEMPLATES {
+        runs.push((format!("t_{id}"), json!({"look": "template", "style": id})));
+    }
+    // Twice: the second run (a slider move) reuses the measurements and the scene.
+    runs.push(("enhance_sky".into(), json!({"look": "enhance", "sky": 70})));
+    runs.push(("enhance_sky2".into(), json!({"look": "enhance", "sky": 40})));
+    for s in ["sunset", "dusk"] {
+        runs.push((format!("sky_{s}"), json!({"look": "skyReplace", "style": s})));
+    }
+    for (name, p) in runs {
+        let before = e.ok("doc.history", json!({}))["count"].as_u64().unwrap();
+        let t = std::time::Instant::now();
+        let r = e.call("edit.look", p);
+        let ms = t.elapsed().as_millis();
+        let after = e.ok("doc.history", json!({}))["count"].as_u64().unwrap();
+        println!("{name:14} {ms:5} ms  history +{}  {}", after - before, r.as_ref().map_or_else(|e| e.to_string(), |v| v.to_string()));
+        if after > before {
+            let mut s = e.shared.session.lock().unwrap();
+            std::fs::write(format!("{out}/{name}.png"), s.render_png(None, 600).unwrap()).unwrap();
+            drop(s);
+            e.ok("doc.undo", json!({}));
+        }
+    }
+}
+
+/// Face liquify strokes on a grid with a stand-in face, rendered to `IMAGELAB_LOOK_OUT`.
+#[test]
+#[ignore]
+fn render_face_liquify_grid() {
+    let Ok(out) = std::env::var("IMAGELAB_LOOK_OUT") else { return };
+    let e = env();
+    let (w, h) = (600u32, 600u32);
+    let mut px = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let line = x % 20 == 0 || y % 20 == 0;
+            px.extend_from_slice(if line { &[0, 0, 0, 255] } else { &[235, 220, 200, 255] });
+        }
+    }
+    let img = Image::from_u8(w, h, ChannelLayout::Rgba, px).unwrap();
+    let bytes = photocraft_codecs::encode(&img, Format::Png, &EncodeOptions::default()).unwrap();
+    std::fs::create_dir_all(e.root.join("library/x")).unwrap();
+    std::fs::write(e.root.join("library/x/g.png"), bytes).unwrap();
+    e.ok("doc.open", json!({"photo": "library/x/g.png"}));
+    let face = crate::looks::Face { rect: [150.0, 120.0, 300.0, 360.0], eyes: vec![[240.0, 255.0], [360.0, 255.0]], nose: Some([300.0, 330.0]), mouth: vec![[250.0, 400.0], [350.0, 400.0]] };
+    let cases = [
+        ("eyes", json!({"eyes": 100})),
+        ("slim", json!({"faceWidth": -100})),
+        ("smile", json!({"smile": 100})),
+        ("chin", json!({"chin": 100})),
+        ("nose", json!({"nose": -100})),
+    ];
+    for (name, p) in cases {
+        let p: crate::face::FaceParams = serde_json::from_value(p).unwrap();
+        let strokes = crate::face::strokes(&face, &p);
+        let mut s = e.shared.session.lock().unwrap();
+        let t = std::time::Instant::now();
+        s.command_run("filter.liquify", json!({"strokes": strokes})).unwrap();
+        println!("{name} {:?}", t.elapsed());
+        std::fs::write(format!("{out}/liq_{name}.png"), s.render_png(None, 600).unwrap()).unwrap();
+        s.command_run("edit.undo", json!({})).unwrap();
+    }
+}

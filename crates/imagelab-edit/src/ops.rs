@@ -57,7 +57,7 @@ fn needs_pixels(message: &str) -> bool {
 }
 
 /// The topmost visible pixel layer of the active document, from the inspect projection.
-fn top_pixel_layer(h: &Headless) -> Option<u64> {
+pub(crate) fn top_pixel_layer(h: &Headless) -> Option<u64> {
     fn walk(layers: &Value) -> Option<u64> {
         for l in layers.as_array()? {
             if l.get("visible").and_then(Value::as_bool) == Some(false) {

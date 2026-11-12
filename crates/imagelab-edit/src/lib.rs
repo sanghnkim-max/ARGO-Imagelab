@@ -19,6 +19,8 @@ pub mod batch;
 pub mod doc;
 pub mod edit;
 pub mod fonts;
+pub mod looks;
+pub mod face;
 pub mod ops;
 pub mod paths;
 

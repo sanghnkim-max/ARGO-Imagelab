@@ -247,8 +247,35 @@ Reference: a mobile layered editor — full-bleed canvas, chrome at the edges, o
   entry point for cull and batch jobs; batch progress shows as a card.
 * **Select**: tap = SAM point, drag = box, type = concept ("sky"); Subject/Sky quick chips
   (PhotoCraft, no model). The mask shows as an overlay; actions: adjust inside, blur, remove, cut to layer.
+* **Enhance** (first tool): one-slider, photo-aware looks from `edit.look`, live as the slider
+  moves, each one history step. "For this photo" suggests templates for the scene
+  (`edit.lookSuggest`: portrait if faces, landscape if a sky). Groups: Templates; Essentials
+  (Enhance + sky, Sky, Structure, Details, Denoise, B&W, Vignette); Landscape (Golden hour,
+  Foliage, Atmosphere, Sky replacement, Relight); Creative (Dramatic, Glow, Matte, Toning, Film
+  grain); Portrait (Smooth skin, Face light, Eyes, Red eye, Background blur, Face shape).
 * **Adjust**: adjustment layers (light, color, effects); applies to the selection if one exists.
-* **Retouch**: heal/remove brush, content-aware fill, denoise.
+* **Retouch**: brushes painted on the canvas — Heal (`paint.spotHealing`), Remove
+  (`paint.remove`), Lighten/Darken (`paint.dodge`/`paint.burn`), Liquify Push/Bloat/Pinch/Restore
+  (`filter.liquify` strokes) — plus content-aware fill, denoise, and a shortcut to Face shape.
+
+#### Looks (`edit.look`) and face liquify (`edit.faceLiquify`)
+
+Built only from PhotoCraft commands. A look becomes a plan: one `filter.cameraRaw` pass for the
+whole photo, masked passes for areas PhotoCraft finds itself (Select Sky, `image.detectFaces`
+ellipses, skin tones via `select.colorRange`, the subject's background), and for sky replacement
+a gradient fill layer masked by the sky, blended *Color* so clouds keep their texture and the
+soft sky edge shows no halo. The plan plays as a temporary action, so the look is one history
+step ("Action: Enhance"); the action is deleted afterwards. Enhance measures the photo
+(luminance percentiles, dark/bright share, saturation, from a ≤ 256 px render cached per
+revision) and only corrects what it finds. Sky and face looks return `applied:false` with
+`skipped` when there is no sky or face, and change nothing.
+
+Face shape sliders (eyes, nose, mouth, smile, face width, chin, forehead; −100..100) become
+`filter.liquify` strokes sized from each face's width: bloat/pucker held at the eye, nose and
+mouth landmarks, forward-warp drags for the smile corners, five rows along each cheek and jaw,
+chin and hairline. One call is one Liquify step. Checked on a grid
+(`render_face_liquify_grid`), and every look on a photo (`render_looks`, both `#[ignore]`d in
+imagelab-edit; on a 3000×4000 photo a whole-photo look takes 0.15–1.6 s on the Mac).
 * **Agent**: a sheet (phone) or side pane (large screens); shows the program it runs (collapsed),
   progress, previews it looked at, and chips for photos it touched.
 * CLI console and MCP switch live under Settings → Developer.

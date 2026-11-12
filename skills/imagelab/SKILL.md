@@ -63,6 +63,17 @@ await lab.edit.run({ id: "filter.blur.gaussianBlur", params: { radius: 12 }, mas
 return await lab.doc.preview({ maxSide: 768 });
 ```
 
+One-slider looks (each one undo step; `lab.edit.looks()` lists them), templates, and
+face-aware liquify:
+
+```js
+const s = await lab.edit.lookSuggest({});            // {scene, faces, sky, templates:[{id,label}]}
+await lab.edit.look({ look: "template", style: s.templates[0].id, amount: 70 });
+await lab.edit.look({ look: "enhance", amount: 60, sky: 50 });
+await lab.edit.look({ look: "skyReplace", style: "sunset" });   // {applied:false, skipped} if no sky
+await lab.edit.faceLiquify({ eyes: 20, faceWidth: -25, smile: 30 });
+```
+
 A small object in a big photo, with sharp edges: `refine: true` re-segments a full-resolution
 crop around the first mask (check `detail.refined`):
 

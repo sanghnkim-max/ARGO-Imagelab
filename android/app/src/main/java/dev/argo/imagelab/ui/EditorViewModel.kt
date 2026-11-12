@@ -35,11 +35,23 @@ import kotlin.math.roundToInt
 /** How a tap or drag on the canvas selects (Select tool). */
 enum class SelectMode(val label: String) { Object("Object"), Box("Box"), Rect("Rectangle"), Ellipse("Ellipse"), Lasso("Lasso") }
 
+/** Retouch brushes: a drag on the canvas is one stroke of the chosen engine tool. */
+enum class RetouchBrush(val label: String, val command: String, val liquify: String? = null) {
+    Heal("Heal", "paint.spotHealing"),
+    Remove("Remove", "paint.remove"),
+    Dodge("Lighten", "paint.dodge"),
+    Burn("Darken", "paint.burn"),
+    Warp("Push", "filter.liquify", "forwardWarp"),
+    Bloat("Bloat", "filter.liquify", "bloat"),
+    Pucker("Pinch", "filter.liquify", "pucker"),
+    Restore("Restore", "filter.liquify", "reconstruct"),
+}
+
 /** How a new selection combines with the current one. */
 enum class Combine(val label: String) { New("New"), Add("Add"), Subtract("Subtract") }
 
 enum class Tool(val label: String) {
-    Layers("Layers"), Select("Select"), Adjust("Adjust"), Filters("Filters"), Effects("Effects"),
+    Enhance("Enhance"), Layers("Layers"), Select("Select"), Adjust("Adjust"), Filters("Filters"), Effects("Effects"),
     Retouch("Retouch"), Paint("Paint"), Text("Text"), Crop("Crop & size"),
 }
 
@@ -83,6 +95,61 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         tool = if (tool == t) null else t
         if (tool == Tool.Select) onSelectOpened()
         if (tool == Tool.Text) refreshFonts()
+        if (tool == Tool.Enhance) suggest()
+        if (tool != Tool.Retouch) retouchBrush = null
+    }
+
+    // ── enhance ──────────────────────────────────────────────────────────────────────────
+
+    /** The photo's scene ("portrait", "landscape", "general") and the templates that suit it. */
+    var scene by mutableStateOf<String?>(null); private set
+    var suggested by mutableStateOf<List<String>>(emptyList()); private set
+    private var suggestedFor: String? = null
+
+    private fun suggest() = viewModelScope.launch {
+        val st = lab.state.value
+        val key = "${st.name}:${st.width}x${st.height}"
+        if (key == suggestedFor) return@launch
+        val r = lab.fn(Fn.EDIT_LOOK_SUGGEST, "{}", refreshAfter = false).getOrNull() as? JsonObject ?: return@launch
+        scene = (r["scene"] as? JsonPrimitive)?.content
+        suggested = (r["templates"] as? JsonArray)?.mapNotNull { ((it as? JsonObject)?.get("id") as? JsonPrimitive)?.content } ?: emptyList()
+        suggestedFor = key
+    }
+
+    // ── retouch brushes ──────────────────────────────────────────────────────────────────
+
+    /** The active retouch brush (null: one finger pans as usual). */
+    var retouchBrush by mutableStateOf<RetouchBrush?>(null)
+    var retouchSize by mutableFloatStateOf(80f)
+    var retouchStrength by mutableFloatStateOf(0.5f)
+
+    /** One retouch stroke in document pixels: [x, y, pressure]. */
+    fun retouchStroke(points: List<Triple<Float, Float, Float>>) {
+        val brush = retouchBrush ?: return
+        if (points.isEmpty()) return
+        val pts = JsonArray(points.map { (x, y, p) -> JsonArray(listOf(JsonPrimitive(x.roundToInt()), JsonPrimitive(y.roundToInt()), JsonPrimitive(p.coerceIn(0.05f, 1f).toDouble()))) })
+        val strength = (retouchStrength * 100).roundToInt().coerceIn(1, 100)
+        val params = buildJsonObject {
+            if (brush.liquify != null) {
+                putJsonArray("strokes") {
+                    add(buildJsonObject {
+                        put("tool", brush.liquify); put("size", retouchSize.roundToInt()); put("pressure", strength); put("rate", 60)
+                        put("points", pts)
+                    })
+                }
+            } else {
+                put("points", pts); put("size", retouchSize.roundToInt())
+                when (brush) {
+                    RetouchBrush.Heal -> { put("hardness", 50); put("type", "contentAware") }
+                    RetouchBrush.Remove -> put("hardness", 50)
+                    else -> { put("exposure", strength); put("range", "midtones"); put("hardness", 0) }
+                }
+            }
+        }
+        viewModelScope.launch {
+            lab.markInteractive()
+            lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", brush.command); put("params", params) }.toString())
+        }
     }
 
     // ── segmentation model (MobileSAM) ───────────────────────────────────────────────────

@@ -228,7 +228,8 @@ private fun EditorTopBar(state: EditorState, agentOpen: Boolean, vm: EditorViewM
 private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modifier, onOpen: () -> Unit, onLibrary: () -> Unit) {
     val preview = state.preview
     val selectMode = vm.tool == Tool.Select
-    val paintMode = vm.tool == Tool.Paint
+    val retouchMode = vm.tool == Tool.Retouch && vm.retouchBrush != null
+    val paintMode = vm.tool == Tool.Paint || retouchMode
     val textMode = vm.tool == Tool.Text
     // The stroke being painted (screen points) and its pressures.
     var stroke by remember { mutableStateOf<List<Offset>>(emptyList()) }
@@ -265,7 +266,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
             .clipToBounds()
             .background(CanvasBackground)
             .onSizeChanged { box = it }
-            .pointerInput(selectMode, paintMode, textMode) {
+            .pointerInput(selectMode, paintMode, textMode, retouchMode) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     if (down.type == PointerType.Stylus) vm.stylusPressure = down.pressure
@@ -308,7 +309,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                     draft = emptyList()
                     if (paintMode && !multi) {
                         val pts = path.mapIndexedNotNull { i, p -> toDocOrClamp(p, clamp = true)?.let { d -> Triple(d.x, d.y, pressures.getOrElse(i) { 1f }) } }
-                        vm.paintStroke(pts)
+                        if (retouchMode) vm.retouchStroke(pts) else vm.paintStroke(pts)
                         stroke = emptyList()
                     }
                     if (textMode && !multi) toDoc(start)?.let { vm.textAt = it }
@@ -531,6 +532,7 @@ private fun AddMenu(vm: EditorViewModel, onPhotoLayer: () -> Unit, modifier: Mod
 // ── tool bar / rail ──────────────────────────────────────────────────────────────────────────
 
 private fun toolIcon(t: Tool) = when (t) {
+    Tool.Enhance -> Sym.enhance
     Tool.Layers -> Sym.layers
     Tool.Select -> Sym.select
     Tool.Adjust -> Sym.adjust

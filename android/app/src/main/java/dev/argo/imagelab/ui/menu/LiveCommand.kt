@@ -41,6 +41,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
 
     private val inbox = Channel<Msg>(Channel.UNLIMITED)
     private var revisionAfter: Long? = null
+    private var lastSkipped: String? = null
 
     init {
         scope.launch {
@@ -152,10 +153,23 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         val p = params(item, msg.values)
         val r = when (item.kind) {
             Kind.AdjustmentLayer -> lab.io { it.call(Fn.EDIT_ADJUST, buildJsonObject { put("kind", item.command); put("params", p) }.toString(), "ui") }
+            Kind.Look -> lab.io { it.call(Fn.EDIT_LOOK, buildJsonObject { put("look", item.command); p.forEach { (k, v) -> put(k, v) } }.toString(), "ui") }
+            Kind.Face -> lab.io { it.call(Fn.EDIT_FACE_LIQUIFY, p.toString(), "ui") }
             else -> lab.io { it.call(Fn.EDIT_RUN, buildJsonObject { put("id", item.command); put("params", p) }.toString(), "ui") }
         }
         r.exceptionOrNull()?.let { lab.showMessage(Lab.describe(it)) }
-        applied = r.isSuccess
+        // Looks and face tools that found nothing to work on (no sky, no face) change nothing:
+        // say why, and keep no preview step (so the next run never undoes an earlier edit).
+        val result = r.getOrNull()?.let { lab.parse(it) } as? JsonObject
+        val nothing = (result?.get("applied") as? JsonPrimitive)?.content == "false"
+        if (nothing) {
+            val why = (result?.get("skipped") as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }?.distinct()?.joinToString()
+            if (!why.isNullOrBlank() && why != lastSkipped) lab.showMessage("${item.label}: $why")
+            lastSkipped = why
+        } else {
+            lastSkipped = null
+        }
+        applied = r.isSuccess && !nothing
         revisionAfter = if (r.isSuccess) revision() else null
         if (r.isSuccess) {
             lab.markInteractive()

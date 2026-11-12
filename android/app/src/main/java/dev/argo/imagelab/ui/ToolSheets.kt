@@ -74,6 +74,7 @@ fun ToolSheet(tool: Tool, state: EditorState, vm: EditorViewModel, modifier: Mod
                 return@Column
             }
             when (tool) {
+                Tool.Enhance -> EnhanceSheet(vm)
                 Tool.Layers -> LayersSheet(state, vm)
                 Tool.Select -> SelectSheet(vm)
                 Tool.Adjust -> {
@@ -99,6 +100,25 @@ fun ToolSheet(tool: Tool, state: EditorState, vm: EditorViewModel, modifier: Mod
 @Composable
 private fun ChipRow(content: @Composable () -> Unit) {
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { content() }
+}
+
+// ── Enhance ──────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun EnhanceSheet(vm: EditorViewModel) {
+    if (vm.suggested.isNotEmpty()) {
+        Text("For this photo" + (vm.scene?.let { " · $it" } ?: ""), style = MaterialTheme.typography.labelLarge, color = Accent)
+        ChipRow {
+            vm.suggested.mapNotNull { Catalog.templateFor(it) }.forEach { item ->
+                FilterChip(selected = vm.command.item == item, onClick = { if (vm.command.item != item) vm.command.open(item) }, label = { Text(item.label) }, leadingIcon = { SymIcon(Sym.enhance, null, Modifier.size(16.dp)) })
+            }
+        }
+        HorizontalDivider(Modifier.padding(vertical = 6.dp))
+    }
+    CommandSheet(
+        Catalog.enhance, vm.command,
+        note = if (vm.selection != null) "Whole-photo looks apply inside the selection; sky and portrait looks find their own area." else "One slider each; the photo follows it. Sky and portrait tools find the sky and faces themselves.",
+    )
 }
 
 // ── Layers ───────────────────────────────────────────────────────────────────────────────────
@@ -369,6 +389,30 @@ private fun AdjustSheet(vm: EditorViewModel) {
 
 @Composable
 private fun RetouchSheet(vm: EditorViewModel) {
+    Text(
+        if (vm.retouchBrush == null) "Pick a brush, then paint on the photo (two fingers zoom). Or use the selection tools below."
+        else "Paint over what to fix with one finger; two fingers zoom and pan.",
+        style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+    )
+    ChipRow {
+        RetouchBrush.entries.filter { it.liquify == null }.forEach { b ->
+            FilterChip(selected = vm.retouchBrush == b, onClick = { vm.retouchBrush = if (vm.retouchBrush == b) null else b }, label = { Text(b.label) })
+        }
+    }
+    Text("Liquify", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 4.dp))
+    ChipRow {
+        RetouchBrush.entries.filter { it.liquify != null }.forEach { b ->
+            FilterChip(selected = vm.retouchBrush == b, onClick = { vm.retouchBrush = if (vm.retouchBrush == b) null else b }, label = { Text(b.label) })
+        }
+        AssistChip(onClick = { vm.tool = Tool.Enhance; vm.command.open(Catalog.enhance.last().items.last()) }, label = { Text("Face shape") }, leadingIcon = { SymIcon(Sym.face, null, Modifier.size(18.dp)) })
+    }
+    if (vm.retouchBrush != null) {
+        LabeledSlider("Size", vm.retouchSize, 5f..600f, { vm.retouchSize = it }) { "${it.roundToInt()} px" }
+        if (vm.retouchBrush != RetouchBrush.Heal && vm.retouchBrush != RetouchBrush.Remove) {
+            LabeledSlider("Strength", vm.retouchStrength, 0.05f..1f, { vm.retouchStrength = it }) { "${(it * 100).roundToInt()}%" }
+        }
+    }
+    HorizontalDivider(Modifier.padding(vertical = 6.dp))
     Text("Content-aware tools use the selection; select what to fix first.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
     ChipRow {
         AssistChip(onClick = { vm.edit("edit.contentAwareFill", masked = true) }, label = { Text("Content-aware fill") }, leadingIcon = { SymIcon(Sym.fill, null, Modifier.size(18.dp)) })
@@ -376,13 +420,8 @@ private fun RetouchSheet(vm: EditorViewModel) {
         AssistChip(onClick = { vm.denoise() }, label = { Text("Denoise") })
         AssistChip(onClick = { vm.edit("filter.noise.dustAndScratches", """{"radius":2,"threshold":10}""", masked = true) }, label = { Text("Dust & scratches") })
     }
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
-        OutlinedButton(onClick = {}, enabled = false) { Text("Heal brush (soon)") }
-        Text(
-            "  stylus pressure ${(vm.stylusPressure * 100).roundToInt()}%",
-            style = MaterialTheme.typography.labelSmall,
-            color = Color.Gray,
-        )
+    if (vm.stylusPressure > 0f) {
+        Text("Stylus pressure ${(vm.stylusPressure * 100).roundToInt()}% shapes each stroke.", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
     }
 }
 

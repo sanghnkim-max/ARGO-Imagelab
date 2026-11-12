@@ -57,7 +57,8 @@ fun CommandSheet(groups: List<MenuGroup>, live: LiveCommand, note: String? = nul
         }
     }
     val item = live.item
-    if (item != null && group.items.contains(item)) {
+    if (item != null && groups.any { it.items.contains(item) }) {
+        if (!group.items.contains(item)) Text(item.label, style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 4.dp))
         Column(Modifier.padding(top = 4.dp)) {
             item.params.forEach { p -> ParamControl(p, live) }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {

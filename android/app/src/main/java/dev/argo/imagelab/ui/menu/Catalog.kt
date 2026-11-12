@@ -43,6 +43,10 @@ enum class Kind {
     LayerStyle,
     /** A document command applied once (size, canvas); not previewed. */
     Document,
+    /** A one-slider look (`edit.look {look, amount, sky?, style?}`): one history step. */
+    Look,
+    /** Face-aware liquify (`edit.faceLiquify`): sliders placed from the detected faces. */
+    Face,
 }
 
 data class MenuItem(
@@ -73,7 +77,88 @@ val layerBlendModes = listOf(
     "Difference", "Exclusion", "Subtract", "Divide", "Hue", "Saturation", "Color", "Luminosity",
 )
 
+private val tonings = listOf("tealOrange" to "Teal & orange", "warmFade" to "Warm fade", "coolBlue" to "Cool blue", "cinematic" to "Cinematic", "sepia" to "Sepia", "rose" to "Rose")
+private val skies = listOf("blue" to "Clear blue", "golden" to "Golden", "sunset" to "Sunset", "dusk" to "Dusk", "storm" to "Storm")
+
+/** A look with one Amount slider. */
+private fun look(label: String, id: String, default: Float, min: Float = 0f, extra: List<Param> = emptyList()) =
+    MenuItem(label, id, Kind.Look, listOf(Slider("amount", "Amount", min, 100f, default)) + extra)
+
+/** A template: several looks in one, with a Strength slider. */
+private fun template(label: String, id: String) =
+    MenuItem(label, "template", Kind.Look, listOf(Slider("amount", "Strength", 0f, 100f, 80f)), fixed = mapOf("style" to id))
+
 object Catalog {
+    /** Template ids as `edit.lookSuggest` names them → items, for the "For this photo" row. */
+    val templates = listOf(
+        "auto" to "Auto", "airy" to "Bright & airy", "crisp" to "Crisp landscape", "golden" to "Golden", "moody" to "Moody",
+        "portrait" to "Portrait glow", "film" to "Film", "tealOrange" to "Teal & orange", "noir" to "Noir",
+    ).map { (id, label) -> template(label, id) }
+
+    fun templateFor(id: String): MenuItem? = templates.firstOrNull { it.fixed["style"] == id }
+
+    /** The Enhance tool: easy, photo-aware tools (PhotoCraft commands composed by `edit.look`). */
+    val enhance = listOf(
+        MenuGroup("Templates", templates),
+        MenuGroup(
+            "Essentials",
+            listOf(
+                look("Enhance", "enhance", 60f, extra = listOf(Slider("sky", "Sky", 0f, 100f, 0f))),
+                look("Sky", "sky", 60f),
+                look("Structure", "structure", 40f, min = -100f),
+                look("Details", "details", 40f),
+                look("Denoise", "denoise", 40f),
+                look("B&W", "bw", 100f),
+                look("Vignette", "vignette", 35f, min = -100f),
+            ),
+        ),
+        MenuGroup(
+            "Landscape",
+            listOf(
+                look("Golden hour", "goldenHour", 50f),
+                look("Foliage", "foliage", 50f),
+                look("Atmosphere", "atmosphere", 35f, min = -100f),
+                look("Sky replacement", "skyReplace", 85f, extra = listOf(Choice("style", "Sky", skies, "blue"))),
+                MenuItem(
+                    "Relight", "filter.render.relight", Kind.Pixels,
+                    listOf(Slider("intensity", "Light", 0f, 100f, 40f), Slider("angle", "Direction", -180f, 180f, 45f), Slider("elevation", "Height", 0f, 90f, 40f), Slider("warmth", "Warmth", -100f, 100f, 0f), Slider("ambient", "Ambient", 0f, 100f, 55f)),
+                ),
+            ),
+        ),
+        MenuGroup(
+            "Creative",
+            listOf(
+                look("Dramatic", "dramatic", 50f),
+                look("Glow", "glow", 40f),
+                look("Matte", "matte", 40f),
+                look("Toning", "toning", 50f, extra = listOf(Choice("style", "Colors", tonings, "tealOrange"))),
+                look("Film grain", "grain", 35f),
+            ),
+        ),
+        MenuGroup(
+            "Portrait",
+            listOf(
+                look("Smooth skin", "skin", 40f),
+                look("Face light", "faceLight", 50f),
+                look("Eyes", "eyes", 50f),
+                look("Red eye", "redEye", 60f),
+                look("Background blur", "bokeh", 50f),
+                MenuItem(
+                    "Face shape", "faceLiquify", Kind.Face,
+                    listOf(
+                        Slider("eyes", "Eye size", -100f, 100f, 0f),
+                        Slider("faceWidth", "Face width", -100f, 100f, 0f),
+                        Slider("chin", "Chin", -100f, 100f, 0f),
+                        Slider("forehead", "Forehead", -100f, 100f, 0f),
+                        Slider("nose", "Nose", -100f, 100f, 0f),
+                        Slider("mouth", "Mouth", -100f, 100f, 0f),
+                        Slider("smile", "Smile", -100f, 100f, 0f),
+                    ),
+                ),
+            ),
+        ),
+    )
+
     /** Light & color: one Camera Raw-style pass (PhotoCraft's `filter.cameraRaw`). */
     val light = MenuGroup(
         "Light & color",
