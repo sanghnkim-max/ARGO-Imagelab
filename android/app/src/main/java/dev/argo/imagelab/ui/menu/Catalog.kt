@@ -47,6 +47,8 @@ enum class Kind {
     Look,
     /** Face-aware liquify (`edit.faceLiquify`): sliders placed from the detected faces. */
     Face,
+    /** Change an existing adjustment layer (`layer.setAdjustment {layer, …}`); `fixed` holds the layer. */
+    AdjustmentEdit,
 }
 
 data class MenuItem(
@@ -59,6 +61,8 @@ data class MenuItem(
     val fixed: Map<String, Any> = emptyMap(),
     /** Preview while values change (false: only on Apply — slow or document-changing commands). */
     val live: Boolean = true,
+    /** Starting values by param key (re-editing); missing keys start at their defaults. */
+    val initial: Map<String, Any> = emptyMap(),
 )
 
 data class MenuGroup(val label: String, val items: List<MenuItem>)
@@ -110,6 +114,82 @@ private val gradients = listOf(
 )
 
 object Catalog {
+    /**
+     * An adjustment layer's catalog item turned into an editor for that layer: same controls,
+     * starting at the layer's current settings (`doc.inspect` `adjustment.params`), applied with
+     * `layer.setAdjustment`. Null when the kind has no item here.
+     */
+    fun editorFor(layer: Long, adjustment: kotlinx.serialization.json.JsonObject): MenuItem? {
+        val kind = (adjustment["kind"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return null
+        val params = adjustment["params"] as? kotlinx.serialization.json.JsonObject ?: kotlinx.serialization.json.JsonObject(emptyMap())
+        val item = (adjustmentLayers.items + light.items).firstOrNull { it.kind == Kind.AdjustmentLayer && it.command == kind } ?: return null
+        val initial = mutableMapOf<String, Any>()
+        item.params.forEach { p -> initialValue(p, params)?.let { initial[p.key] = it } }
+        return item.copy(label = "Edit ${item.label}", kind = Kind.AdjustmentEdit, fixed = item.fixed + ("layer" to layer), initial = initial)
+    }
+
+    private fun lookup(params: kotlinx.serialization.json.JsonObject, key: String): kotlinx.serialization.json.JsonElement? {
+        Regex("""^(\w+)\[(\d+)]$""").matchEntire(key)?.let { m ->
+            return (params[m.groupValues[1]] as? kotlinx.serialization.json.JsonArray)?.getOrNull(m.groupValues[2].toInt())
+        }
+        val dot = key.indexOf('.')
+        if (dot > 0) return (params[key.substring(0, dot)] as? kotlinx.serialization.json.JsonObject)?.get(key.substring(dot + 1))
+        return params[key]
+    }
+
+    private fun initialValue(p: Param, params: kotlinx.serialization.json.JsonObject): Any? {
+        if (p is CurveParam) {
+            fun curve(ch: String): Curve? = (params[ch] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { pt ->
+                val a = pt as? kotlinx.serialization.json.JsonArray ?: return@mapNotNull null
+                val i = (a.getOrNull(0) as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.toInt() ?: return@mapNotNull null
+                val o = (a.getOrNull(1) as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()?.toInt() ?: return@mapNotNull null
+                i to o
+            }?.takeIf { it.size >= 2 }
+            return CurveSet(CurveSet.CHANNELS.associate { (ch, _) -> ch to (curve(ch) ?: LINEAR) })
+        }
+        val v = lookup(params, p.key) ?: return null
+        val prim = v as? kotlinx.serialization.json.JsonPrimitive
+        return when (p) {
+            is Slider -> prim?.content?.toFloatOrNull()?.let { (it / p.sendScale).coerceIn(p.min, p.max) }
+            is Toggle -> prim?.content?.toBooleanStrictOrNull()
+            is ColorParam -> prim?.content
+            is Choice -> {
+                val s = if (prim != null && prim.isString) prim.content else "json:$v"
+                p.options.firstOrNull { (value, _) -> value == s || (value.startsWith("json:") && value.removePrefix("json:").replace(" ", "") == v.toString().replace(" ", "")) }?.first
+            }
+            is CurveParam -> null
+        }
+    }
+
+    /** Warp the active layer to a shape (`edit.transform.warp`); on a text layer it is Warp Text. */
+    val warp = MenuItem(
+        "Warp", "edit.transform.warp", Kind.Pixels,
+        listOf(
+            Choice("style", "Shape", listOf("arc" to "Arc", "arch" to "Arch", "bulge" to "Bulge", "flag" to "Flag", "wave" to "Wave", "fish" to "Fish", "rise" to "Rise", "fisheye" to "Fisheye", "inflate" to "Inflate", "squeeze" to "Squeeze", "twist" to "Twist", "shellUpper" to "Shell"), "arc"),
+            Slider("bend", "Bend %", -100f, 100f, 30f),
+            Slider("hDistort", "Horizontal %", -100f, 100f, 0f),
+            Slider("vDistort", "Vertical %", -100f, 100f, 0f),
+        ),
+    )
+
+    /** Stretch or squeeze the photo keeping what matters in shape (`edit.contentAwareScale`). */
+    val contentAwareScale = MenuItem(
+        "Content-aware scale", "edit.contentAwareScale", Kind.Pixels,
+        listOf(Slider("scaleX", "Width %", 30f, 150f, 80f), Slider("scaleY", "Height %", 30f, 150f, 100f), Slider("amount", "Content-aware %", 0f, 100f, 100f), Toggle("protectSkinTones", "Protect skin", true)),
+        live = false,
+    )
+
+    /** Replace a colour: tap the photo to sample it (`points`), then shift its hue, saturation, lightness. */
+    val replaceColor = MenuItem(
+        "Replace color", "image.adjustments.replaceColor", Kind.Pixels,
+        listOf(
+            Slider("hue", "Hue", -180f, 180f, 40f),
+            Slider("saturation", "Saturation", -100f, 100f, 0f),
+            Slider("lightness", "Lightness", -100f, 100f, 0f),
+            Slider("fuzziness", "Fuzziness", 0f, 200f, 40f),
+        ),
+    )
+
     /** Curves: a non-destructive Curves adjustment layer edited on a draggable curve. */
     val curves = MenuItem("Curves", "curves", Kind.AdjustmentLayer, listOf(CurveParam()))
 

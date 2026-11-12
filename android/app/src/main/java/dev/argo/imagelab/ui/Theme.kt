@@ -93,6 +93,9 @@ object Sym {
     @DrawableRes val grid = R.drawable.ic_sym_grid_view
     @DrawableRes val enhance = R.drawable.ic_sym_magic_button
     @DrawableRes val face = R.drawable.ic_sym_face_retouching_natural
+    @DrawableRes val history = R.drawable.ic_sym_history
+    @DrawableRes val compare = R.drawable.ic_sym_compare
+    @DrawableRes val transform = R.drawable.ic_sym_transform
 }
 
 @Composable

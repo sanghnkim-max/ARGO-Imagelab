@@ -95,7 +95,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         item = next
         values.clear()
         next.params.forEach { p ->
-            values[p.key] = when (p) {
+            values[p.key] = next.initial[p.key] ?: when (p) {
                 is Slider -> p.default
                 is Choice -> p.default
                 is Toggle -> p.default
@@ -222,6 +222,9 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
                 if (s?.integer == true && s.sendScale == 1f) JsonPrimitive(sent.roundToInt()) else JsonPrimitive(sent.toDouble())
             } else element(v)
         }
+        // Values set for keys that are not controls (a sampled colour's `points`).
+        val keys = item.params.map { it.key }.toSet()
+        values.forEach { (k, v) -> if (k !in keys) flat[k] = element(v) }
         return nest(flat)
     }
 
@@ -280,7 +283,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         val item = msg.item
         if (applied && revisionAfter != null && revision() == revisionAfter) {
             lab.io { it.call("doc.undo", "{}", "ui") }
-        } else if (!applied) {
+        } else if (!applied && item.kind != Kind.AdjustmentEdit) {
             // First run of this item: a selection becomes the mask (filters apply inside it,
             // adjustment layers take it as their layer mask).
             maskForNew()?.let { mask -> lab.io { it.call(Fn.SELECT_FROM_MASK, buildJsonObject { put("mask", mask) }.toString(), "ui") } }
@@ -290,6 +293,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
             Kind.AdjustmentLayer -> lab.io { it.call(Fn.EDIT_ADJUST, buildJsonObject { put("kind", item.command); put("params", p) }.toString(), "ui") }
             Kind.Look -> lab.io { it.call(Fn.EDIT_LOOK, buildJsonObject { put("look", item.command); p.forEach { (k, v) -> put(k, v) } }.toString(), "ui") }
             Kind.Face -> lab.io { it.call(Fn.EDIT_FACE_LIQUIFY, p.toString(), "ui") }
+            Kind.AdjustmentEdit -> lab.io { it.call(Fn.EDIT_RUN, buildJsonObject { put("id", "layer.setAdjustment"); put("params", p) }.toString(), "ui") }
             else -> lab.io { it.call(Fn.EDIT_RUN, buildJsonObject { put("id", item.command); put("params", p) }.toString(), "ui") }
         }
         r.exceptionOrNull()?.let { lab.showMessage(Lab.describe(it)) }

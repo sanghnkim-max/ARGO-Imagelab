@@ -14,6 +14,13 @@ object Fn {
 
     const val DOC_INSPECT = "doc.inspect"
     const val DOC_OPEN = "doc.open"
+    const val DOC_HISTORY = "doc.history"
+    const val DOC_HISTORY_GO = "doc.historyGo"
+    const val DOC_SNAPSHOT = "doc.snapshot"
+    const val DOC_RESTORE_SNAPSHOT = "doc.restoreSnapshot"
+    const val DOC_DELETE_SNAPSHOT = "doc.deleteSnapshot"
+    const val DOC_ORIGINAL = "doc.original"
+    const val DOC_EXPORT = "doc.export"
 
     /** `{id, params}`: one allowlisted PhotoCraft engine command. Masked edits load the mask as the selection first ([SELECT_FROM_MASK]). */
     const val EDIT_RUN = "edit.run"

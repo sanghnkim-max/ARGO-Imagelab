@@ -135,7 +135,8 @@ fn trim_layers(layers: &[Value], budget: &mut usize, depth: usize) -> Vec<Value>
         }
         *budget -= 1;
         let mut t = serde_json::Map::new();
-        for k in ["id", "name", "kind", "visible", "opacity", "blend", "hasMask", "bounds", "clipped", "selected"] {
+        // `adjustment` = {kind, params} as the adjustment commands take them (re-editing).
+        for k in ["id", "name", "kind", "visible", "opacity", "blend", "hasMask", "bounds", "clipped", "selected", "adjustment"] {
             if let Some(v) = l.get(k) {
                 t.insert(k.into(), v.clone());
             }
@@ -327,13 +328,69 @@ fn history(h: &Headless) -> ApiResult<Value> {
     let d = h.session.active().ok_or_else(|| ApiError::not_found("no open document"))?;
     let entries = d.history.entries();
     let skip = entries.len().saturating_sub(100);
+    // `states`: every History panel row (past, current, then redo), each with the `state`
+    // index `doc.historyGo` takes; `current` is the current row's index.
+    let current = d.history.past_len();
+    let mut states: Vec<Value> = entries.iter().enumerate().map(|(i, l)| json!({"state": i, "label": l, "redo": false})).collect();
+    states.extend(d.history.redo_labels().enumerate().map(|(i, l)| json!({"state": current + 1 + i, "label": l, "redo": true})));
+    let skip_states = states.len().saturating_sub(200);
     Ok(json!({
         "count": entries.len(),
         "entries": entries.into_iter().skip(skip).collect::<Vec<_>>(),
+        "states": states.into_iter().skip(skip_states).collect::<Vec<_>>(),
+        "current": current,
+        "snapshots": d.snapshots.iter().map(|s| json!({"id": s.id, "name": s.name})).collect::<Vec<_>>(),
         "canUndo": d.history.can_undo(),
         "canRedo": d.history.can_redo(),
         "revision": d.revision,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoParams {
+    state: usize,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SnapshotParams {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    snapshot: Option<Value>,
+}
+
+/// A History command the `edit.run` allowlist keeps out (panel commands), run for one purpose.
+fn history_cmd(ctx: &Ctx, id: &str, params: Value) -> ApiResult<Value> {
+    mutate(ctx, |h| {
+        let r = h.command_run(id, params)?;
+        let mut v = history(h)?;
+        v["result"] = r;
+        Ok(v)
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct OriginalParams {
+    #[serde(default)]
+    max_side: Option<u32>,
+}
+
+/// The document as it was at its oldest history state (the photo as opened, unless the
+/// history has dropped its oldest states), rendered into an image handle: before/after.
+fn original(ctx: &Ctx, p: OriginalParams) -> ApiResult<Value> {
+    let side = p.max_side.unwrap_or(1024).clamp(64, MAX_PREVIEW_SIDE);
+    let img = ctx.with_session(|h| {
+        let d = h.session.active().ok_or_else(|| ApiError::not_found("no open document"))?;
+        let doc = d.history.state(0);
+        let doc = doc.as_deref().unwrap_or(&d.doc);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| photocraft_compose::thumbnail(doc, side))).map_err(|_| ApiError::internal("rendering the original panicked"))
+    })?;
+    let (width, height) = (img.width, img.height);
+    let handle = ctx.shared.handles.put_image(ImageBuf::new(width, height, img.pixels)?)?;
+    Ok(json!({"image": handle.to_string(), "width": width, "height": height}))
 }
 
 fn step_history(ctx: &Ctx, p: UndoParams, id: &str) -> ApiResult<Value> {
@@ -425,7 +482,35 @@ pub fn register(r: &mut Registry) {
         .effects(Effects::Revertible)
         .typed(|ctx: &Ctx, p: UndoParams| step_history(ctx, p, "edit.redo"))
         .register();
-    r.function("doc", "history", "History of the active document {count, entries (last 100), canUndo, canRedo, revision}")
+    r.function("doc", "history", "History of the active document {count, entries (last 100), states (past, current, redo; each {state, label, redo}), current, snapshots [{id, name}], canUndo, canRedo, revision}")
         .typed(|ctx: &Ctx, _: Value| ctx.with_session(|h| history(h)))
+        .register();
+    r.function("doc", "historyGo", "Return the document to History row `state` (an index from doc.history `states`); later rows stay redoable")
+        .params(json!({"type":"object","required":["state"],"properties":{"state":{"type":"integer","minimum":0}}}))
+        .effects(Effects::Revertible)
+        .typed(|ctx: &Ctx, p: GoParams| history_cmd(ctx, "history.selectState", json!({"state": p.state})))
+        .register();
+    r.function("doc", "snapshot", "Keep a named snapshot of the document for this session (not a history step)")
+        .params(json!({"type":"object","properties":{"name":{"type":"string"}}}))
+        .typed(|ctx: &Ctx, p: SnapshotParams| {
+            let mut params = json!({});
+            if let Some(n) = p.name.filter(|n| !n.trim().is_empty()) {
+                params["name"] = json!(n.chars().take(64).collect::<String>());
+            }
+            history_cmd(ctx, "history.newSnapshot", params)
+        })
+        .register();
+    r.function("doc", "restoreSnapshot", "Return the document to snapshot `snapshot` (an id from doc.history), as a new history step")
+        .params(json!({"type":"object","required":["snapshot"],"properties":{"snapshot":{}}}))
+        .effects(Effects::Revertible)
+        .typed(|ctx: &Ctx, p: SnapshotParams| history_cmd(ctx, "history.selectSnapshot", json!({"snapshot": p.snapshot.unwrap_or(Value::Null)})))
+        .register();
+    r.function("doc", "deleteSnapshot", "Delete snapshot `snapshot` (the document is unchanged)")
+        .params(json!({"type":"object","required":["snapshot"],"properties":{"snapshot":{}}}))
+        .typed(|ctx: &Ctx, p: SnapshotParams| history_cmd(ctx, "history.deleteSnapshot", json!({"snapshot": p.snapshot.unwrap_or(Value::Null)})))
+        .register();
+    r.function("doc", "original", "Render the document as first opened (its oldest history state) to an image handle {image, width, height}: before/after")
+        .params(json!({"type":"object","properties":{"maxSide":{"type":"integer","minimum":64,"maximum":MAX_PREVIEW_SIDE,"default":1024}}}))
+        .typed(original)
         .register();
 }

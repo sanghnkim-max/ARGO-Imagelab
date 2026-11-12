@@ -261,7 +261,8 @@ Reference: a mobile layered editor — full-bleed canvas, chrome at the edges, o
   effects, tone curve, HSL hue/saturation/luminance, color grading, detail, vignette & grain;
   Shadows/Highlights, HDR toning); adjustment layers (Levels, Hue/Saturation, Vibrance, Color
   balance, Selective color, Channel mixer, Gradient map, Photo filter, Look, B&W, Posterize,
-  Threshold, Invert). **Curves**: a Curves adjustment layer edited on a draggable curve (RGB,
+  Threshold, Invert); color tools: Replace color (tap the photo to sample; `points`), Match color
+  (to another pixel layer, `sourceLayer`). **Curves**: a Curves adjustment layer edited on a draggable curve (RGB,
   red, green, blue; up to 19 points each; presets), drawn with the same natural cubic spline the
   engine applies (checked level by level), over the photo's histogram; a point is added only by
   touching the line, the end points move too, and dragging a middle point out of the box removes
@@ -274,9 +275,32 @@ Reference: a mobile layered editor — full-bleed canvas, chrome at the edges, o
   (`layer.removeBackground`), defringe, opacity / fill / blend.
 * **Crop & size**: aspect crops, rotate (90°, 180°), flip, straighten, Geometry (lens
   correction: perspective, distortion), image and canvas size.
-* **Retouch**: brushes painted on the canvas — Heal (`paint.spotHealing`), Remove
-  (`paint.remove`), Lighten/Darken (`paint.dodge`/`paint.burn`), Liquify Push/Bloat/Pinch/Restore
-  (`filter.liquify` strokes) — plus content-aware fill, denoise, and a shortcut to Face shape.
+* **Retouch**: brushes painted on the canvas. Repair: Heal (`paint.spotHealing`), Remove
+  (`paint.remove`), Clone / Heal from (`paint.cloneStamp` / `paint.healingBrush`: tap sets the
+  source, the first stroke sends `source`, later strokes the returned aligned `offset`), Patch
+  and Move (`paint.patch` content-aware / `paint.contentAwareMove`: drag the selection's content;
+  the selection is dropped after). Tone: Lighten/Darken (`paint.dodge`/`paint.burn`),
+  Saturate/Desaturate (`paint.sponge`), Blur, Sharpen, Smudge. Liquify Push/Bloat/Pinch/Restore
+  (`filter.liquify` strokes); content-aware fill, denoise, a shortcut to Face shape.
+* **Paint**: Brush, Mixer (`paint.mixerBrush`), Gradient (drag from → to, `paint.gradient`,
+  five styles, to a colour or transparent), Bucket (`paint.bucket`); symmetry
+  (`paint.setSymmetry`); "On layer mask" paints the active layer's mask (`target: "mask"`, white
+  shows / black hides, a mask added first if none) — with Gradient, a graduated mask.
+* **Transform**: flip/rotate the layer, Move & scale (`edit.transform`, live), Warp
+  (`edit.transform.warp` shapes), Content-aware scale, Perspective (drag a quad's four corners:
+  Crop to it = `image.perspectiveCrop`, Straighten = `edit.perspectiveWarp` to the quad's
+  rectangle), Puppet warp (tap pins, drag them: `edit.puppetWarp`), align to the canvas
+  (`layer.align.*`). A locked Background is made a layer first (`layer.new.layerFromBackground`).
+* **History**: every step (past, current, greyed redo) from `doc.history` `states`; a tap returns
+  there (`doc.historyGo` = `history.selectState`). Snapshots: `doc.snapshot`,
+  `doc.restoreSnapshot` (a new step), `doc.deleteSnapshot`.
+* **Before/after**: hold the compare button in the top bar to see `doc.original` (the oldest
+  history state, rendered to a handle) in place of the edit.
+* **Re-editing adjustments**: `doc.inspect` layers carry `adjustment {kind, params}`; Layers shows
+  "Edit <kind>" for an adjustment layer, the same controls starting at its settings, applied
+  with `layer.setAdjustment` (one "Modify Adjustment" step).
+* **Export**: format (JPEG, PNG, WebP, TIFF), quality, longest side (`doc.export`), copied to
+  Pictures/ImageLab.
 
 #### Looks (`edit.look`) and face liquify (`edit.faceLiquify`)
 

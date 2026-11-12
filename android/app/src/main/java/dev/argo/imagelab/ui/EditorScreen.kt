@@ -31,6 +31,12 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Slider
+import androidx.compose.material3.TextButton
+import kotlin.math.roundToInt
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -124,6 +130,7 @@ fun EditorScreen(
     }
     val sheet: @Composable (Modifier) -> Unit = { m -> vm.tool?.let { ToolSheet(it, state, vm, m) } }
 
+    if (vm.exportOpen) ExportDialog(vm)
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         val posture = layout.posture
         val density = LocalDensity.current
@@ -209,12 +216,61 @@ private fun EditorTopBar(state: EditorState, agentOpen: Boolean, vm: EditorViewM
             if (hasDoc) Text("${state.width}×${state.height}", style = MaterialTheme.typography.labelSmall, color = Color.Gray, maxLines = 1)
         }
         if (state.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+        if (hasDoc) CompareButton(vm)
         SymButton(Sym.undo, "Undo", { vm.undo() }, enabled = hasDoc)
         SymButton(Sym.redo, "Redo", { vm.redo() }, enabled = hasDoc)
-        SymButton(Sym.export, "Export", { vm.export() }, enabled = hasDoc)
+        SymButton(Sym.export, "Export", { vm.exportOpen = true }, enabled = hasDoc)
         SymButton(Sym.agent, if (agentOpen) "Hide agent" else "Agent", onToggleAgent, tint = if (agentOpen) Accent else null)
         SymButton(Sym.settings, "Settings", onSettings)
     }
+}
+
+/** Hold to see the photo as it was opened (before), let go for the edit (after). */
+@Composable
+private fun CompareButton(vm: EditorViewModel) {
+    Box(
+        Modifier.size(40.dp).pointerInput(Unit) {
+            detectTapGestures(onPress = {
+                vm.compare(true)
+                tryAwaitRelease()
+                vm.compare(false)
+            })
+        },
+        contentAlignment = Alignment.Center,
+    ) { SymIcon(Sym.compare, "Hold to compare with the original", tint = if (vm.comparing) Accent else MaterialTheme.colorScheme.onSurface) }
+}
+
+/** Export: format, quality and size, then save and add to the gallery. */
+@Composable
+private fun ExportDialog(vm: EditorViewModel) {
+    val spec = vm.exportSpec
+    AlertDialog(
+        onDismissRequest = { vm.exportOpen = false },
+        title = { Text("Export") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Format", style = MaterialTheme.typography.labelLarge)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("jpg" to "JPEG", "png" to "PNG", "webp" to "WebP", "tif" to "TIFF").forEach { (f, l) ->
+                        FilterChip(selected = spec.format == f, onClick = { vm.exportSpec = spec.copy(format = f) }, label = { Text(l) })
+                    }
+                }
+                if (spec.format == "jpg" || spec.format == "webp") {
+                    Text("Quality ${spec.quality}", style = MaterialTheme.typography.labelLarge)
+                    Slider(value = spec.quality.toFloat(), onValueChange = { vm.exportSpec = spec.copy(quality = it.roundToInt()) }, valueRange = 40f..100f)
+                }
+                Text("Size (longest side)", style = MaterialTheme.typography.labelLarge)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf<Pair<Int?, String>>(null to "Full", 4096 to "4096", 2048 to "2048", 1080 to "1080").forEach { (m, l) ->
+                        FilterChip(selected = spec.maxSide == m, onClick = { vm.exportSpec = spec.copy(maxSide = m) }, label = { Text(l) })
+                    }
+                }
+                Text(if (spec.format == "png" || spec.format == "tif") "Lossless; larger files." else "Saved flattened to Pictures/ImageLab.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            }
+        },
+        confirmButton = { Button(onClick = { vm.export() }) { Text("Export") } },
+        dismissButton = { TextButton(onClick = { vm.exportOpen = false }) { Text("Cancel") } },
+    )
 }
 
 // ── canvas ───────────────────────────────────────────────────────────────────────────────────
@@ -231,6 +287,8 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
     val retouchMode = vm.tool == Tool.Retouch && vm.retouchBrush != null
     val paintMode = vm.tool == Tool.Paint || retouchMode
     val textMode = vm.tool == Tool.Text
+    val handleMode = vm.tool == Tool.Transform && vm.handleMode != HandleMode.None
+    val sampleMode = vm.sampling
     // The stroke being painted (screen points) and its pressures.
     var stroke by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var box by remember { mutableStateOf(IntSize.Zero) }
@@ -256,6 +314,20 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
 
     fun toDoc(p: Offset): Offset? = toDocOrClamp(p, clamp = false)
 
+    /** Document px → screen (the inverse of [toDocOrClamp]). */
+    fun toScreen(d: Offset): Offset? {
+        val bmp = preview ?: return null
+        val c = Offset(box.width / 2f, box.height / 2f)
+        val fit = minOf((box.width - 2 * padPx) / bmp.width, (box.height - 2 * padPx) / bmp.height)
+        val dw = bmp.width * fit
+        val dh = bmp.height * fit
+        val docW = if (state.width > 0) state.width else bmp.width
+        val docH = if (state.height > 0) state.height else bmp.height
+        val u = Offset(c.x - dw / 2 + d.x / docW * dw, c.y - dh / 2 + d.y / docH * dh)
+        return c + (u - c) * vm.scale + vm.offset
+    }
+    val grabPx = with(LocalDensity.current) { 32.dp.toPx() }
+
     // A new document starts fitted, not at the last one's zoom and pan.
     LaunchedEffect(state.name, state.width, state.height) { vm.resetView() }
 
@@ -266,9 +338,37 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
             .clipToBounds()
             .background(CanvasBackground)
             .onSizeChanged { box = it }
-            .pointerInput(selectMode, paintMode, textMode, retouchMode) {
+            .pointerInput(selectMode, paintMode, textMode, retouchMode, handleMode, sampleMode) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    // Handles: drag the nearest one; in Pins, a tap elsewhere adds a pin.
+                    if (handleMode) {
+                        val idx = vm.handles.indices.minByOrNull { i -> toScreen(vm.handles[i].second)?.let { (it - down.position).getDistance() } ?: Float.MAX_VALUE }
+                        val near = idx != null && (toScreen(vm.handles[idx].second)?.let { (it - down.position).getDistance() } ?: Float.MAX_VALUE) <= grabPx
+                        var moved = false
+                        var multiTouch = false
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pressed = event.changes.filter { it.pressed }
+                            if (pressed.isEmpty()) break
+                            if (pressed.size >= 2) {
+                                multiTouch = true
+                                vm.scale = (vm.scale * event.calculateZoom()).coerceIn(0.5f, 12f)
+                                vm.offset += event.calculatePan()
+                            } else if (!multiTouch) {
+                                val ch = pressed[0]
+                                if ((ch.position - down.position).getDistance() > viewConfiguration.touchSlop) moved = true
+                                if (near && idx != null) {
+                                    toDocOrClamp(ch.position, clamp = true)?.let { d -> vm.handles[idx] = vm.handles[idx].first.let { src -> if (vm.handleMode == HandleMode.Quad) d to d else src to d } }
+                                } else if (moved) {
+                                    vm.offset += ch.position - ch.previousPosition
+                                }
+                            }
+                            event.changes.forEach { it.consume() }
+                        }
+                        if (!near && !moved && !multiTouch && vm.handleMode == HandleMode.Pins) toDoc(down.position)?.let { vm.handles += it to it }
+                        return@awaitEachGesture
+                    }
                     if (down.type == PointerType.Stylus) vm.stylusPressure = down.pressure
                     val start = down.position
                     val path = mutableListOf(start)
@@ -302,6 +402,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                                 }
                             } else {
                                 vm.offset += ch.position - ch.previousPosition
+                                if ((ch.position - start).getDistance() > viewConfiguration.touchSlop) dragged = true
                             }
                         }
                         event.changes.forEach { it.consume() }
@@ -313,6 +414,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                         stroke = emptyList()
                     }
                     if (textMode && !multi) toDoc(start)?.let { vm.textAt = it }
+                    if (sampleMode && !multi && !dragged) toDoc(start)?.let { vm.sampleAt(it.x, it.y) }
                     if (selectMode && !multi) {
                         if (dragged) {
                             val pts = if (vm.selectMode == SelectMode.Lasso) path else listOf(path.first(), path.last())
@@ -352,11 +454,12 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
             // Straightening rotates the frame inside the photo's own rectangle (clipped), so the
             // drag shows exactly what the crop will keep.
             Box(transform.graphicsLayer { clip = vm.straightener.active; shape = FitRect(preview.width, preview.height) }) {
+                val shown = if (vm.comparing) vm.before ?: preview else preview
                 Image(
-                    bitmap = preview.asImageBitmap(),
+                    bitmap = shown.asImageBitmap(),
                     contentDescription = "Document preview",
                     contentScale = ContentScale.Fit,
-                    colorFilter = vm.live.matrix?.let { androidx.compose.ui.graphics.ColorFilter.colorMatrix(it) },
+                    colorFilter = if (vm.comparing) null else vm.live.matrix?.let { androidx.compose.ui.graphics.ColorFilter.colorMatrix(it) },
                     modifier = Modifier.fillMaxSize().graphicsLayer {
                         rotationZ = vm.straightener.rotation
                         scaleX = vm.straightener.zoom
@@ -364,13 +467,18 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                     },
                 )
             }
-            vm.selection?.overlay?.let { ov ->
+            if (!vm.comparing) vm.selection?.overlay?.let { ov ->
                 Image(bitmap = ov.asImageBitmap(), contentDescription = "Selection mask", contentScale = ContentScale.Fit, modifier = transform)
             }
         }
         Canvas(Modifier.fillMaxSize()) {
             // The stroke being painted, at its on-screen width.
-            if (stroke.size >= 2) {
+            val lineTool = (vm.tool == Tool.Paint && (vm.paintMode == PaintMode.Gradient)) || (vm.tool == Tool.Retouch && vm.retouchBrush?.use == BrushUse.Drag)
+            if (stroke.size >= 2 && lineTool) {
+                drawLine(Accent, stroke.first(), stroke.last(), 3.dp.toPx())
+                drawCircle(Accent, 6.dp.toPx(), stroke.first())
+                drawCircle(Color.White, 6.dp.toPx(), stroke.last())
+            } else if (stroke.size >= 2) {
                 val bmp = preview
                 val fit = if (bmp != null && bmp.width > 0) minOf((size.width - 2 * padPx) / bmp.width, (size.height - 2 * padPx) / bmp.height) else 1f
                 val docW = if (state.width > 0) state.width.toFloat() else (bmp?.width ?: 1).toFloat()
@@ -414,7 +522,35 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                 while (y < size.height) { drawLine(Color.White.copy(alpha = 0.25f), Offset(0f, y), Offset(size.width, y), 1f); y += step }
             }
             hover?.let { drawCircle(Color.White.copy(alpha = 0.8f), radius = 14.dp.toPx(), center = it, style = Stroke(1.5.dp.toPx())) }
+            // Perspective quad / puppet pins.
+            if (vm.tool == Tool.Transform && vm.handleMode != HandleMode.None) {
+                val pts = vm.handles.mapNotNull { (src, dst) -> toScreen(dst)?.let { d -> toScreen(src) to d } }
+                if (vm.handleMode == HandleMode.Quad && pts.size == 4) {
+                    val path = androidx.compose.ui.graphics.Path().apply { moveTo(pts[0].second.x, pts[0].second.y); pts.drop(1).forEach { lineTo(it.second.x, it.second.y) }; close() }
+                    drawPath(path, Accent, style = Stroke(2.dp.toPx()))
+                    // Thirds inside the quad help line up verticals.
+                    for (t in listOf(1f / 3, 2f / 3)) {
+                        fun lerp(a: Offset, b: Offset) = a + (b - a) * t
+                        drawLine(Accent.copy(alpha = 0.5f), lerp(pts[0].second, pts[1].second), lerp(pts[3].second, pts[2].second), 1.dp.toPx())
+                        drawLine(Accent.copy(alpha = 0.5f), lerp(pts[0].second, pts[3].second), lerp(pts[1].second, pts[2].second), 1.dp.toPx())
+                    }
+                }
+                pts.forEach { (src, dst) ->
+                    if (vm.handleMode == HandleMode.Pins && src != null && (src - dst).getDistance() > 2f) drawLine(Color.White.copy(alpha = 0.7f), src, dst, 2.dp.toPx())
+                    drawCircle(Color.Black, 11.dp.toPx(), dst)
+                    drawCircle(if (vm.handleMode == HandleMode.Pins) Color(0xFFFFC94D) else Accent, 8.dp.toPx(), dst)
+                }
+            }
+            // Clone / Heal from: the source point.
+            if (vm.tool == Tool.Retouch && vm.retouchBrush?.use == BrushUse.Source) vm.cloneSource?.let { src ->
+                toScreen(src)?.let { c ->
+                    drawCircle(Color.White, 10.dp.toPx(), c, style = Stroke(2.dp.toPx()))
+                    drawLine(Color.White, c - Offset(16.dp.toPx(), 0f), c + Offset(16.dp.toPx(), 0f), 1.5.dp.toPx())
+                    drawLine(Color.White, c - Offset(0f, 16.dp.toPx()), c + Offset(0f, 16.dp.toPx()), 1.5.dp.toPx())
+                }
+            }
         }
+        if (vm.comparing) Text("Before", color = Color.White, modifier = Modifier.align(Alignment.TopStart).padding(12.dp).background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 4.dp))
         if (vm.selecting) CircularProgressIndicator(Modifier.align(Alignment.TopCenter).padding(12.dp).size(24.dp), strokeWidth = 2.dp)
     }
 }
@@ -542,7 +678,9 @@ private fun toolIcon(t: Tool) = when (t) {
     Tool.Retouch -> Sym.retouch
     Tool.Paint -> Sym.brush
     Tool.Text -> Sym.text
+    Tool.Transform -> Sym.transform
     Tool.Crop -> Sym.crop
+    Tool.History -> Sym.history
 }
 
 /** Nine tools: a horizontally scrolling bar on phones (more than a NavigationBar holds). */

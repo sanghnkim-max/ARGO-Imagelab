@@ -120,3 +120,15 @@ const f = await lab.fonts.list({});
 await lab.edit.run({id: "type.create", params: {x: 60, y: 200, text: "Hello", size: 96, font: f.installed[0]?.families[0], color: "#ffffff"}});
 ```
 `lab.fonts.install({path})` installs a TTF/OTF already in the workspace.
+
+### History, snapshots, before/after
+
+```js
+const h = await lab.doc.history({});        // {states: [{state, label, redo}], current, snapshots}
+await lab.doc.historyGo({ state: 0 });      // back to the photo as opened (later steps stay redoable)
+const s = await lab.doc.snapshot({ name: "Before grading" });
+await lab.doc.restoreSnapshot({ snapshot: s.snapshots.at(-1).id });
+const before = await lab.doc.original({ maxSide: 1024 });   // {image} of the photo as opened
+// Change an adjustment layer: doc.inspect layers carry {adjustment: {kind, params}}
+await lab.edit.run({ id: "layer.setAdjustment", params: { layer: 3, points: [[0,0],[128,150],[255,255]] } });
+```

@@ -51,6 +51,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import dev.argo.imagelab.ui.menu.layerBlendModes
 import dev.argo.imagelab.ui.menu.Choice
+import dev.argo.imagelab.ui.menu.Toggle
 import dev.argo.imagelab.ui.menu.Kind
 import dev.argo.imagelab.ui.menu.MenuItem
 import dev.argo.imagelab.ui.menu.MenuGroup
@@ -78,15 +79,21 @@ fun ToolSheet(tool: Tool, state: EditorState, vm: EditorViewModel, modifier: Mod
                 Tool.Layers -> LayersSheet(state, vm)
                 Tool.Select -> SelectSheet(vm)
                 Tool.Adjust -> {
+                    // Replace color starts from the photo's centre until a tap picks the colour.
+                    androidx.compose.runtime.LaunchedEffect(vm.sampling) {
+                        if (vm.sampling && vm.command.values["points"] == null) vm.sampleAt(state.width / 2f, state.height / 2f)
+                    }
                     AdjustSheet(vm)
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    CommandSheet(listOf(Catalog.light, Catalog.adjustmentLayers), vm.command)
+                    CommandSheet(listOf(Catalog.light, Catalog.adjustmentLayers, colorTools(state)), vm.command, note = if (vm.sampling) "Tap the photo on the colour to replace." else null)
                 }
                 Tool.Filters -> CommandSheet(Catalog.filters, vm.command, note = if (vm.selection != null) "Filters apply inside the selection." else "Filters change the active layer's pixels; the photo follows the sliders.")
                 Tool.Effects -> CommandSheet(listOf(Catalog.styles), vm.command, note = "Effects style the active layer (not the locked Background: duplicate it or use a text/shape layer).")
                 Tool.Retouch -> RetouchSheet(vm)
                 Tool.Paint -> PaintSheet(vm)
                 Tool.Text -> TextSheet(state, vm)
+                Tool.Transform -> TransformSheet(state, vm)
+                Tool.History -> HistorySheet(state, vm)
                 Tool.Crop -> {
                     CropSheet(vm)
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
@@ -150,6 +157,23 @@ private fun LayersSheet(state: EditorState, vm: EditorViewModel) {
         AssistChip(onClick = { vm.edit("layer.layerMask.apply") }, label = { Text("Apply mask") })
         AssistChip(onClick = { vm.edit("layer.layerMask.fromTransparency") }, label = { Text("Mask from transparency") })
     }
+    // An adjustment layer reopens with its own controls at its current settings.
+    // Kept while it is open, so the controls stay as the layer's settings change underneath.
+    val editing = vm.command.item?.kind == Kind.AdjustmentEdit
+    val editor = remember(active?.id, editing) {
+        val adj = active?.adjustment
+        if (editing) vm.command.item else if (active?.id != null && adj != null) Catalog.editorFor(active.id, adj) else null
+    }
+    if (editor != null) {
+        Text("Adjustment layer: tap to change its settings", style = MaterialTheme.typography.labelMedium, color = Accent)
+        CommandSheet(listOf(MenuGroup("Adjustment", listOf(editor))), vm.command)
+    }
+    Text("Align the active layer to the canvas (or the selection)", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+    ChipRow {
+        listOf("leftEdges" to "Left", "horizontalCenters" to "Center", "rightEdges" to "Right", "topEdges" to "Top", "verticalCenters" to "Middle", "bottomEdges" to "Bottom").forEach { (id, l) ->
+            AssistChip(onClick = { vm.edit("layer.align.$id") }, label = { Text(l) })
+        }
+    }
     if (active != null) {
         var name by remember(active.id) { mutableStateOf(active.name) }
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -180,17 +204,77 @@ private val paintSwatches = listOf("#ffffff", "#000000", "#e53935", "#fb8c00", "
 
 @Composable
 private fun PaintSheet(vm: EditorViewModel) {
-    Text("Draw on the photo with one finger (two fingers zoom). Pressure works with a stylus.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
     ChipRow {
-        FilterChip(selected = !vm.eraser, onClick = { vm.eraser = false }, label = { Text("Brush") }, leadingIcon = { SymIcon(Sym.brush, null, Modifier.size(18.dp)) })
-        FilterChip(selected = vm.eraser, onClick = { vm.eraser = true }, label = { Text("Eraser") }, leadingIcon = { SymIcon(Sym.erase, null, Modifier.size(18.dp)) })
-        FilterChip(selected = vm.paintOnNewLayer, onClick = { vm.paintOnNewLayer = !vm.paintOnNewLayer }, label = { Text("On a new layer") })
-        AssistChip(onClick = vm::newPaintLayer, label = { Text("Next layer") })
+        PaintMode.entries.forEach { m -> FilterChip(selected = vm.paintMode == m, onClick = { vm.paintMode = m }, label = { Text(m.label) }) }
     }
-    if (!vm.eraser) Swatches(paintSwatches, vm.paintColor) { vm.paintColor = it }
-    LabeledSlider("Size", vm.paintSize, 1f..300f, { vm.paintSize = it }) { "${it.roundToInt()} px" }
-    LabeledSlider("Opacity", vm.paintOpacity, 0.05f..1f, { vm.paintOpacity = it }) { "${(it * 100).roundToInt()}%" }
-    LabeledSlider("Hardness", vm.paintHardness, 0f..1f, { vm.paintHardness = it }) { "${(it * 100).roundToInt()}%" }
+    Text(
+        when (vm.paintMode) {
+            PaintMode.Brush -> "Draw with one finger (two fingers zoom). Pressure works with a stylus."
+            PaintMode.Mixer -> "Paint that blends with the colours already there, like wet paint."
+            PaintMode.Gradient -> "Drag across the photo: the gradient runs from where you start to where you lift."
+            PaintMode.Bucket -> "Tap an area to fill it (similar colours that touch)."
+        },
+        style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+    )
+    // Where paint goes: pixels, or the active layer's mask (white shows the layer, black hides it).
+    ChipRow {
+        FilterChip(selected = !vm.paintOnMask, onClick = { vm.paintOnMask = false }, label = { Text("On pixels") })
+        FilterChip(selected = vm.paintOnMask, onClick = { vm.paintOnMask = true }, label = { Text("On layer mask") })
+        if (!vm.paintOnMask && vm.paintMode != PaintMode.Bucket) FilterChip(selected = vm.paintOnNewLayer, onClick = { vm.paintOnNewLayer = !vm.paintOnNewLayer }, label = { Text("On a new layer") })
+        if (!vm.paintOnMask) AssistChip(onClick = vm::newPaintLayer, label = { Text("Next layer") })
+    }
+    if (vm.paintOnMask) {
+        Text("Paints the active layer's mask (one is added if it has none) — e.g. an adjustment layer, to limit where it applies.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        ChipRow {
+            FilterChip(selected = !vm.maskReveal, onClick = { vm.maskReveal = false }, label = { Text("Hide (black)") })
+            FilterChip(selected = vm.maskReveal, onClick = { vm.maskReveal = true }, label = { Text("Show (white)") })
+        }
+    } else {
+        if (vm.paintMode == PaintMode.Brush) ChipRow {
+            FilterChip(selected = !vm.eraser, onClick = { vm.eraser = false }, label = { Text("Brush") }, leadingIcon = { SymIcon(Sym.brush, null, Modifier.size(18.dp)) })
+            FilterChip(selected = vm.eraser, onClick = { vm.eraser = true }, label = { Text("Eraser") }, leadingIcon = { SymIcon(Sym.erase, null, Modifier.size(18.dp)) })
+        }
+        if (!vm.eraser || vm.paintMode != PaintMode.Brush) Swatches(paintSwatches, vm.paintColor) { vm.paintColor = it }
+    }
+    when (vm.paintMode) {
+        PaintMode.Gradient -> {
+            ChipRow {
+                listOf("linear" to "Linear", "radial" to "Radial", "reflected" to "Reflected", "angle" to "Angle", "diamond" to "Diamond").forEach { (v, l) ->
+                    FilterChip(selected = vm.gradientStyle == v, onClick = { vm.gradientStyle = v }, label = { Text(l) })
+                }
+            }
+            if (!vm.paintOnMask) {
+                Text("Ends in", style = MaterialTheme.typography.labelMedium)
+                ChipRow {
+                    FilterChip(selected = vm.gradientTo == "transparent", onClick = { vm.gradientTo = "transparent" }, label = { Text("Transparent") })
+                    paintSwatches.forEach { hex -> FilterChip(selected = vm.gradientTo == hex, onClick = { vm.gradientTo = hex }, label = { Box(Modifier.size(16.dp).background(Color(android.graphics.Color.parseColor(hex)), CircleShape)) }) }
+                }
+            }
+            LabeledSlider("Opacity", vm.paintOpacity, 0.05f..1f, { vm.paintOpacity = it }) { "${(it * 100).roundToInt()}%" }
+        }
+        PaintMode.Bucket -> {
+            LabeledSlider("Tolerance", vm.bucketTolerance, 0f..255f, { vm.bucketTolerance = it }) { it.roundToInt().toString() }
+            LabeledSlider("Opacity", vm.paintOpacity, 0.05f..1f, { vm.paintOpacity = it }) { "${(it * 100).roundToInt()}%" }
+        }
+        PaintMode.Mixer -> {
+            LabeledSlider("Size", vm.paintSize, 1f..300f, { vm.paintSize = it }) { "${it.roundToInt()} px" }
+            LabeledSlider("Wet", vm.mixerWet, 0f..100f, { vm.mixerWet = it }) { "${it.roundToInt()}%" }
+            LabeledSlider("Mix", vm.mixerMix, 0f..100f, { vm.mixerMix = it }) { "${it.roundToInt()}%" }
+        }
+        PaintMode.Brush -> {
+            LabeledSlider("Size", vm.paintSize, 1f..300f, { vm.paintSize = it }) { "${it.roundToInt()} px" }
+            LabeledSlider("Opacity", vm.paintOpacity, 0.05f..1f, { vm.paintOpacity = it }) { "${(it * 100).roundToInt()}%" }
+            LabeledSlider("Hardness", vm.paintHardness, 0f..1f, { vm.paintHardness = it }) { "${(it * 100).roundToInt()}%" }
+        }
+    }
+    if (vm.paintMode == PaintMode.Brush || vm.paintMode == PaintMode.Mixer) {
+        Text("Symmetry", style = MaterialTheme.typography.labelMedium)
+        ChipRow {
+            listOf<Pair<String?, String>>(null to "Off", "vertical" to "Mirror ↔", "horizontal" to "Mirror ↕", "dual" to "Four ways", "diagonal" to "Diagonal").forEach { (m, l) ->
+                FilterChip(selected = vm.symmetry == m, onClick = { vm.setSymmetryMode(m) }, label = { Text(l) })
+            }
+        }
+    }
 }
 
 // ── Text ─────────────────────────────────────────────────────────────────────────────────────
@@ -420,27 +504,41 @@ private fun AdjustSheet(vm: EditorViewModel) {
 
 @Composable
 private fun RetouchSheet(vm: EditorViewModel) {
+    val b = vm.retouchBrush
     Text(
-        if (vm.retouchBrush == null) "Pick a brush, then paint on the photo (two fingers zoom). Or use the selection tools below."
-        else "Paint over what to fix with one finger; two fingers zoom and pan.",
+        when (b?.use) {
+            null -> "Pick a brush, then paint on the photo (two fingers zoom). Or use the selection tools below."
+            BrushUse.Source -> if (vm.cloneSource == null || vm.settingSource) "Tap where to copy from (the source), then paint where it should go." else "Paint where the copy should go; the source follows your strokes."
+            BrushUse.Drag -> if (vm.selection == null) "Select the area first (Select tool), then come back and drag." else "Drag from the selection to " + (if (b == RetouchBrush.Patch) "a clean area to patch it from." else "where it should move; the gap is filled.")
+            BrushUse.Stroke -> "Paint over what to fix with one finger; two fingers zoom and pan."
+        },
         style = MaterialTheme.typography.bodySmall, color = Color.Gray,
     )
-    ChipRow {
-        RetouchBrush.entries.filter { it.liquify == null }.forEach { b ->
-            FilterChip(selected = vm.retouchBrush == b, onClick = { vm.retouchBrush = if (vm.retouchBrush == b) null else b }, label = { Text(b.label) })
+    fun pick(x: RetouchBrush) { vm.retouchBrush = if (vm.retouchBrush == x) null else x; vm.settingSource = false }
+    listOf("Repair", "Tone").forEach { g ->
+        Text(g, style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 4.dp))
+        ChipRow {
+            RetouchBrush.entries.filter { it.liquify == null && it.group == g }.forEach { x ->
+                FilterChip(selected = b == x, onClick = { pick(x) }, label = { Text(x.label) })
+            }
         }
     }
     Text("Liquify", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 4.dp))
     ChipRow {
-        RetouchBrush.entries.filter { it.liquify != null }.forEach { b ->
-            FilterChip(selected = vm.retouchBrush == b, onClick = { vm.retouchBrush = if (vm.retouchBrush == b) null else b }, label = { Text(b.label) })
+        RetouchBrush.entries.filter { it.liquify != null }.forEach { x ->
+            FilterChip(selected = b == x, onClick = { pick(x) }, label = { Text(x.label) })
         }
         AssistChip(onClick = { vm.tool = Tool.Enhance; vm.command.open(Catalog.enhance.last().items.last()) }, label = { Text("Face shape") }, leadingIcon = { SymIcon(Sym.face, null, Modifier.size(18.dp)) })
     }
-    if (vm.retouchBrush != null) {
+    if (b?.use == BrushUse.Source) {
+        ChipRow {
+            FilterChip(selected = vm.settingSource, onClick = { vm.settingSource = !vm.settingSource }, label = { Text(if (vm.cloneSource == null) "Tap to set source" else "Set a new source") })
+        }
+    }
+    if (b != null && b.use != BrushUse.Drag) {
         LabeledSlider("Size", vm.retouchSize, 5f..600f, { vm.retouchSize = it }) { "${it.roundToInt()} px" }
-        if (vm.retouchBrush != RetouchBrush.Heal && vm.retouchBrush != RetouchBrush.Remove) {
-            LabeledSlider("Strength", vm.retouchStrength, 0.05f..1f, { vm.retouchStrength = it }) { "${(it * 100).roundToInt()}%" }
+        if (b != RetouchBrush.Heal && b != RetouchBrush.Remove) {
+            LabeledSlider(if (b.use == BrushUse.Source) "Opacity" else "Strength", vm.retouchStrength, 0.05f..1f, { vm.retouchStrength = it }) { "${(it * 100).roundToInt()}%" }
         }
     }
     HorizontalDivider(Modifier.padding(vertical = 6.dp))
@@ -454,6 +552,132 @@ private fun RetouchSheet(vm: EditorViewModel) {
     if (vm.stylusPressure > 0f) {
         Text("Stylus pressure ${(vm.stylusPressure * 100).roundToInt()}% shapes each stroke.", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
     }
+}
+
+// ── Transform ────────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun TransformSheet(state: EditorState, vm: EditorViewModel) {
+    val active = state.layers.firstOrNull { it.id != null && it.id == state.activeLayer }
+    val isBackground = active?.name == "Background" && active.kind.equals("Pixel", true)
+    if (isBackground) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("The Background is locked in place. Make it a layer to move, scale or warp it.", style = MaterialTheme.typography.bodySmall, color = Color.Gray, modifier = Modifier.weight(1f))
+            TextButton(onClick = vm::makeMovable) { Text("Make movable") }
+        }
+    }
+    ChipRow {
+        AssistChip(onClick = { vm.edit("edit.transform.flipHorizontal") }, label = { Text("Flip ↔") })
+        AssistChip(onClick = { vm.edit("edit.transform.flipVertical") }, label = { Text("Flip ↕") })
+        AssistChip(onClick = { vm.edit("edit.transform.rotate90Ccw") }, label = { Text("Rotate left") })
+        AssistChip(onClick = { vm.edit("edit.transform.rotate90Cw") }, label = { Text("Rotate right") })
+    }
+    // Free transform of the active layer, live; ranges follow the document's size.
+    val w = state.width.coerceAtLeast(1).toFloat()
+    val h = state.height.coerceAtLeast(1).toFloat()
+    val free = remember(state.width, state.height) {
+        MenuItem(
+            "Move & scale", "edit.transform", Kind.Pixels,
+            listOf(
+                MSlider("dx", "Move ↔ px", -w, w, 0f),
+                MSlider("dy", "Move ↕ px", -h, h, 0f),
+                MSlider("scaleX", "Width %", 10f, 300f, 100f),
+                MSlider("scaleY", "Height %", 10f, 300f, 100f),
+                MSlider("rotate", "Rotate °", -180f, 180f, 0f, integer = false),
+            ),
+        )
+    }
+    CommandSheet(listOf(MenuGroup("Shape", listOf(free, Catalog.warp, Catalog.contentAwareScale))), vm.command, note = "Move & scale and Warp change the active layer; Content-aware scale keeps people and key shapes intact.")
+    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+    Text("Perspective & puppet", style = MaterialTheme.typography.labelLarge)
+    when (vm.handleMode) {
+        HandleMode.None -> ChipRow {
+            AssistChip(onClick = vm::startQuad, label = { Text("Perspective") })
+            AssistChip(onClick = vm::startPins, label = { Text("Puppet warp") })
+        }
+        HandleMode.Quad -> {
+            Text("Drag the four corners onto something that should be rectangular (a building, a page, a screen).", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = vm::applyPerspectiveCrop) { Text("Crop to it") }
+                OutlinedButton(onClick = vm::applyPerspectiveStraighten) { Text("Straighten") }
+                TextButton(onClick = vm::cancelHandles) { Text("Cancel") }
+            }
+        }
+        HandleMode.Pins -> {
+            Text("Tap to place pins on the layer (${vm.handles.size}), then drag pins to bend it; pins you leave hold their part still.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = vm::applyPuppet, enabled = vm.handles.size >= 2) { Text("Apply") }
+                TextButton(onClick = { vm.startPins() }) { Text("Clear pins") }
+                TextButton(onClick = vm::cancelHandles) { Text("Cancel") }
+            }
+        }
+    }
+    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+    Text("Align to the canvas", style = MaterialTheme.typography.labelLarge)
+    ChipRow {
+        listOf("leftEdges" to "Left", "horizontalCenters" to "Center", "rightEdges" to "Right", "topEdges" to "Top", "verticalCenters" to "Middle", "bottomEdges" to "Bottom").forEach { (id, l) ->
+            AssistChip(onClick = { vm.edit("layer.align.$id") }, label = { Text(l) })
+        }
+    }
+}
+
+// ── History ──────────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun HistorySheet(state: EditorState, vm: EditorViewModel) {
+    androidx.compose.runtime.LaunchedEffect(state.version) { vm.refreshHistory() }
+    val h = vm.history
+    val states = (h?.get("states") as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull { it as? kotlinx.serialization.json.JsonObject }
+    val current = (h?.get("current") as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: -1
+    Text("Tap a step to go back to it; later steps stay until you make a new change.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+    Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState())) {
+        states.asReversed().forEach { st ->
+            val i = (st["state"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: return@forEach
+            val label = (st["label"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "Step"
+            val redo = (st["redo"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "true"
+            Row(
+                Modifier.fillMaxWidth().background(if (i == current) Accent.copy(alpha = 0.25f) else Color.Transparent).clickable(enabled = i != current) { vm.historyGo(i) }.padding(horizontal = 8.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SymIcon(if (i == current) Sym.check else Sym.history, null, Modifier.size(16.dp), tint = if (redo) Color.Gray else MaterialTheme.colorScheme.onSurface)
+                Text("  $label", color = if (redo) Color.Gray else MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+    HorizontalDivider(Modifier.padding(vertical = 6.dp))
+    Text("Snapshots", style = MaterialTheme.typography.labelLarge)
+    var name by rememberSaveable { mutableStateOf("") }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedTextField(name, { name = it }, singleLine = true, placeholder = { Text("Name (optional)") }, modifier = Modifier.weight(1f))
+        TextButton(onClick = { vm.snapshot(name); name = "" }) { Text("Keep snapshot") }
+    }
+    val snaps = (h?.get("snapshots") as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull { it as? kotlinx.serialization.json.JsonObject }
+    if (snaps.isEmpty()) Text("A snapshot keeps the photo as it is now, to come back to later in this session.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+    snaps.forEach { sn ->
+        val id = sn["id"] ?: return@forEach
+        val label = (sn["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "Snapshot"
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+            TextButton(onClick = { vm.restoreSnapshot(id) }) { Text("Restore") }
+            SymButton(Sym.delete, "Delete $label", { vm.deleteSnapshot(id) })
+        }
+    }
+}
+
+/** Colour tools (Replace color, Match color); Match color needs another pixel layer to match. */
+private fun colorTools(state: EditorState): MenuGroup {
+    val others = state.layers.filter { it.id != null && it.id != state.activeLayer && it.kind.equals("Pixel", true) }
+    val match = if (others.isEmpty()) null else MenuItem(
+        "Match color", "image.adjustments.matchColor", Kind.Pixels,
+        listOf(
+            Choice("sourceLayer", "Match the colours of", others.map { "json:${it.id}" to it.name }, "json:${others.first().id}"),
+            MSlider("luminance", "Luminance", 1f, 200f, 100f),
+            MSlider("intensity", "Color intensity", 1f, 200f, 100f),
+            MSlider("fade", "Fade", 0f, 100f, 0f),
+            Toggle("neutralize", "Neutralize", false),
+        ),
+    )
+    return MenuGroup("Color tools", listOfNotNull(Catalog.replaceColor, match))
 }
 
 // ── Crop ─────────────────────────────────────────────────────────────────────────────────────

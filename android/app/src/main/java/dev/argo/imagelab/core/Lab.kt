@@ -32,7 +32,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 
 /** One layer as `doc.inspect` describes it (top first). */
-data class LayerInfo(val id: Long?, val name: String, val kind: String, val visible: Boolean, val hasMask: Boolean)
+/** One layer; [adjustment] is `{kind, params}` for an adjustment layer (re-editing it). */
+data class LayerInfo(val id: Long?, val name: String, val kind: String, val visible: Boolean, val hasMask: Boolean, val adjustment: JsonObject? = null)
 
 /** What the editor shows. `version` changes whenever the document may have changed. */
 data class EditorState(
@@ -138,6 +139,12 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
         true
     }
 
+    /** An image handle as a bitmap (not shown). */
+    suspend fun handleBitmap(handle: String): Bitmap? = withContext(Dispatchers.IO) {
+        val api = runCatching { apiDeferred.await() }.getOrNull() ?: return@withContext null
+        runCatching { api.handleRgba(handle) }.getOrNull()?.toBitmap()
+    }
+
     private fun RgbaFrame.toBitmap(): Bitmap? = runCatching {
         Bitmap.createBitmap(width.toInt(), height.toInt(), Bitmap.Config.ARGB_8888).apply {
             copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
@@ -215,6 +222,7 @@ class Lab(createApi: () -> LabApi, private val scope: CoroutineScope) {
                 kind = l.string("kind") ?: "pixel",
                 visible = (l["visible"] as? JsonPrimitive)?.booleanOrNull ?: true,
                 hasMask = (l["hasMask"] as? JsonPrimitive)?.booleanOrNull ?: false,
+                adjustment = l["adjustment"] as? JsonObject,
             )
         }
 

@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import dev.argo.imagelab.core.Lab
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.compose.runtime.getValue
@@ -35,12 +36,28 @@ import kotlin.math.roundToInt
 /** How a tap or drag on the canvas selects (Select tool). */
 enum class SelectMode(val label: String) { Object("Object"), Box("Box"), Rect("Rectangle"), Ellipse("Ellipse"), Lasso("Lasso"), Wand("Magic wand"), Color("Color") }
 
-/** Retouch brushes: a drag on the canvas is one stroke of the chosen engine tool. */
-enum class RetouchBrush(val label: String, val command: String, val liquify: String? = null) {
+/** How a retouch brush uses the canvas. */
+enum class BrushUse { Stroke, Source, Drag }
+
+/**
+ * Retouch brushes: a drag on the canvas is one stroke of the chosen engine tool. [BrushUse.Source]
+ * brushes copy from a source point (tap to set it); [BrushUse.Drag] tools move the selection's
+ * content by the drag.
+ */
+enum class RetouchBrush(val label: String, val command: String, val liquify: String? = null, val use: BrushUse = BrushUse.Stroke, val group: String = "Repair") {
     Heal("Heal", "paint.spotHealing"),
     Remove("Remove", "paint.remove"),
-    Dodge("Lighten", "paint.dodge"),
-    Burn("Darken", "paint.burn"),
+    Clone("Clone", "paint.cloneStamp", use = BrushUse.Source),
+    HealFrom("Heal from", "paint.healingBrush", use = BrushUse.Source),
+    Patch("Patch", "paint.patch", use = BrushUse.Drag),
+    Move("Move", "paint.contentAwareMove", use = BrushUse.Drag),
+    Dodge("Lighten", "paint.dodge", group = "Tone"),
+    Burn("Darken", "paint.burn", group = "Tone"),
+    Saturate("Saturate", "paint.sponge", group = "Tone"),
+    Desaturate("Desaturate", "paint.sponge", group = "Tone"),
+    Soften("Blur", "paint.blur", group = "Tone"),
+    Crisp("Sharpen", "paint.sharpen", group = "Tone"),
+    Smudge("Smudge", "paint.smudge", group = "Tone"),
     Warp("Push", "filter.liquify", "forwardWarp"),
     Bloat("Bloat", "filter.liquify", "bloat"),
     Pucker("Pinch", "filter.liquify", "pucker"),
@@ -52,8 +69,17 @@ enum class Combine(val label: String) { New("New"), Add("Add"), Subtract("Subtra
 
 enum class Tool(val label: String) {
     Enhance("Enhance"), Layers("Layers"), Select("Select"), Adjust("Adjust"), Filters("Filters"), Effects("Effects"),
-    Retouch("Retouch"), Paint("Paint"), Text("Text"), Crop("Crop & size"),
+    Retouch("Retouch"), Paint("Paint"), Text("Text"), Transform("Transform"), Crop("Crop & size"), History("History"),
 }
+
+/** What a Paint drag does. */
+enum class PaintMode(val label: String) { Brush("Brush"), Mixer("Mixer"), Gradient("Gradient"), Bucket("Bucket") }
+
+/** On-canvas handles: four corners of a quad (perspective) or puppet pins. */
+enum class HandleMode { None, Quad, Pins }
+
+/** Export settings: format, quality and the longest side (null = full size). */
+data class ExportSpec(val format: String = "jpg", val quality: Int = 92, val maxSide: Int? = null)
 
 /**
  * The current selection: a registry mask handle (`mask:N`, from `segment.*`/`select.*`) with
@@ -96,7 +122,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         if (tool == Tool.Select) onSelectOpened()
         if (tool == Tool.Text) refreshFonts()
         if (tool == Tool.Enhance) suggest()
+        if (tool == Tool.History) refreshHistory()
         if (tool != Tool.Retouch) retouchBrush = null
+        if (tool != Tool.Transform) handleMode = HandleMode.None
     }
 
     // ── enhance ──────────────────────────────────────────────────────────────────────────
@@ -127,6 +155,17 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun retouchStroke(points: List<Triple<Float, Float, Float>>) {
         val brush = retouchBrush ?: return
         if (points.isEmpty()) return
+        when (brush.use) {
+            BrushUse.Source -> if (settingSource || cloneSource == null || points.size == 1) {
+                cloneSource = Offset(points[0].first, points[0].second)
+                cloneOffset = null
+                settingSource = false
+                lab.showMessage("Source set: now paint where it should go.")
+                return
+            }
+            BrushUse.Drag -> return dragSelection(brush, points.first(), points.last())
+            BrushUse.Stroke -> {}
+        }
         val pts = JsonArray(points.map { (x, y, p) -> JsonArray(listOf(JsonPrimitive(x.roundToInt()), JsonPrimitive(y.roundToInt()), JsonPrimitive(p.coerceIn(0.05f, 1f).toDouble()))) })
         val strength = (retouchStrength * 100).roundToInt().coerceIn(1, 100)
         val params = buildJsonObject {
@@ -142,13 +181,54 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 when (brush) {
                     RetouchBrush.Heal -> { put("hardness", 50); put("type", "contentAware") }
                     RetouchBrush.Remove -> put("hardness", 50)
+                    RetouchBrush.Clone, RetouchBrush.HealFrom -> {
+                        put("hardness", 50); put("aligned", true); put("opacity", strength)
+                        val off = cloneOffset
+                        val src = cloneSource
+                        if (off != null) putJsonArray("offset") { add(JsonPrimitive(off.x.roundToInt())); add(JsonPrimitive(off.y.roundToInt())) }
+                        else if (src != null) putJsonArray("source") { add(JsonPrimitive(src.x.roundToInt())); add(JsonPrimitive(src.y.roundToInt())) }
+                    }
+                    RetouchBrush.Saturate, RetouchBrush.Desaturate -> { put("mode", if (brush == RetouchBrush.Saturate) "saturate" else "desaturate"); put("flow", strength); put("hardness", 0) }
+                    RetouchBrush.Soften, RetouchBrush.Crisp, RetouchBrush.Smudge -> { put("strength", strength); put("hardness", 0) }
                     else -> { put("exposure", strength); put("range", "midtones"); put("hardness", 0) }
                 }
             }
         }
         viewModelScope.launch {
             lab.markInteractive()
-            lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", brush.command); put("params", params) }.toString())
+            val r = lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", brush.command); put("params", params) }.toString()).getOrNull() as? JsonObject
+            // Aligned cloning: later strokes keep the first stroke's offset to the source.
+            val off = r?.get("offset") as? JsonArray
+            if (brush.use == BrushUse.Source && off != null && off.size == 2) {
+                cloneOffset = Offset((off[0] as JsonPrimitive).content.toFloat(), (off[1] as JsonPrimitive).content.toFloat())
+            }
+        }
+    }
+
+    /** Clone / Heal from: where pixels are copied from (document px); the next tap sets it while [settingSource]. */
+    var cloneSource by mutableStateOf<Offset?>(null)
+    private var cloneOffset: Offset? = null
+    var settingSource by mutableStateOf(false)
+
+    /** Patch / Move: drag the selection's content from [a] to [b] (content-aware). */
+    private fun dragSelection(brush: RetouchBrush, a: Triple<Float, Float, Float>, b: Triple<Float, Float, Float>) {
+        val sel = selection ?: return lab.showMessage("Select the area first (Select tool), then drag it here.")
+        val dx = (b.first - a.first).roundToInt()
+        val dy = (b.second - a.second).roundToInt()
+        if (dx == 0 && dy == 0) return lab.showMessage("Drag from the selection to where it should go.")
+        viewModelScope.launch {
+            lab.markInteractive()
+            val params = if (brush == RetouchBrush.Patch) {
+                // Patch: fill the selection with the content found where it was dragged to.
+                """{"offset":[$dx,$dy],"contentAware":true}"""
+            } else {
+                """{"offset":[$dx,$dy],"mode":"move"}"""
+            }
+            val r = editNow(brush.command, params, sel.mask)
+            // The engine moved (or used up) the selection; the mask handle no longer matches it.
+            selection = null
+            editNow("select.deselect", "{}", null)
+            if (r.isSuccess) lab.showMessage(if (brush == RetouchBrush.Patch) "Patched from the dragged-to area." else "Moved; the gap was filled.")
         }
     }
 
@@ -279,17 +359,26 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun addSolidFill() = edit("layer.newFillLayer.solidColor", """{"color":"#3D7BF5"}""", masked = true)
     fun addGradientFill() = edit("layer.newFillLayer.gradient", """{"from":"#000000","to":"#ffffff","angle":90}""", masked = true)
 
-    /** Save at full size into exports/ and hand a copy to the gallery (Pictures/ImageLab). */
+    /** Save into exports/ with [exportSpec] (format, quality, size) and hand a copy to the gallery (Pictures/ImageLab). */
     fun export() = viewModelScope.launch {
+        exportOpen = false
+        val spec = exportSpec
         val stamp = System.currentTimeMillis()
-        val rel = "exports/imagelab-$stamp.jpg"
-        val saved = lab.call(refreshAfter = false) { it.save(rel, null) }
+        val ext = spec.format
+        val rel = "exports/imagelab-$stamp.$ext"
+        val body = buildJsonObject {
+            put("path", rel); put("format", ext)
+            if (ext == "jpg" || ext == "webp") put("quality", spec.quality)
+            spec.maxSide?.let { put("maxSide", it) }
+        }
+        val saved = lab.fn(Fn.DOC_EXPORT, body.toString(), refreshAfter = false)
         if (saved.isFailure) return@launch
+        val mime = when (ext) { "png" -> "image/png"; "webp" -> "image/webp"; "tif" -> "image/tiff"; else -> "image/jpeg" }
         val copied = withContext(Dispatchers.IO) {
             runCatching {
                 val values = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, "imagelab-$stamp.jpg")
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.Images.Media.DISPLAY_NAME, "imagelab-$stamp.$ext")
+                    put(MediaStore.Images.Media.MIME_TYPE, mime)
                     put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ImageLab")
                 }
                 val resolver = app.contentResolver
@@ -568,24 +657,78 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     var paintOnNewLayer by mutableStateOf(true)
     private var paintLayerMade = false
 
+    var paintMode by mutableStateOf(PaintMode.Brush)
+    /** Paint on the active layer's mask (white reveals, black hides) instead of pixels. */
+    var paintOnMask by mutableStateOf(false)
+    var maskReveal by mutableStateOf(false)
+    var gradientTo by mutableStateOf("transparent")
+    var gradientStyle by mutableStateOf("linear")
+    var bucketTolerance by mutableFloatStateOf(32f)
+    var mixerWet by mutableFloatStateOf(50f)
+    var mixerMix by mutableFloatStateOf(50f)
+    var symmetry by mutableStateOf<String?>(null)
+        private set
+
+    fun setSymmetryMode(mode: String?) {
+        symmetry = mode
+        if (mode == null) edit("paint.symmetryDisable") else edit("paint.setSymmetry", """{"mode":"$mode"}""")
+    }
+
+    private fun maskColor() = if (maskReveal) "#ffffff" else "#000000"
+
+    /** A mask to paint on: the active layer's, added (white) first when it has none. */
+    private suspend fun ensureMask(): Boolean {
+        val st = lab.state.value
+        val active = st.layers.firstOrNull { it.id == st.activeLayer }
+        if (active?.hasMask == true) return true
+        return lab.fn(Fn.EDIT_RUN, """{"id":"layer.layerMask.revealAll","params":{}}""", refreshAfter = false).isSuccess
+    }
+
     /** One stroke in document pixels: [x, y, pressure]. */
     fun paintStroke(points: List<Triple<Float, Float, Float>>) {
         if (points.isEmpty()) return
         viewModelScope.launch {
-            if (paintOnNewLayer && !eraser && !paintLayerMade) {
+            if (paintOnMask) {
+                if (!ensureMask()) return@launch
+            } else if (paintOnNewLayer && !eraser && !paintLayerMade && paintMode != PaintMode.Bucket) {
                 lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "layer.new.layer"); put("params", buildJsonObject { put("name", "Paint") }) }.toString(), refreshAfter = false)
                 paintLayerMade = true
             }
-            val params = buildJsonObject {
-                putJsonArray("points") { points.forEach { (x, y, p) -> add(JsonArray(listOf(JsonPrimitive(x.roundToInt()), JsonPrimitive(y.roundToInt()), JsonPrimitive(p.coerceIn(0.05f, 1f).toDouble())))) } }
-                put("size", paintSize.toDouble())
-                put("opacity", paintOpacity.toDouble())
-                put("hardness", paintHardness.toDouble())
-                put("color", paintColor)
-                if (eraser) put("erase", true)
+            val color = if (paintOnMask) maskColor() else paintColor
+            val (a, b) = points.first() to points.last()
+            val (id, params) = when (paintMode) {
+                PaintMode.Gradient -> "paint.gradient" to buildJsonObject {
+                    putJsonArray("from") { add(JsonPrimitive(a.first.roundToInt())); add(JsonPrimitive(a.second.roundToInt())) }
+                    putJsonArray("to") { add(JsonPrimitive(b.first.roundToInt())); add(JsonPrimitive(b.second.roundToInt())) }
+                    put("style", gradientStyle)
+                    val end = if (paintOnMask) (if (maskReveal) "#000000" else "#ffffff") else if (gradientTo == "transparent") color else gradientTo
+                    putJsonArray("stops") { add(JsonArray(listOf(JsonPrimitive(0), JsonPrimitive(color)))); add(JsonArray(listOf(JsonPrimitive(1), JsonPrimitive(end)))) }
+                    if (!paintOnMask && gradientTo == "transparent") putJsonArray("transparency") { add(JsonArray(listOf(JsonPrimitive(0), JsonPrimitive(100)))); add(JsonArray(listOf(JsonPrimitive(1), JsonPrimitive(0)))) }
+                    put("opacity", (paintOpacity * 100).roundToInt().coerceIn(1, 100))
+                }
+                PaintMode.Bucket -> "paint.bucket" to buildJsonObject {
+                    put("x", a.first.roundToInt()); put("y", a.second.roundToInt())
+                    put("tolerance", bucketTolerance.roundToInt()); put("color", color)
+                    put("opacity", (paintOpacity * 100).roundToInt().coerceIn(1, 100))
+                    put("sampleAllLayers", true)
+                }
+                PaintMode.Mixer -> "paint.mixerBrush" to buildJsonObject {
+                    putJsonArray("points") { points.forEach { (x, y, p) -> add(JsonArray(listOf(JsonPrimitive(x.roundToInt()), JsonPrimitive(y.roundToInt()), JsonPrimitive(p.coerceIn(0.05f, 1f).toDouble())))) } }
+                    put("size", paintSize.toDouble()); put("wet", mixerWet.roundToInt()); put("mix", mixerMix.roundToInt()); put("color", color)
+                    put("sampleAllLayers", true)
+                }
+                PaintMode.Brush -> "paint.stroke" to buildJsonObject {
+                    putJsonArray("points") { points.forEach { (x, y, p) -> add(JsonArray(listOf(JsonPrimitive(x.roundToInt()), JsonPrimitive(y.roundToInt()), JsonPrimitive(p.coerceIn(0.05f, 1f).toDouble())))) } }
+                    put("size", paintSize.toDouble())
+                    put("opacity", paintOpacity.toDouble())
+                    put("hardness", paintHardness.toDouble())
+                    put("color", color)
+                    if (eraser && !paintOnMask) put("erase", true)
+                }
             }
+            val withTarget = if (paintOnMask) JsonObject(params + ("target" to JsonPrimitive("mask"))) else params
             lab.markInteractive()
-            lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", "paint.stroke"); put("params", params) }.toString())
+            lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", id); put("params", withTarget) }.toString())
         }
     }
 
@@ -593,6 +736,145 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun newPaintLayer() {
         paintLayerMade = false
     }
+
+    // ── history & snapshots ──────────────────────────────────────────────────────────────
+
+    /** `doc.history`: `states` (past, current, redo), `current`, `snapshots`. */
+    var history by mutableStateOf<JsonObject?>(null); private set
+
+    fun refreshHistory() = viewModelScope.launch {
+        history = lab.fn(Fn.DOC_HISTORY, "{}", refreshAfter = false).getOrNull() as? JsonObject
+    }
+
+    fun historyGo(state: Int) = viewModelScope.launch {
+        if (command.item != null) command.apply()
+        history = lab.fn(Fn.DOC_HISTORY_GO, """{"state":$state}""").getOrNull() as? JsonObject ?: history
+    }
+
+    fun snapshot(name: String) = viewModelScope.launch {
+        val body = buildJsonObject { if (name.isNotBlank()) put("name", name.trim()) }
+        history = lab.fn(Fn.DOC_SNAPSHOT, body.toString(), refreshAfter = false).getOrNull() as? JsonObject ?: history
+        lab.showMessage("Snapshot kept.")
+    }
+
+    fun restoreSnapshot(id: JsonElement) = viewModelScope.launch {
+        history = lab.fn(Fn.DOC_RESTORE_SNAPSHOT, buildJsonObject { put("snapshot", id) }.toString()).getOrNull() as? JsonObject ?: history
+    }
+
+    fun deleteSnapshot(id: JsonElement) = viewModelScope.launch {
+        history = lab.fn(Fn.DOC_DELETE_SNAPSHOT, buildJsonObject { put("snapshot", id) }.toString(), refreshAfter = false).getOrNull() as? JsonObject ?: history
+    }
+
+    // ── before / after ───────────────────────────────────────────────────────────────────
+
+    /** The photo as opened, shown while the compare button is held. */
+    var before by mutableStateOf<Bitmap?>(null); private set
+    var comparing by mutableStateOf(false); private set
+    private var beforeFor: String? = null
+
+    fun compare(on: Boolean) {
+        comparing = on
+        if (!on) return
+        val st = lab.state.value
+        val key = "${st.name}"
+        if (before != null && beforeFor == key) return
+        viewModelScope.launch {
+            val r = lab.fn(Fn.DOC_ORIGINAL, """{"maxSide":${Lab.PREVIEW_SIDE}}""", refreshAfter = false).getOrNull() as? JsonObject ?: return@launch
+            val handle = (r["image"] as? JsonPrimitive)?.content ?: return@launch
+            before = lab.handleBitmap(handle)
+            beforeFor = key
+        }
+    }
+
+    // ── transform handles (perspective crop / straighten, puppet warp) ───────────────────
+
+    var handleMode by mutableStateOf(HandleMode.None)
+    /** Handles in document px: (where it started, where it is now). */
+    val handles = androidx.compose.runtime.mutableStateListOf<Pair<Offset, Offset>>()
+
+    fun startQuad() {
+        val st = lab.state.value
+        val (w, h) = st.width.toFloat() to st.height.toFloat()
+        handles.clear()
+        listOf(Offset(w * 0.1f, h * 0.1f), Offset(w * 0.9f, h * 0.1f), Offset(w * 0.9f, h * 0.9f), Offset(w * 0.1f, h * 0.9f)).forEach { handles += it to it }
+        handleMode = HandleMode.Quad
+    }
+
+    fun startPins() {
+        handles.clear()
+        handleMode = HandleMode.Pins
+    }
+
+    fun cancelHandles() {
+        handles.clear()
+        handleMode = HandleMode.None
+    }
+
+    private fun pt(o: Offset) = JsonArray(listOf(JsonPrimitive(o.x.roundToInt()), JsonPrimitive(o.y.roundToInt())))
+
+    /** Crop to the quad, squared up (`image.perspectiveCrop`). */
+    fun applyPerspectiveCrop() {
+        if (handles.size != 4) return
+        val corners = JsonArray(handles.map { pt(it.second) })
+        edit("image.perspectiveCrop", buildJsonObject { put("corners", corners) }.toString())
+        cancelHandles()
+    }
+
+    /** Straighten what the quad outlines (a building, a page) into a rectangle, keeping the canvas (`edit.perspectiveWarp`). */
+    fun applyPerspectiveStraighten() {
+        if (handles.size != 4) return
+        val q = handles.map { it.second }
+        val left = (q[0].x + q[3].x) / 2; val right = (q[1].x + q[2].x) / 2
+        val top = (q[0].y + q[1].y) / 2; val bottom = (q[2].y + q[3].y) / 2
+        val dst = listOf(Offset(left, top), Offset(right, top), Offset(right, bottom), Offset(left, bottom))
+        val body = buildJsonObject {
+            putJsonArray("planes") { add(buildJsonObject { put("src", JsonArray(q.map(::pt))); put("dst", JsonArray(dst.map(::pt))) }) }
+        }
+        viewModelScope.launch {
+            if (!movable()) return@launch
+            editNow("edit.perspectiveWarp", body.toString(), null)
+            cancelHandles()
+        }
+    }
+
+    /** Puppet warp the active layer by its pins (pins left in place hold that part still). */
+    fun applyPuppet() {
+        if (handles.size < 2 || handles.none { it.first != it.second }) return lab.showMessage("Add pins, then drag one or more of them.")
+        val body = buildJsonObject {
+            putJsonArray("pins") { handles.forEach { (src, dst) -> add(buildJsonObject { put("src", pt(src)); put("dst", pt(dst)) }) } }
+        }
+        viewModelScope.launch {
+            if (!movable()) return@launch
+            editNow("edit.puppetWarp", body.toString(), null)
+            cancelHandles()
+        }
+    }
+
+    /** The active layer can move (not the locked Background): turns the Background into a layer first. */
+    suspend fun movable(): Boolean {
+        val st = lab.state.value
+        val active = st.layers.firstOrNull { it.id == st.activeLayer }
+        if (active?.name == "Background" && active.kind.equals("Pixel", true)) {
+            return lab.fn(Fn.EDIT_RUN, """{"id":"layer.new.layerFromBackground","params":{}}""", refreshAfter = false).isSuccess
+        }
+        return true
+    }
+
+    fun makeMovable() = viewModelScope.launch { if (movable()) lab.requestRefresh() }
+
+    // ── colour sampling (Replace color) ──────────────────────────────────────────────────
+
+    /** True while a canvas tap samples a colour for the open item (Replace color). */
+    val sampling get() = tool == Tool.Adjust && command.item?.command == "image.adjustments.replaceColor"
+
+    fun sampleAt(x: Float, y: Float) {
+        command.set("points", "json:[[${x.roundToInt()},${y.roundToInt()}]]")
+    }
+
+    // ── export ───────────────────────────────────────────────────────────────────────────
+
+    var exportOpen by mutableStateOf(false)
+    var exportSpec by mutableStateOf(ExportSpec())
 
     // ── text ─────────────────────────────────────────────────────────────────────────────
 
