@@ -321,7 +321,8 @@ fn calibrate_refine_edge() {
         })
     };
     type Shape = Box<dyn Fn(u32, u32) -> bool>;
-    let scenes: [(&str, [u8; 3], [u8; 3], u32, Shape); 3] = [
+    type Scene = (&'static str, [u8; 3], [u8; 3], u32, Shape);
+    let scenes: [Scene; 3] = [
         ("high contrast", [235, 120, 30], [40, 70, 160], 17, Box::new(ripple)),
         ("low contrast, noisy", [130, 115, 100], [100, 105, 115], 41, Box::new(ripple)),
         ("thin spokes", [220, 220, 225], [60, 110, 60], 23, Box::new(spokes)),
@@ -360,16 +361,15 @@ fn calibrate_refine_edge() {
         let base = shared.handles.mask_str(v["mask"].as_str().unwrap()).unwrap();
         eprintln!("{name}: detail pass alone IoU {:.4}", score(&base.alpha));
         let mut rows = Vec::new();
+        let contrast = 0.0f64;
         for radius in [0.0f64, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0] {
             for smooth in [0.0f64, 2.0] {
-                for contrast in [0.0f64] {
-                    let params = json!({"radius": radius, "smartRadius": true, "smooth": smooth, "contrast": contrast, "output": "selection"});
-                    let t = Instant::now();
-                    let (_, _, sel) = ctx.with_session(|hs| imagelab_segment::select::probe_from(hs, w, h, &base.alpha, "select.refineEdge", params.clone())).unwrap();
-                    let dt = t.elapsed();
-                    let s = score(&sel.unwrap());
-                    rows.push((s, radius, smooth, contrast, dt));
-                }
+                let params = json!({"radius": radius, "smartRadius": true, "smooth": smooth, "contrast": contrast, "output": "selection"});
+                let t = Instant::now();
+                let (_, _, sel) = ctx.with_session(|hs| imagelab_segment::select::probe_from(hs, w, h, &base.alpha, "select.refineEdge", params.clone())).unwrap();
+                let dt = t.elapsed();
+                let s = score(&sel.unwrap());
+                rows.push((s, radius, smooth, contrast, dt));
             }
         }
         rows.sort_by(|a, b| b.0.total_cmp(&a.0));
