@@ -192,3 +192,190 @@ fn mobilesam_detail_pass_sharpens_a_small_object() {
         assert!(ib > 0.95, "{name}: refined IoU {ib}");
     }
 }
+
+/// 24-bit BMP of RGBA pixels (alpha dropped), so a test can open a document from pixels.
+fn bmp(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    let row = (w * 3).div_ceil(4) * 4;
+    let size = 54 + row * h;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(b"BM");
+    for v in [size, 0, 54, 40] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    for v in [0u32, row * h, 2835, 2835, 0, 0] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for y in (0..h).rev() {
+        let start = out.len();
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            out.extend_from_slice(&[rgba[i + 2], rgba[i + 1], rgba[i]]);
+        }
+        out.resize(start + row as usize, 0);
+    }
+    out
+}
+
+/// On the open document, the detail pass is followed by PhotoCraft's Refine Edge, and the
+/// document's selection and history are left as they were.
+#[test]
+fn mobilesam_detail_pass_runs_refine_edge_on_the_document() {
+    let Ok(weights) = std::env::var("IMAGELAB_MOBILESAM_WEIGHTS") else {
+        eprintln!("skipped: set IMAGELAB_MOBILESAM_WEIGHTS to the MobileSAM weights");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    std::fs::copy(&weights, root.path().join("weights.safetensors")).unwrap();
+    let shared = Shared { root: root.path().canonicalize().unwrap(), session: Arc::new(Mutex::new(authorized(root.path()))), handles: Arc::new(Handles::default()), events: Arc::new(NoEvents) };
+    let ctx = Ctx::new(shared.clone(), Source::Agent);
+    let reg = Registry::new().with(&SegmentModule);
+    reg.call(&ctx, "segment.installModel", json!({"model": "mobilesam", "path": "weights.safetensors"})).unwrap();
+
+    let (w, h) = (3200u32, 2400u32);
+    let (cx, cy) = (1100.0f64, 900.0f64);
+    let inside = |x: u32, y: u32| {
+        let (dx, dy) = (f64::from(x) - cx, f64::from(y) - cy);
+        let r = 160.0 + 9.0 * (40.0 * dy.atan2(dx)).sin();
+        dx * dx + dy * dy <= r * r
+    };
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let n = ((x * 7 + y * 13) % 17) as u8;
+            let (r, g, b): (u8, u8, u8) = if inside(x, y) { (235, 120, 30) } else { (40, 70, 160) };
+            px.extend_from_slice(&[r.saturating_add(n), g.saturating_add(n), b.saturating_add(n), 255]);
+        }
+    }
+    let path = root.path().join("scene.bmp");
+    std::fs::write(&path, bmp(w, h, &px)).unwrap();
+    ctx.with_session(|hs| Ok(hs.open(std::path::Path::new("scene.bmp"))?)).unwrap();
+    let _ = &path;
+    let undo_before = ctx.with_session(|hs| Ok(hs.session.active().unwrap().history.undo_label().map(str::to_string))).unwrap();
+
+    let t = Instant::now();
+    let v = reg.call(&ctx, "segment.box", json!({"box": [920, 720, 360, 360], "refine": true})).unwrap();
+    let dt = t.elapsed();
+    let m = shared.handles.mask_str(v["mask"].as_str().unwrap()).unwrap();
+    let (mut inter, mut uni) = (0u64, 0u64);
+    for y in 650..1150 {
+        for x in 850..1350 {
+            let (a, t) = (m.alpha[(y * w + x) as usize] >= 128, inside(x, y));
+            inter += u64::from(a && t);
+            uni += u64::from(a || t);
+        }
+    }
+    let iou = inter as f64 / uni.max(1) as f64;
+    eprintln!("document box + detail + Refine Edge: IoU {iou:.4} in {dt:?}; detail {}", v["detail"]);
+    assert_eq!(v["detail"]["refined"], true, "{}", v["detail"]);
+    assert_eq!(v["detail"]["edge"]["ran"], true, "{}", v["detail"]);
+    assert!(iou > 0.95, "IoU {iou}");
+    // Read-only: no selection, no new history step.
+    let (sel, undo_after) = ctx.with_session(|hs| {
+        let d = hs.session.active().unwrap();
+        Ok((d.doc.selection.is_some(), d.history.undo_label().map(str::to_string)))
+    }).unwrap();
+    assert!(!sel, "segment.box left a selection");
+    assert_eq!(undo_after, undo_before, "segment.box left a history step");
+}
+
+/// A headless session that may read and write files under `root` (as the app's core grants).
+fn authorized(root: &std::path::Path) -> Headless {
+    let root = root.canonicalize().unwrap();
+    Headless::with_workspace(photocraft_automation::AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap())
+}
+
+/// Calibration of the Refine Edge settings used after the detail pass (run explicitly:
+/// `cargo test --release -p imagelab-segment --test mobilesam calibrate -- --ignored --nocapture`).
+/// Two scenes: a high-contrast rippled edge and a low-contrast, noisy one; each setting is scored
+/// by IoU against the exact shape, starting from the same detail-pass mask.
+#[test]
+#[ignore]
+fn calibrate_refine_edge() {
+    let Ok(weights) = std::env::var("IMAGELAB_MOBILESAM_WEIGHTS") else { return };
+    let (w, h) = (3200u32, 2400u32);
+    let (cx, cy) = (1100.0f64, 900.0f64);
+    let ripple = move |x: u32, y: u32| {
+        let (dx, dy) = (f64::from(x) - cx, f64::from(y) - cy);
+        let r = 160.0 + 9.0 * (40.0 * dy.atan2(dx)).sin();
+        dx * dx + dy * dy <= r * r
+    };
+    // A disk with eight 6 px spokes out to 230 px: thin structure a wide radius could erase.
+    let spokes = move |x: u32, y: u32| {
+        let (dx, dy) = (f64::from(x) - cx, f64::from(y) - cy);
+        let d = (dx * dx + dy * dy).sqrt();
+        if d <= 110.0 {
+            return true;
+        }
+        if d > 230.0 {
+            return false;
+        }
+        (0..8).any(|k| {
+            let a = f64::from(k) * std::f64::consts::PI / 4.0;
+            let (ux, uy) = (a.cos(), a.sin());
+            let along = dx * ux + dy * uy;
+            along > 0.0 && (dx * uy - dy * ux).abs() <= 3.0
+        })
+    };
+    type Shape = Box<dyn Fn(u32, u32) -> bool>;
+    let scenes: [(&str, [u8; 3], [u8; 3], u32, Shape); 3] = [
+        ("high contrast", [235, 120, 30], [40, 70, 160], 17, Box::new(ripple)),
+        ("low contrast, noisy", [130, 115, 100], [100, 105, 115], 41, Box::new(ripple)),
+        ("thin spokes", [220, 220, 225], [60, 110, 60], 23, Box::new(spokes)),
+    ];
+    for (name, fg, bg, noise, inside) in scenes {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::copy(&weights, root.path().join("weights.safetensors")).unwrap();
+        let shared = Shared { root: root.path().canonicalize().unwrap(), session: Arc::new(Mutex::new(authorized(root.path()))), handles: Arc::new(Handles::default()), events: Arc::new(NoEvents) };
+        let ctx = Ctx::new(shared.clone(), Source::Agent);
+        let reg = Registry::new().with(&SegmentModule);
+        reg.call(&ctx, "segment.installModel", json!({"model": "mobilesam", "path": "weights.safetensors"})).unwrap();
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let n = ((x * 7919 + y * 104_729) % noise) as u8;
+                let c = if inside(x, y) { fg } else { bg };
+                px.extend_from_slice(&[c[0].saturating_add(n), c[1].saturating_add(n), c[2].saturating_add(n), 255]);
+            }
+        }
+        std::fs::write(root.path().join("scene.bmp"), bmp(w, h, &px)).unwrap();
+        ctx.with_session(|hs| Ok(hs.open(std::path::Path::new("scene.bmp"))?)).unwrap();
+        let img = shared.handles.put_image(imagelab_api::ImageBuf::new(w, h, px).unwrap()).unwrap().to_string();
+        let score = |m: &[u8]| {
+            let (mut inter, mut uni) = (0u64, 0u64);
+            for y in 650..1150 {
+                for x in 850..1350 {
+                    let (a, t) = (m[(y * w + x) as usize] >= 128, inside(x, y));
+                    inter += u64::from(a && t);
+                    uni += u64::from(a || t);
+                }
+            }
+            inter as f64 / uni.max(1) as f64
+        };
+        // The detail-pass mask (an image handle: no Refine Edge yet).
+        let v = reg.call(&ctx, "segment.box", json!({"image": img, "box": [860, 660, 480, 480], "refine": true})).unwrap();
+        let base = shared.handles.mask_str(v["mask"].as_str().unwrap()).unwrap();
+        eprintln!("{name}: detail pass alone IoU {:.4}", score(&base.alpha));
+        let mut rows = Vec::new();
+        for radius in [0.0f64, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0] {
+            for smooth in [0.0f64, 2.0] {
+                for contrast in [0.0f64] {
+                    let params = json!({"radius": radius, "smartRadius": true, "smooth": smooth, "contrast": contrast, "output": "selection"});
+                    let t = Instant::now();
+                    let (_, _, sel) = ctx.with_session(|hs| imagelab_segment::select::probe_from(hs, w, h, &base.alpha, "select.refineEdge", params.clone())).unwrap();
+                    let dt = t.elapsed();
+                    let s = score(&sel.unwrap());
+                    rows.push((s, radius, smooth, contrast, dt));
+                }
+            }
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        rows.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)));
+        for (s, r, sm, c, dt) in rows.iter() {
+            eprintln!("  IoU {s:.4}  radius {r:>4}  smooth {sm}  contrast {c:>4}  ({dt:?})");
+        }
+    }
+}

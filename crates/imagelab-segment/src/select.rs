@@ -79,6 +79,19 @@ pub fn probe(h: &mut Headless, id: &str, params: Value) -> ApiResult<(u32, u32, 
     result
 }
 
+/// [`probe`] starting from `cov` as the selection: load it, run `id`, read the result, and roll
+/// both steps back (the document's selection and history end as they were).
+pub fn probe_from(h: &mut Headless, w: u32, ht: u32, cov: &[u8], id: &str, params: Value) -> ApiResult<(u32, u32, Option<Vec<u8>>)> {
+    let before = revision(h);
+    write_selection(h, "Load Selection", w, ht, cov)?;
+    let wrote = revision(h) != before;
+    let result = probe(h, id, params);
+    if wrote {
+        h.session.rollback();
+    }
+    result
+}
+
 /// After a selection command: what is selected now.
 fn summary(ctx: &Ctx, engine: Value) -> ApiResult<Value> {
     let (w, h, sel) = ctx.with_session(|h| read_selection(h))?;

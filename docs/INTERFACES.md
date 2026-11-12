@@ -151,6 +151,17 @@ Used wisely:
   phone GPU). Measured: a rippled edge on a 3200 px image goes from IoU 0.930 to 0.979 (3.2× detail).
   On a real 3000×4000 photo, a pylon's soft blob becomes straight, tapered sides with the legs
   apart (4× detail, 0.47 s on the phone).
+* Then, on the open document, PhotoCraft's Refine Edge runs on the result. The mask is loaded as
+  the selection, refined, read back, and the document rolled back, so its selection and history
+  are untouched. The smart radius is 3 mask cells of what SAM last saw: ~12 px after a detail pass
+  on a crop, up to 32 px on a whole large photo. Calibrated by `calibrate_refine_edge` in
+  `tests/mobilesam.rs`:
+  * IoU against exact shapes rises up to ~3 cells, then stays flat.
+  * Thin 6 px spokes stay intact even at 12 cells.
+  * Smooth and contrast made no difference, so they are 0.
+
+  Measured on the document: detail pass 0.978 → with Refine Edge 0.998. Photos and image handles
+  have no document to sample, so `detail.edge` says it did not run.
 * Text concepts other than sky/subject need SAM 3; without it the agent looks at a preview,
   locates the thing and calls `segment.box` (MobileSAM segments it precisely).
 

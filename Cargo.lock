@@ -2852,6 +2852,7 @@ dependencies = [
  "candle-transformers",
  "imagelab-api",
  "lightcraft-segment",
+ "photocraft-automation",
  "photocraft-codecs",
  "photocraft-compose",
  "photocraft-engine",

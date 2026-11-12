@@ -144,7 +144,7 @@ fn fallback_result(ctx: &Ctx, steps: &[(&str, Value, Mode)], sam_error: Option<S
     Ok(v)
 }
 
-const REFINE_NOTE: &str = " `refine: true` adds MobileSAM's detail pass: it re-segments a full-resolution crop around the first mask (the whole-image proxy shows a large photo at ~1/4 scale) and pastes the sharper edge back; the result's `detail` says whether it ran ({refined, detail: gain, region, agreement} or {refined: false, reason}). Costs a second encode (~0.2 s on a phone GPU).";
+const REFINE_NOTE: &str = " `refine: true` adds MobileSAM's detail pass: it re-segments a full-resolution crop around the first mask (the whole-image proxy shows a large photo at ~1/4 scale) and pastes the sharper edge back, then (on the open document) runs PhotoCraft's Refine Edge on the result; the result's `detail` says what ran ({refined, detail: gain, region, agreement} or {refined: false, reason}, plus `edge`: {ran, radius} or {ran: false, reason}). Costs a second encode (~0.2 s on a phone GPU) and the edge pass.";
 
 /// The detail pass gives up unless the crop sees the object at least this much larger than the
 /// whole-image proxy did.
@@ -234,6 +234,45 @@ fn refine(ctx: &Ctx, mobile: &Mobile, input: &Input, clicks: &[Click], user_box:
     Ok(json!({"refined": true, "detail": gain, "region": region, "agreement": agree, "refinedScore": pred.score}))
 }
 
+/// Refine Edge's smart radius, in mask cells of the image SAM last looked at (calibrated by
+/// `tests/mobilesam.rs::calibrate_refine_edge`: IoU against exact shapes rises to ~3 cells and is
+/// flat after, thin 6 px structure intact even at 12 cells; smooth and contrast made no
+/// difference, so they stay 0).
+const EDGE_RADIUS_CELLS: f64 = 3.0;
+
+/// One cell of SAM's 256² mask grid, in full-size pixels, for an image (or crop) whose long
+/// side is `long` px: the proxy is ≤ PROXY_SIDE and the grid covers a 1024 px square.
+fn mask_cell(long: f64) -> f64 {
+    let side = f64::from(input::PROXY_SIDE);
+    (1024.0 / 256.0) * long / long.min(side).max(1.0)
+}
+
+/// PhotoCraft's Refine Edge after the detail pass, on the open document's pixels: the mask is
+/// loaded as the selection, refined with a smart radius of [`EDGE_RADIUS_CELLS`] mask cells of
+/// the last pass (`long`: long side of what it saw, crop or whole image), read back, and the
+/// document rolled back. Edge-aware: it follows contrast the model's mask grid cannot resolve.
+/// Photos and image handles have no document to sample, so it does not run for them.
+fn refine_edge(ctx: &Ctx, input: &Input, m: &mut Vec<u8>, long: f64) -> Value {
+    if !matches!(input.full, input::Full::Document) {
+        return json!({"ran": false, "reason": "Refine Edge samples the open document; this input is a photo or image handle"});
+    }
+    if mask::bbox(m, input.width as usize, input.height as usize).is_none() {
+        return json!({"ran": false, "reason": "empty mask"});
+    }
+    let radius = (EDGE_RADIUS_CELLS * mask_cell(long)).clamp(4.0, 32.0).round();
+    let params = json!({"radius": radius, "smartRadius": true, "output": "selection"});
+    let (w, h) = (input.width, input.height);
+    match ctx.with_session(|hs| select::probe_from(hs, w, h, m, "select.refineEdge", params.clone())) {
+        Ok((rw, rh, Some(refined))) if (rw, rh) == (w, h) && refined.len() == m.len() => {
+            *m = refined;
+            json!({"ran": true, "radius": radius, "smartRadius": true})
+        }
+        Ok((_, _, None)) => json!({"ran": false, "reason": "Refine Edge left no selection; kept the mask"}),
+        Ok(_) => json!({"ran": false, "reason": "the document size changed; kept the mask"}),
+        Err(e) => json!({"ran": false, "reason": e.message}),
+    }
+}
+
 /// Try MobileSAM; on success the mask result (`engine: "mobilesam"`), on failure why. With
 /// `detail`, the [`refine`] pass follows (its outcome under `"detail"`).
 fn mobile_try(ctx: &Ctx, mobile: &Mobile, input: &Input, clicks: &[Click], rect: Option<[f32; 4]>, clip: Option<[f64; 4]>, detail: bool) -> Result<Value, String> {
@@ -245,7 +284,15 @@ fn mobile_try(ctx: &Ctx, mobile: &Mobile, input: &Input, clicks: &[Click], rect:
     }
     let detail = if detail {
         // A failed detail pass keeps the first mask and says why.
-        Some(refine(ctx, mobile, input, clicks, clip, &mut m).unwrap_or_else(|e| json!({"refined": false, "reason": e})))
+        let mut d = refine(ctx, mobile, input, clicks, clip, &mut m).unwrap_or_else(|e| json!({"refined": false, "reason": e}));
+        // Then PhotoCraft's Refine Edge on the result (open document only), its radius in mask
+        // cells of what SAM last saw: the crop when the detail pass ran, else the whole image.
+        let long = match d["region"].as_array() {
+            Some(r) if d["refined"] == true => r.iter().skip(2).filter_map(Value::as_f64).fold(0.0, f64::max),
+            _ => f64::from(input.width.max(input.height)),
+        };
+        d["edge"] = refine_edge(ctx, input, &mut m, long);
+        Some(d)
     } else {
         None
     };
