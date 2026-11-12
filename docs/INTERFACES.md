@@ -245,15 +245,31 @@ Reference: a mobile layered editor — full-bleed canvas, chrome at the edges, o
 
 * **Library** (home): photo grid with ratings/flags, multi-select, "Ask agent about these" — the
   entry point for cull and batch jobs; batch progress shows as a card.
-* **Select**: tap = SAM point, drag = box, type = concept ("sky"); Subject/Sky quick chips
-  (PhotoCraft, no model). The mask shows as an overlay; actions: adjust inside, blur, remove, cut to layer.
+* **Select**: tap = SAM point, drag = box, type = concept ("sky"); Subject/Sky/In focus/All quick
+  chips (PhotoCraft, no model); Magic wand and Color modes (a tap: `select.magicWand` /
+  `select.colorRange`, with a tolerance). The mask shows as an overlay; actions: adjust inside,
+  blur, remove, cut to layer, and refine (invert, feather, expand, contract, smooth, border,
+  similar colors). A PhotoCraft selection is copied into a mask handle and then dropped from the
+  document, so the handle is the only selection (masked edits load it back).
 * **Enhance** (first tool): one-slider, photo-aware looks from `edit.look`, live as the slider
   moves, each one history step. "For this photo" suggests templates for the scene
   (`edit.lookSuggest`: portrait if faces, landscape if a sky). Groups: Templates; Essentials
   (Enhance + sky, Sky, Structure, Details, Denoise, B&W, Vignette); Landscape (Golden hour,
   Foliage, Atmosphere, Sky replacement, Relight); Creative (Dramatic, Glow, Matte, Toning, Film
   grain); Portrait (Smooth skin, Face light, Eyes, Red eye, Background blur, Face shape).
-* **Adjust**: adjustment layers (light, color, effects); applies to the selection if one exists.
+* **Adjust**: quick sliders and auto fixes; Light & color (`filter.cameraRaw`: light, color,
+  effects, tone curve, HSL hue/saturation/luminance, color grading, detail, vignette & grain;
+  Shadows/Highlights, HDR toning); adjustment layers (Levels, Hue/Saturation, Vibrance, Color
+  balance, Selective color, Channel mixer, Gradient map, Photo filter, Look, B&W, Posterize,
+  Threshold, Invert). Applies to the selection if one exists. Catalog keys may address part of a
+  structured param (`hslSat[2]`, `gradeShadows.hue`; a `json:` choice value is sent as JSON).
+* **Filters**: Blur (incl. lens, spin, field, smart, box), Sharpen, Noise, Lens (Lens
+  correction), Painting / Sketch / Texture (PhotoCraft's Filter Gallery, picture frames),
+  Stylize, Distort, Pixelate, Render. **Effects**: layer styles.
+* **Layers**: order, duplicate, merge, group, clipping masks, masks, remove background
+  (`layer.removeBackground`), defringe, opacity / fill / blend.
+* **Crop & size**: aspect crops, rotate (90°, 180°), flip, straighten, Geometry (lens
+  correction: perspective, distortion), image and canvas size.
 * **Retouch**: brushes painted on the canvas — Heal (`paint.spotHealing`), Remove
   (`paint.remove`), Lighten/Darken (`paint.dodge`/`paint.burn`), Liquify Push/Bloat/Pinch/Restore
   (`filter.liquify` strokes) — plus content-aware fill, denoise, and a shortcut to Face shape.
@@ -271,7 +287,7 @@ revision) and only corrects what it finds. Sky and face looks return `applied:fa
 `skipped` when there is no sky or face, and change nothing.
 
 **Fast preview** (`edit.preview`): while a slider of a scale-free item moves (looks, face shape,
-Camera Raw, relight; no selection), the app runs the step on a ≤ 768 px flattened proxy of the
+Camera Raw, relight, lens correction; no selection), the app runs the step on a ≤ 768 px flattened proxy of the
 photo in a session of its own and shows that frame; the full-resolution edit runs once, when the
 slider is released. The proxy is snapshotted when the tool opens (`begin`), so the tool's own
 full-size run landing meanwhile is never previewed on top of itself. Each frame carries a

@@ -90,7 +90,7 @@ fun ToolSheet(tool: Tool, state: EditorState, vm: EditorViewModel, modifier: Mod
                 Tool.Crop -> {
                     CropSheet(vm)
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    CommandSheet(listOf(Catalog.document), vm.command)
+                    CommandSheet(listOf(Catalog.geometry, Catalog.document), vm.command)
                 }
             }
         }
@@ -133,13 +133,22 @@ private fun LayersSheet(state: EditorState, vm: EditorViewModel) {
         AssistChip(onClick = { vm.edit("layer.duplicate") }, label = { Text("Duplicate") }, leadingIcon = { SymIcon(Sym.copy, null, Modifier.size(18.dp)) })
         AssistChip(onClick = { vm.edit("layer.mergeDown") }, label = { Text("Merge down") }, leadingIcon = { SymIcon(Sym.merge, null, Modifier.size(18.dp)) })
         AssistChip(onClick = { vm.edit("layer.delete") }, label = { Text("Delete") }, leadingIcon = { SymIcon(Sym.delete, null, Modifier.size(18.dp)) })
+        AssistChip(onClick = { vm.edit("layer.groupLayers") }, label = { Text("Group") }, leadingIcon = { SymIcon(Sym.layers, null, Modifier.size(18.dp)) })
+        AssistChip(onClick = { vm.edit("layer.createClippingMask") }, label = { Text("Clip to below") })
+        AssistChip(onClick = { vm.edit("layer.releaseClippingMask") }, label = { Text("Release clip") })
+        AssistChip(onClick = { vm.edit("layer.mergeVisible") }, label = { Text("Merge visible") })
         AssistChip(onClick = { vm.edit("layer.flattenImage") }, label = { Text("Flatten") })
+    }
+    ChipRow {
+        AssistChip(onClick = vm::removeBackground, label = { Text("Remove background") }, leadingIcon = { SymIcon(Sym.person, null, Modifier.size(18.dp)) })
+        AssistChip(onClick = { vm.edit("layer.matting.defringe", """{"width":2}""") }, label = { Text("Defringe") })
     }
     ChipRow {
         AssistChip(onClick = { vm.maskFromSelection() }, label = { Text(if (vm.selection != null) "Mask from selection" else "Add mask") })
         AssistChip(onClick = { vm.edit("layer.layerMask.hideAll") }, label = { Text("Black mask") })
         AssistChip(onClick = { vm.edit("layer.layerMask.delete") }, label = { Text("Delete mask") })
         AssistChip(onClick = { vm.edit("layer.layerMask.apply") }, label = { Text("Apply mask") })
+        AssistChip(onClick = { vm.edit("layer.layerMask.fromTransparency") }, label = { Text("Mask from transparency") })
     }
     if (active != null) {
         var name by remember(active.id) { mutableStateOf(active.name) }
@@ -271,11 +280,16 @@ private fun SelectSheet(vm: EditorViewModel) {
         SelectMode.Rect -> "Drag a rectangle."
         SelectMode.Ellipse -> "Drag an ellipse."
         SelectMode.Lasso -> "Draw around the area with your finger."
+        SelectMode.Wand -> "Tap a color: the touching area of similar color is selected."
+        SelectMode.Color -> "Tap a color: every area of that color is selected."
     }
     Text(hint, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
     SegModelRow(vm)
     ChipRow {
         SelectMode.entries.forEach { m -> FilterChip(selected = vm.selectMode == m, onClick = { vm.selectMode = m }, label = { Text(m.label) }) }
+    }
+    if (vm.selectMode == SelectMode.Wand || vm.selectMode == SelectMode.Color) {
+        LabeledSlider("Tolerance", vm.tolerance, 1f..150f, { vm.tolerance = it }) { it.roundToInt().toString() }
     }
     if (vm.selectMode == SelectMode.Object || vm.selectMode == SelectMode.Box) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -299,6 +313,9 @@ private fun SelectSheet(vm: EditorViewModel) {
     ChipRow {
         AssistChip(onClick = vm::selectSubject, label = { Text("Subject") }, leadingIcon = { SymIcon(Sym.person, null, Modifier.size(18.dp)) })
         AssistChip(onClick = vm::selectSky, label = { Text("Sky") }, leadingIcon = { SymIcon(Sym.landscape, null, Modifier.size(18.dp)) })
+        AssistChip(onClick = vm::selectFocus, label = { Text("In focus") })
+        AssistChip(onClick = vm::selectAll, label = { Text("All") })
+        AssistChip(onClick = vm::removeBackground, label = { Text("Remove background") })
     }
     OutlinedTextField(
         concept, { concept = it },
@@ -321,6 +338,18 @@ private fun SelectSheet(vm: EditorViewModel) {
             AssistChip(onClick = vm::removeSelected, label = { Text("Remove") }, leadingIcon = { SymIcon(Sym.erase, null, Modifier.size(18.dp)) })
             AssistChip(onClick = vm::cutToLayer, label = { Text("Cut to layer") }, leadingIcon = { SymIcon(Sym.cut, null, Modifier.size(18.dp)) })
         }
+        // Refine the selection: invert, or grow / shrink / soften its edge by [edge] pixels.
+        var edge by rememberSaveable { mutableFloatStateOf(8f) }
+        ChipRow {
+            AssistChip(onClick = vm::invertSelection, label = { Text("Invert") })
+            AssistChip(onClick = { vm.modifySelection("feather", edge) }, label = { Text("Feather") })
+            AssistChip(onClick = { vm.modifySelection("expand", edge) }, label = { Text("Expand") })
+            AssistChip(onClick = { vm.modifySelection("contract", edge) }, label = { Text("Contract") })
+            AssistChip(onClick = { vm.modifySelection("smooth", edge) }, label = { Text("Smooth") })
+            AssistChip(onClick = { vm.modifySelection("border", edge) }, label = { Text("Border") })
+            AssistChip(onClick = { vm.modifySelection("similar", vm.tolerance) }, label = { Text("Similar colors") })
+        }
+        LabeledSlider("Edge", edge, 1f..100f, { edge = it }) { "${it.roundToInt()} px" }
     }
 }
 
@@ -353,6 +382,8 @@ private val quick = listOf(
     "Auto Color" to "image.autoColor",
     "B&W" to "layer.newAdjustmentLayer.blackWhite",
     "Invert" to "layer.newAdjustmentLayer.invert",
+    "Equalize" to "image.adjustments.equalize",
+    "Desaturate" to "image.adjustments.desaturate",
 )
 
 @Composable
@@ -438,7 +469,9 @@ private fun CropSheet(vm: EditorViewModel) {
     ChipRow {
         AssistChip(onClick = { vm.edit("image.imageRotation.90ccw") }, label = { Text("Rotate left") })
         AssistChip(onClick = { vm.edit("image.imageRotation.90cw") }, label = { Text("Rotate right") })
+        AssistChip(onClick = { vm.edit("image.imageRotation.180") }, label = { Text("Rotate 180°") })
         AssistChip(onClick = { vm.edit("image.imageRotation.flipCanvasHorizontal") }, label = { Text("Flip") })
+        AssistChip(onClick = { vm.edit("image.imageRotation.flipCanvasVertical") }, label = { Text("Flip vertical") })
     }
     Row(verticalAlignment = Alignment.CenterVertically) {
         SymIcon(Sym.straighten, "Straighten", Modifier.size(20.dp))

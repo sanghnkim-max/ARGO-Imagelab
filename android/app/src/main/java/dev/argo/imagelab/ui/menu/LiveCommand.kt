@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -197,31 +198,69 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         showFrame(r.getOrNull()?.let { lab.parse(it) } as? JsonObject, pv.version)
     }
 
-    private fun params(item: MenuItem, values: Map<String, Any>): JsonObject = buildJsonObject {
-        item.fixed.forEach { (k, v) -> putAny(k, v) }
+    /**
+     * The command's params for [values]. Keys may address part of a structured param, so plain
+     * sliders can drive it: `hslSat[2]` is index 2 of the array `hslSat` (missing indices are 0),
+     * `gradeShadows.hue` is field `hue` of the object `gradeShadows`. A [Choice] value starting
+     * with `json:` is sent as that JSON (gradient stops, curves).
+     */
+    private fun params(item: MenuItem, values: Map<String, Any>): JsonObject {
+        val flat = linkedMapOf<String, JsonElement>()
+        item.fixed.forEach { (k, v) -> flat[k] = element(v) }
         item.params.forEach { p ->
-            when (val v = values[p.key]) {
-                is Float -> {
-                    val s = p as? Slider
-                    val shown = if (s?.integer == true) v.roundToInt().toFloat() else v
-                    val sent = shown * (s?.sendScale ?: 1f)
-                    if (s?.integer == true && s.sendScale == 1f) put(p.key, sent.roundToInt()) else put(p.key, sent.toDouble())
-                }
-                null -> {}
-                else -> putAny(p.key, v)
-            }
+            val v = values[p.key] ?: return@forEach
+            flat[p.key] = if (v is Float) {
+                val s = p as? Slider
+                val shown = if (s?.integer == true) v.roundToInt().toFloat() else v
+                val sent = shown * (s?.sendScale ?: 1f)
+                if (s?.integer == true && s.sendScale == 1f) JsonPrimitive(sent.roundToInt()) else JsonPrimitive(sent.toDouble())
+            } else element(v)
         }
+        return nest(flat)
     }
 
-    private fun kotlinx.serialization.json.JsonObjectBuilder.putAny(k: String, v: Any) {
-        when (v) {
-            is Boolean -> put(k, v)
-            is Int -> put(k, v)
-            is Long -> put(k, v)
-            is Float -> put(k, v.toDouble())
-            is Double -> put(k, v)
-            else -> put(k, v.toString())
+    private fun element(v: Any): JsonElement = when (v) {
+        is JsonElement -> v
+        is Boolean -> JsonPrimitive(v)
+        is Int -> JsonPrimitive(v)
+        is Long -> JsonPrimitive(v)
+        is Float -> JsonPrimitive(v.toDouble())
+        is Double -> JsonPrimitive(v)
+        is String -> if (v.startsWith("json:")) lab.parse(v.removePrefix("json:")) ?: JsonPrimitive(v) else JsonPrimitive(v)
+        else -> JsonPrimitive(v.toString())
+    }
+
+    private fun nest(flat: Map<String, JsonElement>): JsonObject {
+        val out = linkedMapOf<String, Any>()
+        flat.forEach { (k, v) ->
+            val idx = INDEXED.matchEntire(k)
+            val dot = k.indexOf('.')
+            when {
+                idx != null -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val arr = out.getOrPut(idx.groupValues[1]) { mutableMapOf<Int, JsonElement>() } as? MutableMap<Int, JsonElement> ?: return@forEach
+                    arr[idx.groupValues[2].toInt()] = v
+                }
+                dot > 0 -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val obj = out.getOrPut(k.substring(0, dot)) { linkedMapOf<String, JsonElement>() } as? MutableMap<String, JsonElement> ?: return@forEach
+                    obj[k.substring(dot + 1)] = v
+                }
+                else -> out[k] = v
+            }
         }
+        return JsonObject(out.mapValues { (_, v) ->
+            when {
+                v is JsonElement -> v
+                (v as Map<*, *>).keys.firstOrNull() is Int -> {
+                    @Suppress("UNCHECKED_CAST") val m = v as Map<Int, JsonElement>
+                    JsonArray((0..(m.keys.maxOrNull() ?: -1)).map { m[it] ?: JsonPrimitive(0) })
+                }
+                else -> {
+                    @Suppress("UNCHECKED_CAST") JsonObject(v as Map<String, JsonElement>)
+                }
+            }
+        })
     }
 
     private suspend fun revision(): Long? = lab.io { api ->
@@ -285,6 +324,7 @@ class LiveCommand(private val lab: Lab, scope: CoroutineScope, private val maskF
         /** Longest side of the proxy previews follow while a slider moves. */
         const val PROXY_SIDE = 768
         /** Pixel commands without pixel-unit parameters, so a proxy previews them faithfully. */
-        val PROXY_COMMANDS = setOf("filter.cameraRaw", "filter.render.relight")
+        val PROXY_COMMANDS = setOf("filter.cameraRaw", "filter.render.relight", "filter.lensCorrection")
+        private val INDEXED = Regex("""^(\w+)\[(\d+)]$""")
     }
 }

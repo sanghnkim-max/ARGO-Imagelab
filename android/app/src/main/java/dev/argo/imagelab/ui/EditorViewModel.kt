@@ -33,7 +33,7 @@ import java.io.File
 import kotlin.math.roundToInt
 
 /** How a tap or drag on the canvas selects (Select tool). */
-enum class SelectMode(val label: String) { Object("Object"), Box("Box"), Rect("Rectangle"), Ellipse("Ellipse"), Lasso("Lasso") }
+enum class SelectMode(val label: String) { Object("Object"), Box("Box"), Rect("Rectangle"), Ellipse("Ellipse"), Lasso("Lasso"), Wand("Magic wand"), Color("Color") }
 
 /** Retouch brushes: a drag on the canvas is one stroke of the chosen engine tool. */
 enum class RetouchBrush(val label: String, val command: String, val liquify: String? = null) {
@@ -335,6 +335,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     /** Canvas tap (document pixels). Object mode: a SAM point; New starts over, Add/Subtract
      *  add an include/exclude point to the same prompt (only the decoder runs again). */
     fun canvasTap(x: Float, y: Float) {
+        if (selectMode == SelectMode.Wand || selectMode == SelectMode.Color) return colorTap(x.roundToInt(), y.roundToInt())
         if (selectMode != SelectMode.Object) return
         val p = Triple(x.roundToInt(), y.roundToInt(), if (combine == Combine.Subtract) 0 else 1)
         when (combine) {
@@ -389,29 +390,87 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                     "select.lasso",
                     buildJsonObject { putJsonArray("points") { path.forEach { add(JsonArray(listOf(JsonPrimitive(it.x.roundToInt()), JsonPrimitive(it.y.roundToInt())))) } } },
                 )
+                SelectMode.Wand, SelectMode.Color -> null
             }
-            val newMask = fresh?.let(::maskHandleIn)
-            if (newMask != null) {
-                samPoints.clear()
-                val old = selection?.mask
-                val combined = if (old != null && combine != Combine.New) {
-                    val op = if (combine == Combine.Add) "union" else "subtract"
-                    lab.fn("cv.combineMasks", buildJsonObject { put("a", old); put("b", newMask); put("op", op) }.toString(), refreshAfter = false).getOrNull()
-                } else fresh
-                val label = when {
-                    combine == Combine.New || old == null -> mode.label + boxDetail
-                    else -> "${selection?.label} ${if (combine == Combine.Add) "+" else "−"} ${mode.label}$boxDetail"
-                }
-                setSelection(label, combined)
-            }
+            combineWith(fresh, mode.label + boxDetail)
             selecting = false
         }
     }
 
-    /** Run a PhotoCraft selection command, then read the selection back as a mask handle. */
+    /** A new mask from a selection tool, combined with the current one per [combine]. */
+    private suspend fun combineWith(fresh: JsonElement?, what: String) {
+        val newMask = fresh?.let(::maskHandleIn) ?: return
+        samPoints.clear()
+        val old = selection?.mask
+        val combined = if (old != null && combine != Combine.New) {
+            val op = if (combine == Combine.Add) "union" else "subtract"
+            lab.fn("cv.combineMasks", buildJsonObject { put("a", old); put("b", newMask); put("op", op) }.toString(), refreshAfter = false).getOrNull()
+        } else fresh
+        val label = if (combine == Combine.New || old == null) what else "${selection?.label} ${if (combine == Combine.Add) "+" else "−"} $what"
+        setSelection(label, combined)
+    }
+
+    /** Magic wand / color range tolerance (0..255 wand, fuzziness for color). */
+    var tolerance by mutableFloatStateOf(32f)
+
+    /** Magic wand (touching pixels of a similar color) or color range (that color everywhere). */
+    private fun colorTap(x: Int, y: Int) {
+        val mode = selectMode
+        viewModelScope.launch {
+            selecting = true
+            val fresh = if (mode == SelectMode.Wand) {
+                photocraftShape("select.magicWand", buildJsonObject { put("x", x); put("y", y); put("tolerance", tolerance.roundToInt()); put("sampleAllLayers", true) })
+            } else {
+                photocraftShape("select.colorRange", buildJsonObject { putJsonArray("points") { add(JsonArray(listOf(JsonPrimitive(x), JsonPrimitive(y)))) }; put("fuzziness", tolerance.roundToInt().coerceAtMost(200)) })
+            }
+            combineWith(fresh, mode.label)
+            selecting = false
+        }
+    }
+
+    /** The in-focus area (PhotoCraft Focus Area). */
+    fun selectFocus() = viewModelScope.launch {
+        selecting = true
+        combineWith(photocraftShape("select.focusArea", buildJsonObject { put("range", 0.5) }), "In focus")
+        selecting = false
+    }
+
+    fun selectAll() = viewModelScope.launch {
+        combine = Combine.New
+        combineWith(photocraftShape("select.all", JsonObject(emptyMap())), "All")
+    }
+
+    fun invertSelection() = viewModelScope.launch {
+        val sel = selection ?: return@launch
+        val mask = sel.mask ?: return@launch edit("select.inverse")
+        val inv = lab.fn(Fn.CV_INVERT_MASK, buildJsonObject { put("mask", mask) }.toString(), refreshAfter = false).getOrNull()
+        setSelection("${sel.label} (inverted)", inv)
+    }
+
+    /** `select.modify.<op>` (feather, expand, contract, smooth, border) or `select.similar` on the current selection. */
+    fun modifySelection(op: String, amount: Float) = viewModelScope.launch {
+        val sel = selection ?: return@launch
+        sel.mask?.let { m -> if (lab.fn(Fn.SELECT_FROM_MASK, buildJsonObject { put("mask", m) }.toString(), refreshAfter = false).isFailure) return@launch }
+        selecting = true
+        val (id, params) = if (op == "similar") "select.similar" to buildJsonObject { put("tolerance", amount.roundToInt()); put("sampleAllLayers", true) }
+        else "select.modify.$op" to buildJsonObject { put("radius", amount.roundToInt().coerceAtLeast(1)) }
+        val r = photocraftShape(id, params)
+        val what = mapOf("feather" to "feathered", "expand" to "expanded", "contract" to "contracted", "smooth" to "smoothed", "border" to "border", "similar" to "+ similar")[op] ?: op
+        if (r != null) setSelection("${sel.label.substringBefore(" · ")} · $what", r)
+        selecting = false
+    }
+
+    /** Cut the subject out: a layer mask from Select Subject (the Background becomes a layer). */
+    fun removeBackground() = edit("layer.removeBackground")
+
+    /** Run a PhotoCraft selection command, then read the selection back as a mask handle. The
+     *  document selection is dropped again: the handle is the selection from here on (edits
+     *  load it back), so a stale document selection never limits a later edit. */
     private suspend fun photocraftShape(id: String, params: JsonObject): JsonElement? {
         if (lab.fn(Fn.EDIT_RUN, buildJsonObject { put("id", id); put("params", params) }.toString(), refreshAfter = false).isFailure) return null
-        return lab.fn("select.toMask", "{}", refreshAfter = false).getOrNull()
+        val mask = lab.fn("select.toMask", "{}", refreshAfter = false).getOrNull()
+        lab.fn(Fn.EDIT_RUN, """{"id":"select.deselect","params":{}}""", refreshAfter = false)
+        return mask
     }
 
     private suspend fun setSelection(label: String, result: JsonElement?) {
@@ -443,7 +502,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val had = selection
         selection = null
         samPoints.clear()
-        if (had != null && had.mask == null) edit("select.deselect")
+        // Also drop any document selection (a masked edit loads the mask as one).
+        if (had != null) edit("select.deselect")
     }
 
     fun adjustInside() {

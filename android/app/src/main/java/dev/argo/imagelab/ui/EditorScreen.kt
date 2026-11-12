@@ -401,6 +401,7 @@ private fun EditorCanvas(state: EditorState, vm: EditorViewModel, modifier: Modi
                         },
                         Accent, style = stroke,
                     )
+                    SelectMode.Wand, SelectMode.Color -> {}
                     else -> drawRect(Accent, topLeft = tl, size = sz, style = stroke)
                 }
             }
