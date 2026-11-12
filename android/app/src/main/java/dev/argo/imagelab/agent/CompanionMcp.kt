@@ -30,7 +30,8 @@ import java.io.ByteArrayOutputStream
  * `imagelab__help` and `imagelab__save`.
  *
  * The three MCP server features:
- * - **Tools** (`tools/list`, `tools/call`): `open`, `read`, `edit`, `help`, `save`.
+ * - **Tools** (`tools/list`, `tools/call`): `open`, `read`, `edit`, `help`, `save`, and
+ *   `overwrite`, the one destructive tool (a client asks before each call).
  * - **Resources** (`resources/list`, `resources/templates/list`, `resources/read`): the open
  *   document (`imagelab://document`), its history, a preview image, and the function reference
  *   (`imagelab://reference`, one area at `imagelab://reference/{area}`).
@@ -182,6 +183,7 @@ class CompanionMcp(private val app: ImageLabApp) {
             "help" -> lab("lab_help", buildJsonObject { args.text("area")?.let { put("area", it) } })
             "open" -> open(args)
             "save" -> save(args)
+            "overwrite" -> overwrite(args)
             else -> failed("unknown tool `$name`; ImageLab serves ${TOOL_NAMES.joinToString()}")
         }
     }
@@ -241,8 +243,11 @@ class CompanionMcp(private val app: ImageLabApp) {
     private fun save(args: JsonObject): JsonObject {
         val format = (args.text("format") ?: "jpg").lowercase().let { if (it == "jpeg") "jpg" else it }
         if (format !in setOf("jpg", "png", "webp")) return failed("format must be jpg, png or webp")
+        // Always a new file: a name already taken gets the next number.
         val stamp = System.currentTimeMillis()
-        val fileName = "imagelab-$stamp.$format"
+        var fileName = "imagelab-$stamp.$format"
+        var n = 1
+        while (java.io.File(app.workspace, "exports/$fileName").exists()) fileName = "imagelab-$stamp-${n++}.$format"
         val rel = "exports/$fileName"
         val body = buildJsonObject {
             put("path", rel)
@@ -268,6 +273,27 @@ class CompanionMcp(private val app: ImageLabApp) {
                 })
             },
         )
+    }
+
+    /**
+     * Replace an existing file in ImageLab's workspace with the open document: the one write that
+     * destroys something, so it is its own tool, marked destructive, which the client asks the
+     * person about before every call. Programs are refused it (`needs_approval`).
+     */
+    private fun overwrite(args: JsonObject): JsonObject {
+        val path = args.text("path") ?: return failed("`path` is required: the existing file to replace, e.g. exports/imagelab-1.jpg")
+        if (!java.io.File(app.workspace, path).exists()) return failed("`$path` does not exist; to keep a result, use `save`, which makes a new photo")
+        val body = buildJsonObject {
+            put("path", path)
+            args.text("format")?.let { put("format", it) }
+            (args["quality"] as? JsonPrimitive)?.longOrNull?.let { put("quality", it.coerceIn(1, 100)) }
+            (args["maxSide"] as? JsonPrimitive)?.longOrNull?.let { put("maxSide", it.coerceIn(16, 16384)) }
+        }
+        runBlocking { app.lab.io { it.call("doc.exportOverwrite", body.toString(), "agent") } }.getOrThrow()
+        return ok("Replaced $path with the open document.", buildJsonObject {
+            put("replaced", true)
+            put("path", path)
+        })
     }
 
     private fun readCapped(input: java.io.InputStream): ByteArray {
@@ -474,11 +500,24 @@ class CompanionMcp(private val app: ImageLabApp) {
                 },"additionalProperties":false}""",
                 readOnly = false, idempotent = false,
             ))
+            add(tool(
+                "overwrite", "Replace an existing file",
+                "Replace an existing file in ImageLab's workspace (exports/, edits/) with the open photo. It cannot be " +
+                    "undone, so use it only when the person asked to replace that file; to keep a result, use `save`, " +
+                    "which always makes a new photo. Programs may not overwrite (LabCallError `needs_approval`).",
+                """{"type":"object","properties":{
+                  "path":{"type":"string","description":"The existing file, e.g. exports/imagelab-1.jpg."},
+                  "format":{"type":"string","enum":["jpg","png","webp"]},
+                  "quality":{"type":"integer","minimum":1,"maximum":100},
+                  "maxSide":{"type":"integer","minimum":16}
+                },"required":["path"],"additionalProperties":false}""",
+                readOnly = false, idempotent = true, destructive = true,
+            ))
         }
 
         private val TOOL_NAMES = TOOLS.map { ((it as JsonObject)["name"] as JsonPrimitive).content }
 
-        private fun tool(name: String, title: String, description: String, schema: String, readOnly: Boolean, idempotent: Boolean) =
+        private fun tool(name: String, title: String, description: String, schema: String, readOnly: Boolean, idempotent: Boolean, destructive: Boolean = false) =
             buildJsonObject {
                 put("name", name)
                 put("title", title)
@@ -487,8 +526,9 @@ class CompanionMcp(private val app: ImageLabApp) {
                 put("annotations", buildJsonObject {
                     put("title", title)
                     put("readOnlyHint", readOnly)
-                    // Edits are undoable in ImageLab and saving makes a new photo: nothing is lost.
-                    put("destructiveHint", false)
+                    // Edits are undoable in ImageLab and saving makes a new photo: nothing is lost,
+                    // except by `overwrite`, which says so.
+                    put("destructiveHint", destructive)
                     put("idempotentHint", idempotent)
                     // Everything stays on the phone, in ImageLab and the gallery.
                     put("openWorldHint", false)

@@ -412,6 +412,14 @@ roster line (`select:imagelab`) like every MCP server's.
 | `edit {code, description, timeoutMs?}` | `lab_script`: an editing program, one undoable step each |
 | `help {area?}` | `lab_help` |
 | `save {format?, quality?, maxSide?}` | Export to the gallery (Pictures/ImageLab): `structuredContent {photo, uri, photos:[{id,name}]}`, which ARGO's card shows |
+| `overwrite {path, format?, quality?, maxSide?}` | Replace an existing workspace file (`doc.exportOverwrite`): the one tool with `destructiveHint: true`, which ARGO asks about before every call |
+
+**Never overwrite without asking.** `save` always makes a new gallery photo (a taken file name
+gets the next number), and the gallery is never written over. A program an agent runs (`lab_script`
+from the in-app agent, MCP or ARGO) is refused every Destructive function with `needs_approval`, so
+`doc.exportOverwrite` is out of its reach, and `doc.save` refuses any existing file but the
+document's own. A replacement the person asked for goes through `overwrite`, which ARGO asks about
+every time: a standing "allow" for the `imagelab` server never covers a tool marked destructive.
 
 | Resource | What |
 |---|---|

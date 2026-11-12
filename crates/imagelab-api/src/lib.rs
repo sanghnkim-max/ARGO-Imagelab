@@ -147,11 +147,20 @@ pub struct Ctx {
     pub read_only: bool,
     /// Set to cancel; long functions check it between steps ([`Ctx::check_cancel`]).
     pub cancel: Arc<AtomicBool>,
+    /// A program an agent wrote: Destructive functions (an overwrite, a deletion) are refused
+    /// with `needs_approval`, so the agent asks the person instead of doing it.
+    pub asks_before_destroying: bool,
 }
 
 impl Ctx {
     pub fn new(shared: Shared, source: Source) -> Self {
-        Self { shared, source, read_only: false, cancel: Arc::new(AtomicBool::new(false)) }
+        Self { shared, source, read_only: false, cancel: Arc::new(AtomicBool::new(false)), asks_before_destroying: false }
+    }
+
+    /// Refuse Destructive functions ([`Ctx::asks_before_destroying`]).
+    pub fn asking_before_destroying(mut self) -> Self {
+        self.asks_before_destroying = true;
+        self
     }
 
     pub fn read_only(mut self) -> Self {
@@ -365,6 +374,15 @@ impl Registry {
         if ctx.read_only && f.effects != Effects::ReadOnly {
             return Err(ApiError::new("read_only", format!("`{id}` changes things ({:?}) and this call is read-only", f.effects)));
         }
+        if ctx.asks_before_destroying && f.effects == Effects::Destructive {
+            return Err(ApiError::new(
+                "needs_approval",
+                format!(
+                    "`{id}` cannot be undone (it overwrites or deletes), so a program may not run it. Keep results as new \
+                     files instead (doc.export to a new path); if the person wants to replace a file, ask them first"
+                ),
+            ));
+        }
         ctx.check_cancel()?;
         let handler = f.handler.clone();
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(ctx, params))) {
@@ -447,6 +465,17 @@ mod tests {
         let ctx = Ctx::new(shared(), Source::Agent).read_only();
         assert_eq!(r.call(&ctx, "math.store", json!({})).unwrap_err().code, "read_only");
         assert!(r.call(&ctx, "math.add", json!({"a": 1, "b": 1})).is_ok());
+    }
+
+    #[test]
+    fn an_agents_program_is_refused_what_cannot_be_undone() {
+        let mut r = registry();
+        r.function("math", "wipe", "pretend to overwrite").effects(Effects::Destructive).handler(|_, _| Ok(json!("wiped"))).register();
+        let program = Ctx::new(shared(), Source::Agent).asking_before_destroying();
+        assert_eq!(r.call(&program, "math.wipe", json!({})).unwrap_err().code, "needs_approval");
+        assert!(r.call(&program, "math.store", json!({})).is_ok(), "an undoable change still runs");
+        // A direct call (the person's own UI, or a tool the person approved) is not a program.
+        assert!(r.call(&Ctx::new(shared(), Source::Ui), "math.wipe", json!({})).is_ok());
     }
 
     #[test]

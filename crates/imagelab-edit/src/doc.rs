@@ -234,9 +234,12 @@ fn save(ctx: &Ctx, p: SaveParams) -> ApiResult<Value> {
             None => default_save_target(doc_path.as_deref())?,
         };
         let layered = p.format.as_deref().map(|f| f.trim_start_matches('.').eq_ignore_ascii_case("pcraft")).unwrap_or_else(|| target.ends_with(".pcraft"));
-        // A flat file other than the document's own is an export: never over an existing file.
-        if !layered && doc_path.as_deref() != Some(target.as_str()) && root.join(&target).exists() {
-            return Err(ApiError::new("exists", format!("`{target}` exists; pick another name or use doc.exportOverwrite")));
+        // Anything but the document's own file (or its own edits sidecar) is a new file: never
+        // over an existing one, layered or flat.
+        let own = doc_path.as_deref() == Some(target.as_str())
+            || (p.path.is_none() && default_save_target(doc_path.as_deref()).ok().as_deref() == Some(target.as_str()));
+        if !own && root.join(&target).exists() {
+            return Err(ApiError::new("exists", format!("`{target}` exists; pick another name (doc.exportOverwrite replaces a file, and needs the person's OK)")));
         }
         ensure_parent(&root, &target)?;
         let spec = ExportSpec { format: p.format.clone(), ..ExportSpec::default() };

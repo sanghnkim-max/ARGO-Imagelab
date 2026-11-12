@@ -120,6 +120,10 @@ impl Core {
         let _busy = self.busy();
         let mut ctx = Ctx::new(self.shared.clone(), source);
         ctx.cancel = cancel.clone();
+        // An agent's program never overwrites or deletes on its own: the person is asked.
+        if matches!(source, Source::Agent | Source::Mcp) {
+            ctx = ctx.asking_before_destroying();
+        }
         if read_only {
             ctx = ctx.read_only();
         }
