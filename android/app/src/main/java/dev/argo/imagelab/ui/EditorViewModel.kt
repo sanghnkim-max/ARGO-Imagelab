@@ -1,12 +1,10 @@
 package dev.argo.imagelab.ui
 
 import android.app.Application
-import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import dev.argo.imagelab.core.Lab
 import android.net.Uri
-import android.provider.MediaStore
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -16,6 +14,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.argo.imagelab.ImageLabApp
 import dev.argo.imagelab.core.Fn
+import dev.argo.imagelab.core.Gallery
 import dev.argo.imagelab.core.Imports
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -411,19 +410,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
         val saved = lab.fn(Fn.DOC_EXPORT, body.toString(), refreshAfter = false)
         if (saved.isFailure) return@launch
-        val mime = when (ext) { "png" -> "image/png"; "webp" -> "image/webp"; "tif" -> "image/tiff"; else -> "image/jpeg" }
         val copied = withContext(Dispatchers.IO) {
-            runCatching {
-                val values = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, "imagelab-$stamp.$ext")
-                    put(MediaStore.Images.Media.MIME_TYPE, mime)
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ImageLab")
-                }
-                val resolver = app.contentResolver
-                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: error("no gallery")
-                val out = resolver.openOutputStream(uri) ?: run { resolver.delete(uri, null, null); error("gallery refused the file") }
-                out.use { o -> File(app.workspace, rel).inputStream().use { it.copyTo(o) } }
-            }
+            runCatching { Gallery.save(app, File(app.workspace, rel), "imagelab-$stamp.$ext") }
         }
         lab.showMessage(if (copied.isSuccess) "Exported to Pictures/ImageLab" else "Saved to $rel")
     }

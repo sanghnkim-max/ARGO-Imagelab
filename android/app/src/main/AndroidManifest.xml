@@ -5,6 +5,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- PhotoCraft's GPU renderer runs on Vulkan through wgpu; phones without it use the CPU. -->
+    <!-- The ARGO app, the one caller LabService answers (its signature is checked on every call). -->
+    <queries>
+        <package android:name="com.argo.android" />
+    </queries>
+
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />
 
     <application
@@ -31,5 +36,18 @@
                 <data android:mimeType="image/*" />
             </intent-filter>
         </activity>
+
+        <!--
+            The companion wire (docs/INTERFACES.md §12): the ARGO app's agent drives ImageLab
+            here. Exported so another app can bind it; LabService answers only a caller signed
+            by a pinned ARGO certificate.
+        -->
+        <service
+            android:name=".agent.LabService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.argo.imagelab.action.COMPANION" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

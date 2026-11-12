@@ -95,7 +95,7 @@ impl Default for Budget {
             max_log_bytes: 64 << 10,
             max_result_bytes: 8 << 20,
             max_images: 16,
-            max_image_side: 2048,
+            max_image_side: 1568,
         }
     }
 }

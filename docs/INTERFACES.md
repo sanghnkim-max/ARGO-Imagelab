@@ -376,3 +376,38 @@ setEventListener(listener: EventListener)        // callback interface
     EventListener.onEvent(eventJson: String)      // Event serialized (§5), called off the main thread
 renderHandle(handle: String, maxSide: UInt) -> ByteArray   // PNG of img:N / mask:N for overlays
 ```
+
+## 12. ARGO companion
+
+ImageLab is a companion of the ARGO app (ARGOv2, `apps/argo-android`): ARGO's own on-device agent
+edits photos through ImageLab, from ARGO's chat, with ARGO's model, memory and approvals.
+
+**The wire.** `dev.argo.imagelab.agent.LabService`, an exported bound service speaking
+`ILabService` (`android/app/src/main/aidl`; ARGO keeps an identical copy, add methods only at the
+end). Any app can bind an exported service, so the service checks the **caller's signing
+certificate on every call** (`LabService.ALLOWED`: `com.argo.android` with ARGO's debug key; a
+release ARGO adds its release key). ARGO pins ImageLab's certificate the same way before binding
+(`LabLink.TRUSTED`), so neither side talks to a look-alike package.
+
+| Call | What |
+|---|---|
+| `call("tools/call", {name, arguments})` | ImageLab's own MCP tools (`lab_read`, `lab_script`, `lab_help`) on the in-process server: the same programs, effects and budgets as the in-app agent and the HTTP server. The MCP `CallToolResult` (text + image blocks) |
+| `call("export", {format, quality, maxSide})` | Save the open document to `exports/` and copy it to the gallery (Pictures/ImageLab): `{path, mediaId, uri}` |
+| `call("status")`, `call("tools/list")` | Contract version, open document; the tool list |
+| `importPhoto(name, fd)` | ARGO opens a gallery photo (MediaStore id from its `photos_search`) and hands the descriptor over; ImageLab copies it into `imports/` and opens it |
+| `cancel()` | Stop the running programs (the turn was cancelled) |
+
+Results travel through a **pipe** (`ParcelFileDescriptor`), never in the Binder reply: images ride
+inline as base64 and outgrow a transaction. Images are encoded at most 1568 px a side (ARGO's
+attachment store refuses more than 2000).
+
+**In ARGO** (`com.argo.android.tools.lab`): five native tools behind the `imagelab` gate (offered
+only while ImageLab is installed and trusted): `imagelab_read`, `imagelab_edit`, `imagelab_help`,
+`imagelab_open` (a photo id from `photos_search`), `imagelab_save` (a new gallery photo, its id for
+`photos_get`). None asks first: every edit is an undoable step in ImageLab, the gallery original
+is never changed, and saving makes a new photo. Results are private (the person's photos) and
+untrusted (EXIF and text in photos).
+
+**ARGO's core client allowlist.** ImageLab and VideoLab are listed in ARGO's
+`res/values/core_clients.xml` (debug: their shared debug key `647e1822…`) as client packages, as ARGO
+Browser and VIA are, so they may bind ARGO's `:core` and open a client tab on ARGO's agent.

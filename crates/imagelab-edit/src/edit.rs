@@ -22,8 +22,34 @@ struct CommandsParams {
 }
 
 fn commands(p: CommandsParams) -> Value {
+    let filtered = p.filter.as_deref().is_some_and(|f| !f.trim().is_empty());
     let all = allow::entries(p.filter.as_deref());
-    let limit = p.limit.unwrap_or(100).clamp(1, 1000);
+    // No filter and no limit: an index of the groups (a few hundred tokens), not hundreds of
+    // full rows; the caller then searches one group with `filter`.
+    if !filtered && p.limit.is_none() {
+        // area → second segment → count, e.g. image → {adjustments: 41, autoTone: 1}.
+        let mut groups: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> = std::collections::BTreeMap::new();
+        for e in &all {
+            let Some(id) = e.get("id").and_then(Value::as_str) else { continue };
+            let mut parts = id.split('.');
+            let area = parts.next().unwrap_or_default().to_string();
+            let sub = parts.next().unwrap_or_default().to_string();
+            *groups.entry(area).or_default().entry(sub).or_default() += 1;
+        }
+        let index: serde_json::Map<String, Value> = groups
+            .into_iter()
+            .map(|(area, subs)| {
+                let names: Vec<String> = subs.into_iter().map(|(sub, n)| if n > 1 { format!("{sub}({n})") } else { sub }).collect();
+                (area, Value::String(names.join(" ")))
+            })
+            .collect();
+        return json!({
+            "total": all.len(),
+            "groups": index,
+            "hint": "Groups by area (name(count)). Search with filter (\"image.adjustments\", \"filter.blur\", or a word like \"curves\", \"vibrance\") for the ids and their params."
+        });
+    }
+    let limit = p.limit.unwrap_or(40).clamp(1, 1000);
     json!({"total": all.len(), "allowlisted": allow::len(), "commands": all.into_iter().take(limit).collect::<Vec<_>>()})
 }
 
@@ -173,7 +199,7 @@ fn step_schema() -> Value {
 
 pub fn register(r: &mut Registry) {
     r.function("edit", "commands", "Allowlisted PhotoCraft engine commands with their param docs")
-        .description("Searches the engine commands edit.run may run (id, label or keywords contain `filter`; default limit 100). The list is generated from PhotoCraft's registry: image.*, layer.*, filter.*, select.*, paint.* and in-document edit.* (undo/redo, fill, stroke, transform, content-aware); never file, export, preferences, plugin, script, print, view or tool-state commands.")
+        .description("Searches the engine commands edit.run may run (id, label or keywords contain `filter`; default limit 40), with each command's params. With neither filter nor limit: an index of the command groups (id prefix, count, example labels) to search next. The list is generated from PhotoCraft's registry: image.*, layer.*, filter.*, select.*, paint.* and in-document edit.* (undo/redo, fill, stroke, transform, content-aware); never file, export, preferences, plugin, script, print, view or tool-state commands.")
         .params(json!({"type":"object","properties":{"filter":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}}}))
         .typed(|_: &Ctx, p: CommandsParams| Ok(commands(p)))
         .register();
