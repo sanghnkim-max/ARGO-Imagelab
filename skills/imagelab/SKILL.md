@@ -63,6 +63,14 @@ await lab.edit.run({ id: "filter.blur.gaussianBlur", params: { radius: 12 }, mas
 return await lab.doc.preview({ maxSide: 768 });
 ```
 
+A small object in a big photo, with sharp edges: `refine: true` re-segments a full-resolution
+crop around the first mask (check `detail.refined`):
+
+```js
+const pylon = await lab.segment.box({ photo: "library/2026-11/6394.jpg", box: [2470, 760, 230, 560], refine: true });
+return { mask: pylon.mask, detail: pylon.detail };
+```
+
 Batch, defensively: one failure does not stop the rest:
 
 ```js

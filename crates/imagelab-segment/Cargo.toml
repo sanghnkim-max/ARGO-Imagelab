@@ -25,6 +25,9 @@ workspace = true
 imagelab-api = { workspace = true }
 photocraft-engine = { workspace = true }
 photocraft-codecs = { workspace = true }
+# Region renders of the open document for the detail pass (render_reduced_rect).
+photocraft-compose = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
+photocraft-geom = { git = "https://github.com/storytold/photocraft", rev = "20fcb6193fcaa1c517d99df2396d0f985593e528" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # SAM 3 on candle (Apache-2.0). Pinned like PhotoCraft: a git dependency at a reviewed rev.

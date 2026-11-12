@@ -21,6 +21,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
@@ -255,6 +256,15 @@ private fun SelectSheet(vm: EditorViewModel) {
     SegModelRow(vm)
     ChipRow {
         SelectMode.entries.forEach { m -> FilterChip(selected = vm.selectMode == m, onClick = { vm.selectMode = m }, label = { Text(m.label) }) }
+    }
+    if (vm.selectMode == SelectMode.Object || vm.selectMode == SelectMode.Box) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Fine detail", style = MaterialTheme.typography.bodyMedium)
+                Text("Looks again at full resolution around the object: sharper edges on big photos.", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            }
+            Switch(checked = vm.detail, onCheckedChange = { vm.detail = it })
+        }
     }
     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
         Combine.entries.forEachIndexed { i, c ->

@@ -43,6 +43,9 @@ struct PointParams {
     #[serde(flatten)]
     src: Source,
     points: Vec<[f64; 3]>,
+    /// Detail pass (MobileSAM): re-segment a full-resolution crop around the first mask.
+    #[serde(default)]
+    refine: bool,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +55,8 @@ struct BoxParams {
     src: Source,
     #[serde(rename = "box")]
     rect: [f64; 4],
+    #[serde(default)]
+    refine: bool,
 }
 
 #[derive(Deserialize)]
@@ -139,17 +144,117 @@ fn fallback_result(ctx: &Ctx, steps: &[(&str, Value, Mode)], sam_error: Option<S
     Ok(v)
 }
 
-/// Try MobileSAM; on success the mask result (`engine: "mobilesam"`), on failure why.
-fn mobile_try(ctx: &Ctx, mobile: &Mobile, input: &Input, clicks: &[Click], rect: Option<[f32; 4]>, clip: Option<[f64; 4]>) -> Result<Value, String> {
+const REFINE_NOTE: &str = " `refine: true` adds MobileSAM's detail pass: it re-segments a full-resolution crop around the first mask (the whole-image proxy shows a large photo at ~1/4 scale) and pastes the sharper edge back; the result's `detail` says whether it ran ({refined, detail: gain, region, agreement} or {refined: false, reason}). Costs a second encode (~0.2 s on a phone GPU).";
+
+/// The detail pass gives up unless the crop sees the object at least this much larger than the
+/// whole-image proxy did.
+const MIN_DETAIL_GAIN: f64 = 1.4;
+/// Context kept around the object in the crop: this fraction of its longer side, plus pixels.
+const CROP_MARGIN: f64 = 0.15;
+const CROP_MARGIN_PX: f64 = 16.0;
+/// The refined mask must agree this well (IoU) with the first one, or the first one stays.
+const MIN_REFINE_IOU: f64 = 0.5;
+
+fn iou(a: &[u8], b: &[u8]) -> f64 {
+    let (mut inter, mut uni) = (0u64, 0u64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (*x >= 128, *y >= 128);
+        inter += u64::from(x && y);
+        uni += u64::from(x || y);
+    }
+    if uni == 0 { 0.0 } else { inter as f64 / uni as f64 }
+}
+
+/// Detail pass: MobileSAM again on a full-resolution crop around the first mask (plus the box
+/// and the include points), prompted with the same points and the first mask's box, and the
+/// sharper mask pasted back into `m`. The whole-image proxy shows a 12 MP photo at ~1/4 scale;
+/// a crop around a small object shows it at up to full resolution. Returns what happened.
+fn refine(ctx: &Ctx, mobile: &Mobile, input: &Input, clicks: &[Click], user_box: Option<[f64; 4]>, m: &mut [u8]) -> Result<Value, String> {
+    let (w, h) = (f64::from(input.width), f64::from(input.height));
+    // What to keep in view: the first mask, the box, the include points.
+    let mut b: Option<[f64; 4]> = mask::bbox(m, input.width as usize, input.height as usize).map(|[x, y, bw, bh]| [f64::from(x), f64::from(y), f64::from(x + bw), f64::from(y + bh)]);
+    let mut grow = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        b = Some(match b {
+            None => [x0, y0, x1, y1],
+            Some([a0, b0, a1, b1]) => [a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1)],
+        });
+    };
+    if let Some([x, y, bw, bh]) = user_box {
+        grow(x, y, x + bw, y + bh);
+    }
+    for c in clicks.iter().filter(|c| c.positive) {
+        let (x, y) = (f64::from(c.x) * w, f64::from(c.y) * h);
+        grow(x, y, x + 1.0, y + 1.0);
+    }
+    let Some([x0, y0, x1, y1]) = b else { return Ok(json!({"refined": false, "reason": "nothing to refine"})) };
+    let margin = (x1 - x0).max(y1 - y0) * CROP_MARGIN + CROP_MARGIN_PX;
+    let (rx0, ry0) = ((x0 - margin).max(0.0).floor(), (y0 - margin).max(0.0).floor());
+    let (rx1, ry1) = ((x1 + margin).min(w).ceil(), (y1 + margin).min(h).ceil());
+    let region = [rx0 as u32, ry0 as u32, (rx1 - rx0).max(1.0) as u32, (ry1 - ry0).max(1.0) as u32];
+    let side = f64::from(input::PROXY_SIDE);
+    let gain = (side / f64::from(region[2].max(region[3]))).min(1.0) / (side / w.max(h)).min(1.0);
+    if gain < MIN_DETAIL_GAIN {
+        return Ok(json!({"refined": false, "reason": "the crop would add no detail (the object fills most of the image, or the image is already small)", "detail": gain}));
+    }
+    ctx.check_cancel().map_err(|e| e.message)?;
+    let crop = input::crop(ctx, input, region).map_err(|e| e.message)?;
+    let (cw, ch) = (f64::from(region[2]), f64::from(region[3]));
+    let to_crop = |x: f64, y: f64| (((x - rx0) / cw) as f32, ((y - ry0) / ch) as f32);
+    let cclicks: Vec<Click> = clicks
+        .iter()
+        .filter_map(|c| {
+            let (x, y) = (f64::from(c.x) * w, f64::from(c.y) * h);
+            ((rx0..rx1).contains(&x) && (ry0..ry1).contains(&y)).then(|| {
+                let (cx, cy) = to_crop(x, y);
+                Click { x: cx, y: cy, positive: c.positive }
+            })
+        })
+        .collect();
+    // The box prompt: the first mask's extent (or the user's box), in the crop.
+    let (bx0, by0) = to_crop(x0, y0);
+    let (bx1, by1) = to_crop(x1, y1);
+    let (pred, _) = mobile.segment(&ctx.shared.root, &crop, &cclicks, Some([bx0, by0, bx1, by1]))?;
+    let mut cm = mask::logits_to_mask(&pred.logits, pred.side, region[2] as usize, region[3] as usize);
+    if let Some([x, y, bw, bh]) = user_box {
+        let pad = (cw.max(ch) * 0.01) as f32;
+        mask::clip_to_box(&mut cm, region[2] as usize, region[3] as usize, [(x - rx0) as f32, (y - ry0) as f32, bw as f32, bh as f32], pad);
+    }
+    // Same object? Compare with the first mask over the region.
+    let (iw, rw) = (input.width as usize, region[2] as usize);
+    let first: Vec<u8> = (0..region[3] as usize).flat_map(|yy| m[(region[1] as usize + yy) * iw + region[0] as usize..][..rw].iter().copied()).collect();
+    let agree = iou(&first, &cm);
+    if agree < MIN_REFINE_IOU {
+        return Ok(json!({"refined": false, "reason": "the detailed pass found a different shape; kept the first mask", "agreement": agree}));
+    }
+    // The first mask lies inside the region (it was grown from its extent): paste.
+    for (yy, row) in cm.chunks_exact(rw).enumerate() {
+        let at = (region[1] as usize + yy) * iw + region[0] as usize;
+        m[at..at + rw].copy_from_slice(row);
+    }
+    Ok(json!({"refined": true, "detail": gain, "region": region, "agreement": agree, "refinedScore": pred.score}))
+}
+
+/// Try MobileSAM; on success the mask result (`engine: "mobilesam"`), on failure why. With
+/// `detail`, the [`refine`] pass follows (its outcome under `"detail"`).
+fn mobile_try(ctx: &Ctx, mobile: &Mobile, input: &Input, clicks: &[Click], rect: Option<[f32; 4]>, clip: Option<[f64; 4]>, detail: bool) -> Result<Value, String> {
     let (pred, cached) = mobile.segment(&ctx.shared.root, input, clicks, rect)?;
     let mut m = sam_mask(input, &pred);
     if let Some([x, y, w, h]) = clip {
         let pad = (f64::from(input.width.max(input.height)) * 0.01) as f32;
         mask::clip_to_box(&mut m, input.width as usize, input.height as usize, [x as f32, y as f32, w as f32, h as f32], pad);
     }
+    let detail = if detail {
+        // A failed detail pass keeps the first mask and says why.
+        Some(refine(ctx, mobile, input, clicks, clip, &mut m).unwrap_or_else(|e| json!({"refined": false, "reason": e})))
+    } else {
+        None
+    };
     let mut v = put(ctx, input.width, input.height, m, Some(pred.score)).map_err(|e| e.message)?;
     v["engine"] = json!("mobilesam");
     v["cached"] = json!(cached);
+    if let Some(d) = detail {
+        v["detail"] = d;
+    }
     Ok(v)
 }
 
@@ -190,7 +295,7 @@ fn point(ctx: &Ctx, st: &State, p: PointParams) -> ApiResult<Value> {
         }
         Err(e) => e,
     };
-    let err = match mobile_try(ctx, &st.mobile, &input, &clicks, None, None) {
+    let err = match mobile_try(ctx, &st.mobile, &input, &clicks, None, None, p.refine) {
         Ok(mut v) => {
             v["samError"] = json!(err);
             return Ok(v);
@@ -243,7 +348,7 @@ fn boxed(ctx: &Ctx, st: &State, p: BoxParams) -> ApiResult<Value> {
     };
     // MobileSAM takes the box as a real box prompt.
     let nbox = [(x / iw) as f32, (y / ih) as f32, ((x + w) / iw) as f32, ((y + h) / ih) as f32];
-    let err = match mobile_try(ctx, &st.mobile, &input, &[], Some(nbox), Some([x, y, w, h])) {
+    let err = match mobile_try(ctx, &st.mobile, &input, &[], Some(nbox), Some([x, y, w, h]), p.refine) {
         Ok(mut v) => {
             v["samError"] = json!(err);
             return Ok(v);
@@ -335,7 +440,7 @@ fn subject(ctx: &Ctx, st: &State, p: SubjectParams) -> ApiResult<Value> {
         let (sx, sy) = (fw / f64::from(w.max(1)), fh / f64::from(h.max(1)));
         let r = [f64::from(bx) * sx, f64::from(by) * sy, f64::from(bw) * sx, f64::from(bh) * sy];
         let nbox = [(r[0] / fw) as f32, (r[1] / fh) as f32, ((r[0] + r[2]) / fw) as f32, ((r[1] + r[3]) / fh) as f32];
-        if let Ok(mut v) = mobile_try(ctx, &st.mobile, &input, &[], Some(nbox), Some(r)) {
+        if let Ok(mut v) = mobile_try(ctx, &st.mobile, &input, &[], Some(nbox), Some(r), false) {
             v["engine"] = json!("mobilesam");
             v["guide"] = json!("photocraft select.subject");
             v["samError"] = json!(err);
@@ -364,16 +469,16 @@ pub fn register(r: &mut Registry, state: Arc<State>) {
 
     let s = state.clone();
     r.function("segment", "point", "Mask of the object at points [[x,y,label 1|0],…] (SAM 3; PhotoCraft Object Finder fallback)")
-        .description(&format!("{input_note} Returns {{mask, width, height, bbox, coverage, score, engine, cached}}."))
-        .params(schema(json!({"points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"minItems":1,"maxItems":MAX_POINTS}}), &["points"]))
+        .description(&format!("{input_note} Returns {{mask, width, height, bbox, coverage, score, engine, cached}}.{REFINE_NOTE}"))
+        .params(schema(json!({"points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"minItems":1,"maxItems":MAX_POINTS},"refine":{"type":"boolean"}}), &["points"]))
         .effects(Effects::ReadOnly)
         .typed(move |ctx, p: PointParams| point(ctx, &s, p))
         .register();
 
     let s = state.clone();
     r.function("segment", "box", "Mask of the object in box [x,y,w,h] (SAM 3; PhotoCraft Object Finder fallback)")
-        .description(&format!("{input_note} Returns {{mask, width, height, bbox, coverage, score, engine, cached}}."))
-        .params(schema(json!({"box":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}}), &["box"]))
+        .description(&format!("{input_note} Returns {{mask, width, height, bbox, coverage, score, engine, cached}}.{REFINE_NOTE}"))
+        .params(schema(json!({"box":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"refine":{"type":"boolean"}}), &["box"]))
         .effects(Effects::ReadOnly)
         .typed(move |ctx, p: BoxParams| boxed(ctx, &s, p))
         .register();

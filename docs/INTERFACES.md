@@ -140,6 +140,17 @@ Used wisely:
 * Point prompts accumulate: *Add* / *Subtract* append include / exclude points to the same prompt.
   Shapes combine with the current mask (`cv.combineMasks` union / subtract).
 * "Subject" = PhotoCraft Select Subject for *where*, then MobileSAM with that box for a clean edge.
+* Detail pass (`refine: true` on `segment.point` / `segment.box`, the Select tool's *Fine
+  detail* switch): the whole-image proxy shows a 12 MP photo at ~1/4 scale, and SAM's mask grid
+  is 256² over that. So after the first mask, MobileSAM runs again on a crop of the full-resolution
+  pixels around it: the mask's box plus the prompt, with a 15% margin. Decoded photos are resampled
+  and the open document is rendered (PhotoCraft's `render_reduced_rect`). The crop is prompted with
+  the same points and the first mask's box, and the result is pasted back. The pass skips when
+  the crop would add less than 1.4× detail. It keeps the first mask when the two disagree
+  (IoU < 0.5). `detail` in the result says which happened. Cost: one more encode (~0.2 s on a
+  phone GPU). Measured: a rippled edge on a 3200 px image goes from IoU 0.930 to 0.979 (3.2× detail).
+  On a real 3000×4000 photo, a pylon's soft blob becomes straight, tapered sides with the legs
+  apart (4× detail, 0.47 s on the phone).
 * Text concepts other than sky/subject need SAM 3; without it the agent looks at a preview,
   locates the thing and calls `segment.box` (MobileSAM segments it precisely).
 

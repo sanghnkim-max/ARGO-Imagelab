@@ -23,8 +23,10 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import java.io.File
@@ -241,6 +243,22 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     var selectMode by mutableStateOf(SelectMode.Object)
     var combine by mutableStateOf(Combine.New)
 
+    /** SAM's detail pass: re-segment a full-resolution crop around the object (sharper edges on
+     *  large photos, ~0.2 s more on a phone GPU). */
+    var detail by mutableStateOf(false)
+
+    /** " · detail ×3.2" when the detail pass ran, else "". */
+    private fun detailNote(result: JsonElement?): String {
+        val d = (result as? JsonObject)?.get("detail") as? JsonObject ?: return ""
+        val refined = (d["refined"] as? JsonPrimitive)?.booleanOrNull == true
+        if (!refined) {
+            (d["reason"] as? JsonPrimitive)?.contentOrNull?.let { lab.showMessage("Fine detail skipped: $it") }
+            return ""
+        }
+        val gain = (d["detail"] as? JsonPrimitive)?.doubleOrNull ?: return " · detail"
+        return " · detail ×${"%.1f".format(gain)}"
+    }
+
     /** The SAM prompt behind the current Object selection: [x, y, label] in document pixels. */
     private val samPoints = mutableListOf<Triple<Int, Int, Int>>()
 
@@ -261,8 +279,11 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val label = if (pts.size == 1) "Object" else "Object (${pts.count { it.third == 1 }}+ ${pts.count { it.third == 0 }}−)"
         viewModelScope.launch {
             selecting = true
-            val params = buildJsonObject { putJsonArray("points") { pts.forEach { (px, py, l) -> add(JsonArray(listOf(JsonPrimitive(px), JsonPrimitive(py), JsonPrimitive(l)))) } } }
-            lab.fn(Fn.SEGMENT_POINT, params.toString(), refreshAfter = false).onSuccess { result -> setSelection(label, result) }
+            val params = buildJsonObject {
+                putJsonArray("points") { pts.forEach { (px, py, l) -> add(JsonArray(listOf(JsonPrimitive(px), JsonPrimitive(py), JsonPrimitive(l)))) } }
+                if (detail) put("refine", true)
+            }
+            lab.fn(Fn.SEGMENT_POINT, params.toString(), refreshAfter = false).onSuccess { result -> setSelection(label + detailNote(result), result) }
             selecting = false
         }
     }
@@ -279,9 +300,17 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         val mode = selectMode
         viewModelScope.launch {
             selecting = true
+            var boxDetail = ""
             val fresh: JsonElement? = when (mode) {
                 SelectMode.Object, SelectMode.Box ->
-                    lab.fn(Fn.SEGMENT_BOX, buildJsonObject { putJsonArray("box") { listOf(x, y, w, h).forEach { add(JsonPrimitive(it)) } } }.toString(), refreshAfter = false).getOrNull()
+                    lab.fn(
+                        Fn.SEGMENT_BOX,
+                        buildJsonObject {
+                            putJsonArray("box") { listOf(x, y, w, h).forEach { add(JsonPrimitive(it)) } }
+                            if (detail) put("refine", true)
+                        }.toString(),
+                        refreshAfter = false,
+                    ).getOrNull().also { boxDetail = detailNote(it) }
                 SelectMode.Rect, SelectMode.Ellipse -> photocraftShape(
                     "select.rect",
                     buildJsonObject { put("x", x); put("y", y); put("width", w); put("height", h); put("ellipse", mode == SelectMode.Ellipse) },
@@ -300,8 +329,8 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                     lab.fn("cv.combineMasks", buildJsonObject { put("a", old); put("b", newMask); put("op", op) }.toString(), refreshAfter = false).getOrNull()
                 } else fresh
                 val label = when {
-                    combine == Combine.New || old == null -> mode.label
-                    else -> "${selection?.label} ${if (combine == Combine.Add) "+" else "−"} ${mode.label}"
+                    combine == Combine.New || old == null -> mode.label + boxDetail
+                    else -> "${selection?.label} ${if (combine == Combine.Add) "+" else "−"} ${mode.label}$boxDetail"
                 }
                 setSelection(label, combined)
             }

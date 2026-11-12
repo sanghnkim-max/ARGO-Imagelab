@@ -130,3 +130,65 @@ fn mobilesam_segments_points_and_boxes() {
     let bad = reg.call(&ctx, "segment.installModel", json!({"model": "mobilesam", "path": "bad.safetensors"})).unwrap_err();
     assert_eq!(bad.code, "bad_params");
 }
+
+/// The detail pass on a large image: a disk whose edge ripples (period ~25 px) are finer than
+/// the whole-image proxy can show (a 3200 px image is seen at ~1/3 scale, and SAM's mask grid at
+/// a quarter of that). `refine: true` re-segments a crop at full resolution and gets the edge.
+#[test]
+fn mobilesam_detail_pass_sharpens_a_small_object() {
+    let Ok(weights) = std::env::var("IMAGELAB_MOBILESAM_WEIGHTS") else {
+        eprintln!("skipped: set IMAGELAB_MOBILESAM_WEIGHTS to the MobileSAM weights");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    std::fs::copy(&weights, root.path().join("weights.safetensors")).unwrap();
+    let shared = Shared { root: root.path().canonicalize().unwrap(), session: Arc::new(Mutex::new(Headless::new())), handles: Arc::new(Handles::default()), events: Arc::new(NoEvents) };
+    let ctx = Ctx::new(shared.clone(), Source::Agent);
+    let reg = Registry::new().with(&SegmentModule);
+    reg.call(&ctx, "segment.installModel", json!({"model": "mobilesam", "path": "weights.safetensors"})).unwrap();
+
+    let (w, h) = (3200u32, 2400u32);
+    let (cx, cy) = (1100.0f64, 900.0f64);
+    let inside = |x: u32, y: u32| {
+        let (dx, dy) = (f64::from(x) - cx, f64::from(y) - cy);
+        let r = 160.0 + 9.0 * (40.0 * dy.atan2(dx)).sin();
+        dx * dx + dy * dy <= r * r
+    };
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let n = ((x * 7 + y * 13) % 17) as u8;
+            let (r, g, b): (u8, u8, u8) = if inside(x, y) { (235, 120, 30) } else { (40, 70, 160) };
+            px.extend_from_slice(&[r.saturating_add(n), g.saturating_add(n), b.saturating_add(n), 255]);
+        }
+    }
+    let img = shared.handles.put_image(imagelab_api::ImageBuf::new(w, h, px).unwrap()).unwrap().to_string();
+    let score = |v: &serde_json::Value| {
+        let m = shared.handles.mask_str(v["mask"].as_str().unwrap()).unwrap();
+        let (mut inter, mut uni) = (0u64, 0u64);
+        // Over the object's neighbourhood only (the rest is empty in both and would inflate IoU).
+        for y in 650..1150 {
+            for x in 850..1350 {
+                let (a, t) = (m.alpha[(y * w + x) as usize] >= 128, inside(x, y));
+                inter += u64::from(a && t);
+                uni += u64::from(a || t);
+            }
+        }
+        inter as f64 / uni.max(1) as f64
+    };
+    for (name, params) in [("point", json!({"points": [[1100, 900, 1]]})), ("box", json!({"box": [920, 720, 360, 360]}))] {
+        let mut plain = params.clone();
+        plain["image"] = json!(img);
+        let a = reg.call(&ctx, &format!("segment.{name}"), plain.clone()).unwrap();
+        let mut detailed = plain;
+        detailed["refine"] = json!(true);
+        let t = Instant::now();
+        let b = reg.call(&ctx, &format!("segment.{name}"), detailed).unwrap();
+        let dt = t.elapsed();
+        let (ia, ib) = (score(&a), score(&b));
+        eprintln!("{name}: IoU {ia:.4} -> {ib:.4} with the detail pass ({dt:?}); detail {}", b["detail"]);
+        assert_eq!(b["detail"]["refined"], true, "{}", b["detail"]);
+        assert!(ib > ia + 0.005, "{name}: refine did not help ({ia} -> {ib})");
+        assert!(ib > 0.95, "{name}: refined IoU {ib}");
+    }
+}

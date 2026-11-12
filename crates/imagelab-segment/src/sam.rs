@@ -360,7 +360,7 @@ mod tests {
     fn missing_model_is_reported_not_loaded() {
         let root = tempfile::tempdir().unwrap();
         let sam = Sam::default();
-        let input = Input { width: 4, height: 4, rgb: vec![0; 48], pw: 4, ph: 4, kind: "image" };
+        let input = Input { width: 4, height: 4, rgb: vec![0; 48], pw: 4, ph: 4, kind: "image", full: crate::input::Full::Document };
         let err = sam.clicks(root.path(), &input, &[Click { x: 0.5, y: 0.5, positive: true }]).err().unwrap();
         assert!(err.contains("not installed"), "{err}");
         let st = sam.status(root.path());
