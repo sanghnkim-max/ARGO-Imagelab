@@ -38,8 +38,19 @@ val releaseStorePassword = releaseValue("ARGO_RELEASE_STORE_PASSWORD", "argoRele
 val releaseKeyAlias = releaseValue("ARGO_RELEASE_KEY_ALIAS", "argoReleaseKeyAlias")
 val releaseKeyPassword = releaseValue("ARGO_RELEASE_KEY_PASSWORD", "argoReleaseKeyPassword")
 
-/** ARGO's committed, public debug key (ARGOv2 `apps/argo-android/debug.keystore`): never a release's. */
+/** ARGO's committed, public debug key (ARGOv2 `apps/argo-android/debug.keystore`, copied to `argo-debug.keystore`). */
 val argoDebugCertSha256 = "4eecf98c331b09ebb54559b60ab544856e21c76f1239fdf9e3916bbf60f63c6a"
+
+// Which of ARGO's keys a release is signed with: `release` (the default, above) or `debug`, ARGO's
+// public debug key. ARGO installs and binds a companion only when it is signed like ARGO itself,
+// and ARGO reaches its testers as debug builds for now (its Android bundle's VIA is `off`, which a
+// release ARGO refuses to boot), so the catalog's companions are signed with the debug key until
+// ARGO ships release builds: `ARGO_COMPANION_KEY=debug` or `-PargoCompanionKey=debug`.
+val companionKey = releaseValue("ARGO_COMPANION_KEY", "argoCompanionKey") ?: "release"
+require(companionKey == "release" || companionKey == "debug") {
+    "imagelab: ARGO_COMPANION_KEY / argoCompanionKey is `release` or `debug`, not `$companionKey`"
+}
+val signsWithArgoDebugKey = companionKey == "debug"
 
 android {
     namespace = "dev.argo.imagelab"
@@ -51,8 +62,8 @@ android {
         // wgpu needs for PhotoCraft's GPU renderer. Below that it falls back to the CPU.
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
         ndk {
             // arm64 phones and the Apple-silicon emulator. Add x86_64 only when a matrix needs it.
             abiFilters += "arm64-v8a"
@@ -61,10 +72,17 @@ android {
 
     signingConfigs {
         create("release") {
-            releaseStoreFile?.let { storeFile = rootProject.file(it) }
-            storePassword = releaseStorePassword
-            keyAlias = releaseKeyAlias
-            keyPassword = releaseKeyPassword
+            if (signsWithArgoDebugKey) {
+                storeFile = rootProject.file("argo-debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            } else {
+                releaseStoreFile?.let { storeFile = rootProject.file(it) }
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
 
@@ -121,19 +139,21 @@ dependencies {
     testImplementation(libs.junit)
 }
 
-// A release is signed with ARGO's release key: checked when it is about to be signed or packaged
-// (not at configuration, so debug builds need no secrets). It fails when a secret is missing and
-// when the keystore holds ARGO's public debug key. Plain values captured, for the configuration cache.
+// A release is signed with the ARGO key it asked for: checked when it is about to be signed or
+// packaged (not at configuration, so debug builds need no secrets). With the release key it fails
+// when a secret is missing and when the keystore holds ARGO's public debug key; with the debug key
+// it fails unless the keystore is that key. Plain values captured, for the configuration cache.
 run {
-    val missing = listOfNotNull(
+    val withDebugKey = signsWithArgoDebugKey
+    val missing = if (withDebugKey) emptyList() else listOfNotNull(
         "ARGO_RELEASE_STORE_FILE".takeIf { releaseStoreFile == null },
         "ARGO_RELEASE_STORE_PASSWORD".takeIf { releaseStorePassword == null },
         "ARGO_RELEASE_KEY_ALIAS".takeIf { releaseKeyAlias == null },
         "ARGO_RELEASE_KEY_PASSWORD".takeIf { releaseKeyPassword == null },
     )
-    val storePath = releaseStoreFile?.let { rootProject.file(it).absolutePath }
-    val storePassword = releaseStorePassword
-    val alias = releaseKeyAlias
+    val storePath = if (withDebugKey) rootProject.file("argo-debug.keystore").absolutePath else releaseStoreFile?.let { rootProject.file(it).absolutePath }
+    val storePassword = if (withDebugKey) "android" else releaseStorePassword
+    val alias = if (withDebugKey) "androiddebugkey" else releaseKeyAlias
     val debugDigest = argoDebugCertSha256
     val signingTasks = setOf("validateSigningRelease", "packageRelease", "signReleaseBundle", "packageReleaseBundle")
     tasks.matching { it.name in signingTasks }.configureEach {
@@ -145,13 +165,18 @@ run {
                         "matching -PargoRelease… property). Build the debug variant to test without it.",
                 )
             }
-            val store = KeyStore.getInstance("PKCS12")
-            File(storePath!!).inputStream().use { store.load(it, storePassword!!.toCharArray()) }
+            val store = KeyStore.getInstance(File(storePath!!), storePassword!!.toCharArray())
             val certificate = store.getCertificate(alias)
                 ?: throw GradleException("imagelab: the release keystore has no certificate under alias '$alias'")
             val digest = MessageDigest.getInstance("SHA-256").digest(certificate.encoded).joinToString("") { "%02x".format(it) }
-            if (digest == debugDigest) {
-                throw GradleException("imagelab: the release would be signed with ARGO's public debug key; use the release key.")
+            if (withDebugKey && digest != debugDigest) {
+                throw GradleException("imagelab: argo-debug.keystore is not ARGO's public debug key ($digest)")
+            }
+            if (!withDebugKey && digest == debugDigest) {
+                throw GradleException(
+                    "imagelab: the release would be signed with ARGO's public debug key; use the release key, " +
+                        "or ask for it with ARGO_COMPANION_KEY=debug.",
+                )
             }
         }
     }
