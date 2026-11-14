@@ -120,7 +120,9 @@ class LabService : Service() {
         if (uid == Process.myUid()) return null
         val packages = packageManager.getPackagesForUid(uid).orEmpty()
         val allowed = packages.firstOrNull { pkg ->
-            ALLOWED[pkg]?.any { digest -> packageManager.hasSigningCertificate(pkg, digest, PackageManager.CERT_INPUT_SHA256) } == true
+            // A release: ARGO signed with the very key this app is (the companion catalog's rule).
+            (pkg == ARGO && packageManager.checkSignatures(packageName, pkg) == PackageManager.SIGNATURE_MATCH) ||
+                ALLOWED[pkg]?.any { digest -> packageManager.hasSigningCertificate(pkg, digest, PackageManager.CERT_INPUT_SHA256) } == true
         }
         if (allowed == null) {
             Log.w(TAG, "refused uid $uid (${packages.joinToString()})")
@@ -134,13 +136,17 @@ class LabService : Service() {
         const val CONTRACT_VERSION = 1
         private const val MAX_PHOTO_BYTES = 200L shl 20
 
+        private const val ARGO = "com.argo.android"
+
         /**
-         * Who may drive ImageLab: package → SHA-256 digests of its signing certificate. ARGO's
-         * debug key (`apps/argo-android/debug.keystore` in ARGOv2, the same one ARGO Browser
-         * carries); a release ARGO adds its release certificate here.
+         * Who else may drive ImageLab: package → SHA-256 digests of its signing certificate. A release
+         * ImageLab is signed with ARGO's release key and serves the ARGO signed like itself (above);
+         * a debug build is signed by the developer's own key, so ARGO's committed debug key
+         * (`apps/argo-android/debug.keystore` in ARGOv2, the same one ARGO Browser carries) is
+         * listed here.
          */
         private val ALLOWED: Map<String, List<ByteArray>> = mapOf(
-            "com.argo.android" to listOf(hex("4eecf98c331b09ebb54559b60ab544856e21c76f1239fdf9e3916bbf60f63c6a")),
+            ARGO to listOf(hex("4eecf98c331b09ebb54559b60ab544856e21c76f1239fdf9e3916bbf60f63c6a")),
         )
 
         private fun hex(s: String) = ByteArray(s.length / 2) { i -> s.substring(i * 2, i * 2 + 2).toInt(16).toByte() }

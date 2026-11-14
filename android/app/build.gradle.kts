@@ -1,3 +1,6 @@
+import java.security.KeyStore
+import java.security.MessageDigest
+
 // ImageLab for Android: a Compose shell over PhotoCraft's engine.
 //
 // The Rust side (../../crates) builds with cargo-ndk into this module's jniLibs:
@@ -15,6 +18,29 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// ── Release signing: ARGO's key ───────────────────────────────────────────────────────────────
+//
+// ImageLab ships as one of ARGO's companion apps: ARGO (Settings > Companion apps) installs it from
+// its catalog only when it is signed exactly like ARGO, and each trusts the other by that same
+// signature (`LabService` here, `LabLink` in ARGO). So a release is signed with ARGO's release
+// key, read by the same names as ARGO's own build (ARGOv2 apps/argo-android/app/build.gradle.kts,
+// "Release signing"), from the environment or the matching -P property:
+//   ARGO_RELEASE_STORE_FILE      / argoReleaseStoreFile      the PKCS12 keystore (absolute, or relative to android/)
+//   ARGO_RELEASE_STORE_PASSWORD  / argoReleaseStorePassword
+//   ARGO_RELEASE_KEY_ALIAS       / argoReleaseKeyAlias
+//   ARGO_RELEASE_KEY_PASSWORD    / argoReleaseKeyPassword
+// Read here so a debug build needs none of them; a release refuses to package without them (below).
+fun releaseValue(env: String, property: String): String? =
+    (System.getenv(env) ?: findProperty(property) as String?)?.trim()?.ifEmpty { null }
+
+val releaseStoreFile = releaseValue("ARGO_RELEASE_STORE_FILE", "argoReleaseStoreFile")
+val releaseStorePassword = releaseValue("ARGO_RELEASE_STORE_PASSWORD", "argoReleaseStorePassword")
+val releaseKeyAlias = releaseValue("ARGO_RELEASE_KEY_ALIAS", "argoReleaseKeyAlias")
+val releaseKeyPassword = releaseValue("ARGO_RELEASE_KEY_PASSWORD", "argoReleaseKeyPassword")
+
+/** ARGO's committed, public debug key (ARGOv2 `apps/argo-android/debug.keystore`): never a release's. */
+val argoDebugCertSha256 = "4eecf98c331b09ebb54559b60ab544856e21c76f1239fdf9e3916bbf60f63c6a"
+
 android {
     namespace = "dev.argo.imagelab"
     compileSdk = 37
@@ -30,6 +56,23 @@ android {
         ndk {
             // arm64 phones and the Apple-silicon emulator. Add x86_64 only when a matrix needs it.
             abiFilters += "arm64-v8a"
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            releaseStoreFile?.let { storeFile = rootProject.file(it) }
+            storePassword = releaseStorePassword
+            keyAlias = releaseKeyAlias
+            keyPassword = releaseKeyPassword
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
+            // No shrinking: the uniffi bindings reach the core through JNA by reflection.
+            isMinifyEnabled = false
         }
     }
 
@@ -76,6 +119,42 @@ dependencies {
     implementation(libs.anthropic.java)
     debugImplementation(libs.compose.ui.tooling)
     testImplementation(libs.junit)
+}
+
+// A release is signed with ARGO's release key: checked when it is about to be signed or packaged
+// (not at configuration, so debug builds need no secrets). It fails when a secret is missing and
+// when the keystore holds ARGO's public debug key. Plain values captured, for the configuration cache.
+run {
+    val missing = listOfNotNull(
+        "ARGO_RELEASE_STORE_FILE".takeIf { releaseStoreFile == null },
+        "ARGO_RELEASE_STORE_PASSWORD".takeIf { releaseStorePassword == null },
+        "ARGO_RELEASE_KEY_ALIAS".takeIf { releaseKeyAlias == null },
+        "ARGO_RELEASE_KEY_PASSWORD".takeIf { releaseKeyPassword == null },
+    )
+    val storePath = releaseStoreFile?.let { rootProject.file(it).absolutePath }
+    val storePassword = releaseStorePassword
+    val alias = releaseKeyAlias
+    val debugDigest = argoDebugCertSha256
+    val signingTasks = setOf("validateSigningRelease", "packageRelease", "signReleaseBundle", "packageReleaseBundle")
+    tasks.matching { it.name in signingTasks }.configureEach {
+        doFirst {
+            if (missing.isNotEmpty()) {
+                throw GradleException(
+                    "imagelab: a release is signed with ARGO's release key (it ships as an ARGO companion app), and " +
+                        "${missing.joinToString()} ${if (missing.size == 1) "is" else "are"} not set (environment, or the " +
+                        "matching -PargoRelease… property). Build the debug variant to test without it.",
+                )
+            }
+            val store = KeyStore.getInstance("PKCS12")
+            File(storePath!!).inputStream().use { store.load(it, storePassword!!.toCharArray()) }
+            val certificate = store.getCertificate(alias)
+                ?: throw GradleException("imagelab: the release keystore has no certificate under alias '$alias'")
+            val digest = MessageDigest.getInstance("SHA-256").digest(certificate.encoded).joinToString("") { "%02x".format(it) }
+            if (digest == debugDigest) {
+                throw GradleException("imagelab: the release would be signed with ARGO's public debug key; use the release key.")
+            }
+        }
+    }
 }
 
 // ── Rust ─────────────────────────────────────────────────────────────────────────────────────
