@@ -54,6 +54,16 @@ await lab.library.setRating({ photos: best, rating: 5 });
 return { picked: best, sheet: await lab.analyze.contactSheet({ photos: best }) };
 ```
 
+Pick from gallery photos (MediaStore ids from the phone's photo search), in one `lab_read`
+program: photos are `{gallery: id}`, results are keyed or numbered by `gallery:<id>`:
+
+```js
+const photos = [61, 60, 59, 58].map(id => ({ gallery: id }));
+const q = await lab.analyze.quality({ photos });
+const sheet = await lab.analyze.contactSheet({ photos });   // cell numbers: sheet.layout[i].index -> id, name
+return { image: sheet.image, cells: sheet.layout.map(c => ({ n: c.index, id: c.id, name: c.name, overall: q[c.id]?.overall })) };
+```
+
 Targeted edit: blur the background of the open photo, non-destructively:
 
 ```js

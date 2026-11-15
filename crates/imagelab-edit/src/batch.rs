@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use imagelab_api::{ApiError, ApiResult, Ctx, Effects, Event, Headless, Registry};
+use imagelab_api::{ApiError, ApiResult, Ctx, Effects, Event, GallerySlot, Headless, MAX_GALLERY_PHOTOS, PhotoRef, Registry};
 use photocraft_automation::AuthorizedWorkspace;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,7 +113,7 @@ fn plan(e: &ExportOpts) -> ApiResult<Plan> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApplyParams {
-    pub photos: Vec<String>,
+    pub photos: Vec<PhotoRef>,
     #[serde(default)]
     pub recipe: Option<String>,
     #[serde(default)]
@@ -163,29 +163,44 @@ impl Names {
     }
 }
 
-fn process(root: &Path, photo: &str, steps: &[Step], save_sidecar: bool, plan: Option<&Plan>, names: &Names) -> ApiResult<(Option<String>, Option<String>)> {
-    let (file, _) = resolve_open(root, photo, false)?;
-    let photo = paths::relative(photo)?;
-    let mut h = throwaway(root)?;
-    h.open(Path::new(&file))?;
-    ops::apply_steps(&mut h, steps, true)?;
-    let mut sidecar = None;
-    if save_sidecar {
-        let target = paths::sidecar_for(&photo);
-        ensure_parent(root, &target)?;
-        ops::save_as(&mut h, &target, &ExportSpec { format: Some("pcraft".into()), ..ExportSpec::default() })?;
-        sidecar = Some(target);
+fn process(root: &Path, gallery: &GallerySlot, photo: &PhotoRef, steps: &[Step], save_sidecar: bool, plan: Option<&Plan>, names: &Names) -> ApiResult<(Option<String>, Option<String>)> {
+    // Gallery photos are edited as a copy of the original staged in the workspace, removed after.
+    let (file, stem, staged, sidecar_of) = match photo {
+        PhotoRef::Library(id) => {
+            let (file, _) = resolve_open(root, id, false)?;
+            let id = paths::relative(id)?;
+            (file, paths::stem(&id), None, Some(id))
+        }
+        PhotoRef::Gallery(g) => {
+            let s = crate::gallery::stage(gallery, root, *g)?;
+            (s.file.clone(), s.stem, Some(s.file), None)
+        }
+    };
+    let result = (|| {
+        let mut h = throwaway(root)?;
+        h.open(Path::new(&file))?;
+        ops::apply_steps(&mut h, steps, true)?;
+        let mut sidecar = None;
+        if let (true, Some(photo)) = (save_sidecar, &sidecar_of) {
+            let target = paths::sidecar_for(photo);
+            ensure_parent(root, &target)?;
+            ops::save_as(&mut h, &target, &ExportSpec { format: Some("pcraft".into()), ..ExportSpec::default() })?;
+            sidecar = Some(target);
+        }
+        let mut output = None;
+        if let Some(plan) = plan {
+            ops::shape_for_export(&mut h, &plan.spec)?;
+            let target = names.reserve(&plan.dir, &format!("{stem}{}", plan.suffix), &plan.format)?;
+            ensure_parent(root, &target)?;
+            ops::save_as(&mut h, &target, &plan.spec)?;
+            output = Some(target);
+        }
+        Ok((output, sidecar))
+    })();
+    if let Some(copy) = staged {
+        let _ = std::fs::remove_file(root.join(copy));
     }
-    let mut output = None;
-    if let Some(plan) = plan {
-        ops::shape_for_export(&mut h, &plan.spec)?;
-        let stem = format!("{}{}", paths::stem(&photo), plan.suffix);
-        let target = names.reserve(&plan.dir, &stem, &plan.format)?;
-        ensure_parent(root, &target)?;
-        ops::save_as(&mut h, &target, &plan.spec)?;
-        output = Some(target);
-    }
-    Ok((output, sidecar))
+    result
 }
 
 static JOBS: AtomicU64 = AtomicU64::new(1);
@@ -204,6 +219,13 @@ pub fn apply(ctx: &Ctx, p: ApplyParams) -> ApiResult<Value> {
         (None, Some(s)) => s.clone(),
         (None, None) => Vec::new(),
     };
+    let gallery = p.photos.iter().filter(|r| r.gallery_id().is_some()).count();
+    if gallery > MAX_GALLERY_PHOTOS {
+        return Err(ApiError::too_large(format!("{gallery} gallery photos; at most {MAX_GALLERY_PHOTOS} per batch")));
+    }
+    if gallery > 0 && p.save_sidecar {
+        return Err(ApiError::bad_params("saveSidecar is for library photos; a gallery photo's original is never touched and has no sidecar"));
+    }
     if steps.len() > MAX_STEPS {
         return Err(ApiError::too_large(format!("{} steps; at most {MAX_STEPS}", steps.len())));
     }
@@ -233,11 +255,11 @@ pub fn apply(ctx: &Ctx, p: ApplyParams) -> ApiResult<Value> {
             }
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(photo) = p.photos.get(i) else { break };
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(&root, photo, &steps, p.save_sidecar, plan.as_ref(), &names)))
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(&root, &ctx.shared.gallery, photo, &steps, p.save_sidecar, plan.as_ref(), &names)))
                 .unwrap_or_else(|_| Err(ApiError::internal("processing panicked")));
             let r = match outcome {
-                Ok((output, sidecar)) => PhotoResult { photo: photo.clone(), ok: true, output, sidecar, error: None },
-                Err(e) => PhotoResult { photo: photo.clone(), ok: false, output: None, sidecar: None, error: Some(format!("{}: {}", e.code, e.message)) },
+                Ok((output, sidecar)) => PhotoResult { photo: photo.id(), ok: true, output, sidecar, error: None },
+                Err(e) => PhotoResult { photo: photo.id(), ok: false, output: None, sidecar: None, error: Some(format!("{}: {}", e.code, e.message)) },
             };
             let message = if r.ok { format!("{} done", r.photo) } else { format!("{} failed", r.photo) };
             if let Some(slot) = results.lock().unwrap_or_else(PoisonError::into_inner).get_mut(i) {
@@ -273,7 +295,7 @@ pub fn apply(ctx: &Ctx, p: ApplyParams) -> ApiResult<Value> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExportParams {
-    photos: Vec<String>,
+    photos: Vec<PhotoRef>,
     preset: String,
     #[serde(default)]
     dir: Option<String>,
@@ -305,10 +327,10 @@ pub fn register(r: &mut Registry) {
     let preset_lines = PRESETS.iter().map(|p| format!("{}: {}", p.name, p.summary)).collect::<Vec<_>>().join("; ");
     r.function("batch", "apply", "Apply a recipe or steps to many photos, optionally exporting each; progress events, cancel")
         .description(&format!(
-            "{{photos:[id] (≤{MAX_PHOTOS}), recipe? | steps?, export?: {{dir='exports', format: jpg|png|webp|pcraft, maxSide?, width?, aspect?, quality?, suffix?, preset?, crop?}}, saveSidecar?: false, concurrency?: 2 (max {MAX_CONCURRENCY})}}. Each photo (its sidecar if it has one) is edited in its own throwaway session — the open document is untouched — steps all-or-nothing per photo. Exports never overwrite: a taken name gets ' (2)'. Emits JobProgress after each photo and JobFinished at the end; on cancel returns the results so far with cancelled: true. Returns {{job, results:[{{photo, ok, output?, sidecar?, error?}}], ok, failed, cancelled}}."
+            "{{photos:[id | {{gallery: <MediaStore id>}}] (≤{MAX_PHOTOS}, of which ≤{MAX_GALLERY_PHOTOS} gallery photos), recipe? | steps?, export?: {{dir='exports', format: jpg|png|webp|pcraft, maxSide?, width?, aspect?, quality?, suffix?, preset?, crop?}}, saveSidecar?: false, concurrency?: 2 (max {MAX_CONCURRENCY})}}. Each photo (its sidecar if it has one) is edited in its own throwaway session — the open document is untouched — steps all-or-nothing per photo. A gallery photo is edited as a copy of its original (the gallery is only read, Android only: elsewhere `unsupported`), has no sidecar, and its export is named after it; results name it \"gallery:<id>\". Exports land in ImageLab's workspace folder, not the gallery. Exports never overwrite: a taken name gets ' (2)'. Emits JobProgress after each photo and JobFinished at the end; on cancel returns the results so far with cancelled: true. Returns {{job, results:[{{photo, ok, output?, sidecar?, error?}}], ok, failed, cancelled}}."
         ))
         .params(json!({"type":"object","required":["photos"],"properties":{
-            "photos":{"type":"array","items":{"type":"string"},"maxItems":MAX_PHOTOS},
+            "photos":PhotoRef::list_schema(MAX_PHOTOS),
             "recipe":{"type":"string"},
             "steps":{"type":"array","maxItems":MAX_STEPS,"items":{"type":"object"}},
             "export":{"type":"object","properties":{"dir":{"type":"string"},"format":{"type":"string","enum":["jpg","png","webp","pcraft","tif","psd"]},"maxSide":{"type":"integer"},"width":{"type":"integer"},"aspect":{"type":"string"},"quality":{"type":"integer","minimum":1,"maximum":100},"suffix":{"type":"string"},"preset":{"type":"string","enum":preset_names},"crop":{"type":"boolean"}}},
@@ -318,8 +340,8 @@ pub fn register(r: &mut Registry) {
         .typed(apply)
         .register();
     r.function("batch", "export", "Export many photos with a preset (instagram, web2048, fullJpeg, png)")
-        .description(&format!("{{photos, preset, dir?='exports', crop?, recipe?, concurrency?}}. Presets — {preset_lines}. Same progress, cancel and no-overwrite rules as batch.apply."))
-        .params(json!({"type":"object","required":["photos","preset"],"properties":{"photos":{"type":"array","items":{"type":"string"},"maxItems":MAX_PHOTOS},"preset":{"type":"string","enum":preset_names},"dir":{"type":"string"},"crop":{"type":"boolean"},"recipe":{"type":"string"},"concurrency":{"type":"integer","minimum":1,"maximum":MAX_CONCURRENCY}}}))
+        .description(&format!("{{photos (library ids and {{gallery: id}}), preset, dir?='exports', crop?, recipe?, concurrency?}}. Presets — {preset_lines}. Same progress, cancel and no-overwrite rules as batch.apply."))
+        .params(json!({"type":"object","required":["photos","preset"],"properties":{"photos":PhotoRef::list_schema(MAX_PHOTOS),"preset":{"type":"string","enum":preset_names},"dir":{"type":"string"},"crop":{"type":"boolean"},"recipe":{"type":"string"},"concurrency":{"type":"integer","minimum":1,"maximum":MAX_CONCURRENCY}}}))
         .effects(Effects::Revertible)
         .typed(export)
         .register();

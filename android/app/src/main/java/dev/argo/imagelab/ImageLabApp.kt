@@ -6,6 +6,7 @@ import dev.argo.imagelab.agent.Settings
 import dev.argo.imagelab.core.FfiLabApi
 import dev.argo.imagelab.core.ImageLab
 import dev.argo.imagelab.core.Lab
+import dev.argo.imagelab.core.MediaStoreGallery
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -21,7 +22,7 @@ class ImageLabApp : Application() {
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     val workspace: File by lazy { File(filesDir, "ImageLab").apply { mkdirs() } }
     val settings: Settings by lazy { Settings(this) }
-    val lab: Lab by lazy { Lab({ FfiLabApi(ImageLab(workspace.absolutePath, settings.gpu)) }, appScope) }
+    val lab: Lab by lazy { Lab({ FfiLabApi(ImageLab(workspace.absolutePath, settings.gpu).also { it.setGalleryProvider(MediaStoreGallery(this)) }) }, appScope) }
     val agent: Agent by lazy { Agent(lab, settings) }
 
     /** Where the bundled `imagelab` CLI lives (extracted with the native libraries). */

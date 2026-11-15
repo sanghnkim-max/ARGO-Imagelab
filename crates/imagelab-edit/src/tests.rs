@@ -39,7 +39,7 @@ fn env() -> Env {
     let root = dir.path().canonicalize().unwrap();
     let ws = AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap();
     let events = Arc::new(CollectEvents::default());
-    let shared = Shared { root: root.clone(), session: Arc::new(Mutex::new(Headless::with_workspace(ws))), handles: Arc::new(Handles::default()), events: events.clone() };
+    let shared = Shared { root: root.clone(), session: Arc::new(Mutex::new(Headless::with_workspace(ws))), handles: Arc::new(Handles::default()), events: events.clone(), gallery: Default::default() };
     Env { _dir: dir, root, registry: Registry::new().with(&EditModule), events, shared }
 }
 
@@ -414,4 +414,74 @@ fn preview_looks_on_a_proxy() {
         println!("  {k:15} {} ms", r["ms"]);
     }
     assert_eq!(e.ok("doc.history", json!({}))["revision"], rev, "the document is not touched");
+}
+
+// ---- gallery photos
+
+use imagelab_api::{ApiError, ApiResult, GalleryPhoto, GalleryReader};
+
+/// A phone gallery in memory (synthetic photos by MediaStore id).
+struct FakeGallery(Vec<(i64, &'static str, u32, u32, Vec<u8>)>);
+
+impl FakeGallery {
+    fn photo(id: i64, name: &'static str, w: u32, h: u32, seed: u8) -> (i64, &'static str, u32, u32, Vec<u8>) {
+        let mut px = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&[(x * 255 / w) as u8 ^ seed, (y * 255 / h) as u8, seed, 255]);
+            }
+        }
+        let img = Image::from_u8(w, h, ChannelLayout::Rgba, px).unwrap();
+        (id, name, w, h, photocraft_codecs::encode(&img, Format::Png, &EncodeOptions::default()).unwrap())
+    }
+}
+
+impl GalleryReader for FakeGallery {
+    fn read(&self, id: i64, _max_side: u32) -> ApiResult<GalleryPhoto> {
+        let (_, name, width, height, bytes) = self.0.iter().find(|p| p.0 == id).ok_or_else(|| ApiError::not_found(format!("no gallery photo {id}")))?;
+        Ok(GalleryPhoto { id, name: (*name).to_string(), width: *width, height: *height, bytes: bytes.clone() })
+    }
+}
+
+#[test]
+fn batch_exports_gallery_photos_next_to_library_ones() {
+    let e = env();
+    write_png(&e.root, "library/lib.png", 120, 80, 9);
+    e.shared.gallery.set(Arc::new(FakeGallery(vec![FakeGallery::photo(61, "IMG 0061.png", 120, 80, 3), FakeGallery::photo(60, "IMG_0060.png", 80, 120, 5)])));
+    let r = e.ok("batch.export", json!({"photos": [{"gallery": 61}, "library/lib.png", "gallery:60", {"gallery": 5}], "preset": "web2048"}));
+    assert_eq!((r["ok"].as_u64(), r["failed"].as_u64()), (Some(3), Some(1)), "{r}");
+    let res = r["results"].as_array().unwrap();
+    assert_eq!(res[0]["photo"], "gallery:61");
+    assert_eq!(res[0]["output"], "exports/IMG_0061_web.jpg");
+    assert_eq!(res[1]["output"], "exports/lib_web.jpg");
+    assert_eq!(res[2]["photo"], "gallery:60");
+    assert!(res[3]["error"].as_str().unwrap().starts_with("not_found"), "{r}");
+    let img = photocraft_codecs::decode(&std::fs::read(e.root.join("exports/IMG_0060_web.jpg")).unwrap()).unwrap();
+    assert_eq!(img.dimensions(), (80, 120));
+    // The staged copies are gone; sidecars are refused for the gallery.
+    assert!(std::fs::read_dir(e.root.join("imports/gallery")).map(|d| d.count() == 0).unwrap_or(true));
+    let err = e.call("batch.apply", json!({"photos": [{"gallery": 61}], "saveSidecar": true})).unwrap_err();
+    assert_eq!(err.code, "bad_params");
+}
+
+#[test]
+fn batch_on_gallery_photos_without_a_gallery_is_unsupported_per_photo() {
+    let e = env();
+    let r = e.ok("batch.export", json!({"photos": [{"gallery": 1}], "preset": "png"}));
+    assert!(r["results"][0]["error"].as_str().unwrap().starts_with("unsupported"), "{r}");
+}
+
+#[test]
+fn doc_open_takes_a_gallery_photo_without_naming_the_workspace_copy() {
+    let e = env();
+    e.shared.gallery.set(Arc::new(FakeGallery(vec![FakeGallery::photo(61, "IMG_0061.png", 120, 80, 3), FakeGallery::photo(62, "IMG_0062.png", 64, 48, 4)])));
+    let r = e.ok("doc.open", json!({"gallery": 61}));
+    assert_eq!((r["photo"].as_str(), r["name"].as_str(), r["gallery"].as_i64()), (Some("gallery:61"), Some("IMG_0061.png"), Some(61)));
+    assert!(!r.to_string().contains("imports/"), "{r}");
+    assert_eq!(e.ok("doc.inspect", json!({}))["width"], 120);
+    // A program can switch documents: the second photo becomes the active one.
+    e.ok("doc.open", json!({"gallery": 62}));
+    assert_eq!(e.ok("doc.inspect", json!({}))["width"], 64);
+    assert_eq!(e.call("doc.open", json!({"gallery": 404})).unwrap_err().code, "not_found");
+    assert_eq!(e.call("doc.open", json!({"gallery": 61, "photo": "library/x.png"})).unwrap_err().code, "bad_params");
 }

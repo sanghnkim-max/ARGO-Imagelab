@@ -384,6 +384,19 @@ pub fn facts(ws: &Workspace, hash: &str, original: &std::path::Path, want_faces:
     Ok(f)
 }
 
+/// Facts measured on a proxy that is not backed by a library file (a gallery photo's ≤1024 px
+/// copy); `w`×`h` is the original's size. Nothing is cached.
+pub fn facts_of_proxy(proxy: &Rgba, w: u32, h: u32, want_faces: bool) -> Facts {
+    Facts {
+        algo: ALGO,
+        width: w,
+        height: h,
+        dhash: format!("{:016x}", dhash(proxy)),
+        quality: measure(proxy),
+        faces: want_faces.then(|| faces(proxy)),
+    }
+}
+
 /// `{r, g, b, luma: [256], clipping, mean, pixels}` of an RGBA image (alpha ignored).
 pub fn histogram(px: &[u8]) -> Value {
     let mut r = [0u64; 256];

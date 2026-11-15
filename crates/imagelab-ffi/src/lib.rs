@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use imagelab_core::imagelab_api::{ApiError, Event, EventSink, Source};
+use imagelab_core::imagelab_api::{ApiError, ApiResult, Event, EventSink, GalleryPhoto, GalleryReader, Source};
 use imagelab_core::{Lab, LabError, LabOptions};
 use serde_json::Value;
 
@@ -73,6 +73,42 @@ impl EventSink for ListenerSink {
     fn emit(&self, event: Event) {
         if let Ok(json) = serde_json::to_string(&event) {
             self.0.on_event(json);
+        }
+    }
+}
+
+/// One gallery photo read by the host. `code` is empty on success, else `not_found` (no such
+/// photo, or deleted), `permission` (no photo access), `unsupported` or `failed`, with `message`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct GalleryReply {
+    pub code: String,
+    pub message: String,
+    pub name: String,
+    /// The original's upright size.
+    pub width: u32,
+    pub height: u32,
+    /// An encoded image, upright, longest side at most `max_side` (the original file's bytes
+    /// when `max_side` was 0).
+    pub bytes: Vec<u8>,
+}
+
+/// The phone's gallery (MediaStore), implemented in Kotlin. Read only; called off the main
+/// thread, once per photo, from programs that take `{gallery: id}` photos.
+#[uniffi::export(callback_interface)]
+pub trait GalleryProvider: Send + Sync {
+    /// Read gallery photo `id`, downscaled to fit `max_side` (0: the original, untouched).
+    fn read_photo(&self, id: i64, max_side: u32) -> GalleryReply;
+}
+
+struct ProviderReader(Box<dyn GalleryProvider>);
+
+impl GalleryReader for ProviderReader {
+    fn read(&self, id: i64, max_side: u32) -> ApiResult<GalleryPhoto> {
+        let r = self.0.read_photo(id, max_side);
+        match r.code.as_str() {
+            "" => Ok(GalleryPhoto { id, name: r.name, width: r.width, height: r.height, bytes: r.bytes }),
+            code @ ("not_found" | "permission" | "unsupported" | "too_large") => Err(ApiError::new(code, r.message)),
+            _ => Err(ApiError::new("failed", r.message)),
         }
     }
 }
@@ -172,6 +208,11 @@ impl ImageLab {
             images: outcome.images.into_iter().map(|i| ScriptImage { mime: i.mime, bytes: i.bytes }).collect(),
             error: outcome.error.map(|e| e.to_string()),
         }
+    }
+
+    /// The phone's gallery for programs that take `{gallery: id}` photos (replaces any earlier).
+    pub fn set_gallery_provider(&self, provider: Box<dyn GalleryProvider>) {
+        self.lab.set_gallery_reader(Arc::new(ProviderReader(provider)));
     }
 
     /// Cancel every running script (they finish with error `cancelled: ...`).
