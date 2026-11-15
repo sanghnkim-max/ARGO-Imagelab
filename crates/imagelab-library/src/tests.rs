@@ -26,7 +26,7 @@ impl Env {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("imports")).unwrap();
         let events = Arc::new(CollectEvents::default());
-        let shared = Shared { root: root.clone(), session: Arc::new(Mutex::new(Headless::new())), handles: Arc::new(Handles::default()), events: events.clone() };
+        let shared = Shared { root: root.clone(), session: Arc::new(Mutex::new(Headless::new())), handles: Arc::new(Handles::default()), events: events.clone(), gallery: Default::default() };
         let reg = Registry::new().with(&LibraryModule);
         Self { root, reg, ctx: Ctx::new(shared, Source::Agent), events }
     }
@@ -404,4 +404,104 @@ fn registry_lists_both_areas() {
     assert_eq!(areas, vec!["analyze", "library"]);
     assert!(reg.get("library.delete").is_some_and(|f| f.effects == imagelab_api::Effects::Destructive));
     assert!(reg.get("analyze.quality").is_some_and(|f| f.effects == imagelab_api::Effects::ReadOnly));
+}
+
+// ---- gallery photos
+
+use imagelab_api::{ApiError, ApiResult, GalleryPhoto, GalleryReader};
+
+/// A phone gallery in memory: synthetic images by MediaStore id; records every read.
+struct FakeGallery {
+    photos: Vec<(i64, String, u32, u32, Vec<u8>)>,
+    reads: Mutex<Vec<(i64, u32)>>,
+}
+
+impl FakeGallery {
+    fn new(photos: Vec<(i64, &str, Rgba)>) -> Arc<Self> {
+        let photos = photos.into_iter().map(|(id, name, img)| (id, name.to_string(), img.w, img.h, encode(&img, Format::Jpeg, None))).collect();
+        Arc::new(Self { photos, reads: Mutex::new(Vec::new()) })
+    }
+}
+
+impl GalleryReader for FakeGallery {
+    fn read(&self, id: i64, max_side: u32) -> ApiResult<GalleryPhoto> {
+        self.reads.lock().unwrap().push((id, max_side));
+        let (_, name, w, h, bytes) = self.photos.iter().find(|p| p.0 == id).ok_or_else(|| ApiError::not_found(format!("no gallery photo {id}")))?;
+        Ok(GalleryPhoto { id, name: name.clone(), width: *w, height: *h, bytes: bytes.clone() })
+    }
+}
+
+#[test]
+fn gallery_photos_work_without_a_reader_as_unsupported() {
+    let env = Env::new();
+    let e = env.reg.call(&env.ctx, "analyze.thumbnail", json!({"photo": {"gallery": 61}})).unwrap_err();
+    assert_eq!(e.code, "unsupported");
+    // A sheet shows the failure in its cell instead of failing whole.
+    let s = env.call("analyze.contactSheet", json!({"photos": [{"gallery": 61}]}));
+    assert_eq!(s["layout"][0]["error"]["code"], "unsupported");
+    assert_eq!(env.err("analyze.quality", json!({"photos": [61]})), "bad_params");
+}
+
+#[test]
+fn contact_sheet_numbers_gallery_photos_and_mixes_library_ids() {
+    let env = Env::new();
+    let gallery = FakeGallery::new(vec![(61, "IMG_0061.jpg", scene(800, 600, 1)), (60, "IMG_0060.jpg", scene(600, 800, 2))]);
+    env.ctx.shared.gallery.set(gallery.clone());
+    let lib = env.import("imports/a.png", &encode(&scene(400, 300, 3), Format::Png, None));
+    let photos = json!([{"gallery": 61}, lib, "gallery:60", {"gallery": 999}]);
+    let s = env.call("analyze.contactSheet", json!({"photos": photos, "cellSize": 128}));
+    assert_eq!(s["photos"], json!(["gallery:61", lib, "gallery:60", "gallery:999"]));
+    let layout = s["layout"].as_array().unwrap();
+    assert_eq!((layout[0]["index"].as_u64(), layout[0]["gallery"].as_i64()), (Some(1), Some(61)));
+    assert_eq!(layout[0]["id"], "gallery:61");
+    assert_eq!(layout[0]["name"], "IMG_0061.jpg");
+    assert_eq!(layout[1]["id"], lib);
+    assert!(layout[1].get("gallery").is_none());
+    assert_eq!((layout[2]["index"].as_u64(), layout[2]["name"].as_str()), (Some(3), Some("IMG_0060.jpg")));
+    assert_eq!(layout[3]["error"]["code"], "not_found");
+    // Cells are read downscaled to the cell size, once each.
+    let reads = gallery.reads.lock().unwrap().clone();
+    assert_eq!(reads, vec![(61, 128), (60, 128), (999, 128)]);
+    // The portrait photo is fitted into its cell.
+    assert_eq!(layout[2]["rect"][3], 128);
+    assert!(layout[2]["rect"][2].as_u64().unwrap() < 128);
+    let too_many: Vec<Value> = (0..65).map(|i| json!({"gallery": i})).collect();
+    assert_eq!(env.err("analyze.contactSheet", json!({"photos": too_many})), "too_large");
+}
+
+#[test]
+fn quality_duplicates_and_thumbnail_take_gallery_photos() {
+    let env = Env::new();
+    let sharp = scene(900, 600, 5);
+    let soft = box_blur(&scene(900, 600, 5), 4, 2);
+    let other = scene(900, 600, 40);
+    let gallery = FakeGallery::new(vec![(1, "sharp.jpg", sharp.clone()), (2, "soft.jpg", soft), (3, "sharp_copy.jpg", sharp), (4, "other.jpg", other)]);
+    env.ctx.shared.gallery.set(gallery.clone());
+    let q = env.call("analyze.quality", json!({"photos": [{"gallery": 1}, {"gallery": 2}, {"gallery": 77}], "faces": false}));
+    assert_eq!(q["gallery:1"]["name"], "sharp.jpg");
+    assert_eq!((q["gallery:1"]["width"].as_u64(), q["gallery:1"]["height"].as_u64()), (Some(900), Some(600)));
+    assert!(q["gallery:1"]["sharpness"].as_f64().unwrap() > q["gallery:2"]["sharpness"].as_f64().unwrap());
+    assert_eq!(q["gallery:77"]["error"]["code"], "not_found");
+    // Repeats are dropped; reads are at the analysis proxy size, not the original's.
+    env.call("analyze.quality", json!({"photos": [{"gallery": 4}, "gallery:4"], "faces": false}));
+    assert!(gallery.reads.lock().unwrap().iter().all(|(_, side)| *side == 1024));
+    assert_eq!(gallery.reads.lock().unwrap().iter().filter(|r| r.0 == 4).count(), 1);
+
+    let d = env.call("analyze.duplicates", json!({"photos": [{"gallery": 1}, {"gallery": 3}, {"gallery": 4}]}));
+    let clusters = d.as_array().unwrap();
+    let pair = clusters.iter().find(|c| c["members"].as_array().unwrap().len() == 2).unwrap();
+    assert_eq!(pair["members"], json!(["gallery:1", "gallery:3"]));
+    assert_eq!(clusters.len(), 2);
+    // Members come back in the form photos accepts.
+    let again = env.call("analyze.duplicates", json!({"photos": pair["members"]}));
+    assert_eq!(again.as_array().unwrap().len(), 1);
+
+    let t = env.call("analyze.thumbnail", json!({"photo": {"gallery": 2}, "maxSide": 200}));
+    assert_eq!((t["photo"].as_str(), t["name"].as_str()), (Some("gallery:2"), Some("soft.jpg")));
+    assert_eq!((t["width"].as_u64(), t["height"].as_u64()), (Some(200), Some(133)));
+    let h = env.call("analyze.histogram", json!({"photo": {"gallery": 2}}));
+    assert_eq!(h["source"]["photo"], "gallery:2");
+    assert_eq!(env.err("analyze.thumbnail", json!({"photo": {"gallery": 99}})), "not_found");
+    let many: Vec<Value> = (0..201).map(|i| json!({"gallery": i})).collect();
+    assert_eq!(env.err("analyze.quality", json!({"photos": many})), "too_large");
 }

@@ -46,6 +46,9 @@ struct OpenParams {
     /// Open the original even when a sidecar exists.
     #[serde(default)]
     original: bool,
+    /// A gallery photo (MediaStore id): ImageLab edits a copy; the gallery is never written.
+    #[serde(default)]
+    gallery: Option<i64>,
 }
 
 /// Which file to open for `photo`: its sidecar when one exists (unless `original`).
@@ -61,7 +64,25 @@ pub(crate) fn resolve_open(root: &Path, photo: &str, original: bool) -> ApiResul
     Ok((photo, false))
 }
 
+fn open_gallery(ctx: &Ctx, id: i64) -> ApiResult<Value> {
+    let staged = crate::gallery::stage(&ctx.shared.gallery, &ctx.shared.root, id)?;
+    forget_document_caches(ctx);
+    mutate(ctx, |h| {
+        let info = h.open(Path::new(&staged.file))?;
+        let (index, revision) = ops::active_revision(h).unwrap_or((0, 0));
+        // The copy's workspace path stays out of the answer: the photo is named, not located.
+        let (width, height) = (info.get("width").cloned().unwrap_or(Value::Null), info.get("height").cloned().unwrap_or(Value::Null));
+        Ok(json!({"photo": format!("gallery:{id}"), "gallery": id, "name": staged.name, "index": index, "revision": revision, "width": width, "height": height}))
+    })
+}
+
 fn open(ctx: &Ctx, p: OpenParams) -> ApiResult<Value> {
+    if let Some(id) = p.gallery {
+        if p.photo.is_some() || p.path.is_some() {
+            return Err(ApiError::bad_params("pass `gallery`, `photo` or `path`, not several"));
+        }
+        return open_gallery(ctx, id);
+    }
     forget_document_caches(ctx);
     let photo = p.photo.or(p.path).ok_or_else(|| ApiError::bad_params("pass `photo` (a library id) or `path`"))?;
     let (file, from_sidecar) = resolve_open(&ctx.shared.root, &photo, p.original)?;
@@ -446,9 +467,9 @@ fn schema(s: &str) -> Value {
 pub fn register(r: &mut Registry) {
     r.function("doc", "open", "Open a photo (its edit sidecar if one exists) as the active document")
         .description(
-            "Opens `photo` (a library id such as library/2026-11/IMG_0012.jpg) or any workspace-relative `path`. If the photo has an edit sidecar (edits/<id with / as __>.pcraft) that is opened instead, so earlier edits continue; `original: true` opens the original. Originals are never modified: doc.save writes the sidecar. Returns {photo, opened, fromSidecar, sidecar, index, revision, info}.",
+            "Opens `photo` (a library id such as library/2026-11/IMG_0012.jpg), any workspace-relative `path`, or a gallery photo with `gallery: <MediaStore id>` (ImageLab edits a copy of the original, so the gallery is never written; Android only, elsewhere `unsupported`; answers {photo: \"gallery:<id>\", gallery, name, index, revision, width, height}). Use it in `edit` to switch documents inside one program. If the photo has an edit sidecar (edits/<id with / as __>.pcraft) that is opened instead, so earlier edits continue; `original: true` opens the original. Originals are never modified: doc.save writes the sidecar. Returns {photo, opened, fromSidecar, sidecar, index, revision, info}.",
         )
-        .params(json!({"type":"object","properties":{"photo":{"type":"string"},"path":{"type":"string"},"original":{"type":"boolean","default":false}}}))
+        .params(json!({"type":"object","properties":{"photo":{"type":"string"},"path":{"type":"string"},"original":{"type":"boolean","default":false},"gallery":{"type":"integer","minimum":0,"description":"a gallery photo's MediaStore id"}}}))
         .effects(Effects::Revertible)
         .typed(open)
         .register();

@@ -37,7 +37,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use imagelab_api::{ApiError, ApiResult, Ctx, Effects, Event, ImageBuf, Module, Registry};
+use imagelab_api::{ApiError, ApiResult, Ctx, Effects, Event, ImageBuf, MAX_GALLERY_PHOTOS, Module, PhotoRef, Registry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -213,7 +213,7 @@ struct PhotosParam {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QualityParams {
-    photos: Vec<String>,
+    photos: Vec<PhotoRef>,
     #[serde(default)]
     faces: Option<bool>,
     #[serde(default)]
@@ -223,7 +223,7 @@ struct QualityParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DuplicatesParams {
-    photos: Vec<String>,
+    photos: Vec<PhotoRef>,
     #[serde(default)]
     threshold: Option<u32>,
     #[serde(default)]
@@ -236,7 +236,7 @@ struct DuplicatesParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HistogramParams {
     #[serde(default)]
-    photo: Option<String>,
+    photo: Option<PhotoRef>,
     #[serde(default)]
     image: Option<String>,
 }
@@ -244,7 +244,7 @@ struct HistogramParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ThumbnailParams {
-    photo: String,
+    photo: PhotoRef,
     #[serde(default)]
     max_side: Option<u32>,
 }
@@ -252,7 +252,7 @@ struct ThumbnailParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SheetParams {
-    photos: Vec<String>,
+    photos: Vec<PhotoRef>,
     #[serde(default)]
     columns: Option<u32>,
     #[serde(default)]
@@ -289,6 +289,43 @@ fn photo_ids(ids: &[String], max: usize) -> ApiResult<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// Photos a call takes: library ids normalised, gallery photos kept; order kept, repeats dropped.
+fn photo_refs(refs: &[PhotoRef], max: usize) -> ApiResult<Vec<PhotoRef>> {
+    if refs.len() > max {
+        return Err(ApiError::too_large(format!("{} photos; at most {max} per call", refs.len())));
+    }
+    let gallery = refs.iter().filter(|r| r.gallery_id().is_some()).count();
+    if gallery > MAX_GALLERY_PHOTOS {
+        return Err(ApiError::too_large(format!("{gallery} gallery photos; at most {MAX_GALLERY_PHOTOS} per call")));
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(refs.len());
+    for r in refs {
+        let r = match r {
+            PhotoRef::Library(id) => PhotoRef::Library(photo_ids(std::slice::from_ref(id), 1)?.remove(0)),
+            g => g.clone(),
+        };
+        if seen.insert(r.id()) {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// Library records of the library photos in `refs`, by id.
+fn library_records(ws: &Workspace, refs: &[PhotoRef]) -> ApiResult<HashMap<String, ApiResult<PhotoRecord>>> {
+    let ids: Vec<String> = refs.iter().filter(|r| r.gallery_id().is_none()).map(PhotoRef::id).collect();
+    Ok(records(ws, &ids)?.into_iter().collect())
+}
+
+/// A gallery photo's facts, measured on the host's ≤1024 px copy (not cached: the gallery has
+/// no content hash here). Returns the display name too.
+fn gallery_facts(ctx: &Ctx, id: i64, want_faces: bool) -> ApiResult<(Facts, String)> {
+    let g = ctx.shared.gallery.read(id, analysis::PROXY_SIDE)?;
+    let (proxy, _) = pixels::decode_scaled(&g.bytes, analysis::PROXY_SIDE)?;
+    Ok((analysis::facts_of_proxy(&proxy, g.width, g.height, want_faces), g.name))
 }
 
 fn clean_tag(t: &str) -> ApiResult<String> {
@@ -749,22 +786,38 @@ fn progress(ctx: &Ctx, job: &str, done: usize, total: usize) {
 }
 
 fn quality(ctx: &Ctx, p: QualityParams) -> ApiResult<Value> {
-    let ids = photo_ids(&p.photos, MAX_PHOTOS)?;
+    let refs = photo_refs(&p.photos, MAX_PHOTOS)?;
     let ws = workspace(ctx)?;
     let want_faces = p.faces.unwrap_or(true);
     let deadline = Instant::now() + time_budget(p.time_budget_ms);
     let mut out = Map::new();
-    let recs = records(&ws, &ids)?;
-    let total = recs.len();
-    for (i, (id, rec)) in recs.into_iter().enumerate() {
+    let mut recs = library_records(&ws, &refs)?;
+    let total = refs.len();
+    let late = || err_json(&ApiError::new("time_budget", "not analysed within the time budget; call again (finished photos are cached)"));
+    for (i, r) in refs.iter().enumerate() {
         ctx.check_cancel()?;
-        let v = if Instant::now() > deadline && analysis::cached_facts(&ws, rec.as_ref().map(|r| r.hash.as_str()).unwrap_or(""), want_faces).is_none() {
-            err_json(&ApiError::new("time_budget", "not analysed within the time budget; call again (finished photos are cached)"))
-        } else {
-            match rec.and_then(|r| facts_for(&ws, &r, want_faces)) {
-                Ok(f) => f.to_json(),
-                Err(e) => err_json(&e),
+        let id = r.id();
+        let v = match r {
+            PhotoRef::Library(_) => {
+                let rec = recs.remove(&id).unwrap_or_else(|| Err(ApiError::not_found(format!("no photo `{id}`"))));
+                if Instant::now() > deadline && analysis::cached_facts(&ws, rec.as_ref().map(|r| r.hash.as_str()).unwrap_or(""), want_faces).is_none() {
+                    late()
+                } else {
+                    match rec.and_then(|r| facts_for(&ws, &r, want_faces)) {
+                        Ok(f) => f.to_json(),
+                        Err(e) => err_json(&e),
+                    }
+                }
             }
+            PhotoRef::Gallery(_) if Instant::now() > deadline => late(),
+            PhotoRef::Gallery(g) => match gallery_facts(ctx, *g, want_faces) {
+                Ok((f, name)) => {
+                    let mut v = f.to_json();
+                    v["name"] = json!(name);
+                    v
+                }
+                Err(e) => err_json(&e),
+            },
         };
         out.insert(id, v);
         progress(ctx, "analyze.quality", i + 1, total);
@@ -773,23 +826,30 @@ fn quality(ctx: &Ctx, p: QualityParams) -> ApiResult<Value> {
 }
 
 fn duplicates(ctx: &Ctx, p: DuplicatesParams) -> ApiResult<Value> {
-    let ids = photo_ids(&p.photos, MAX_PHOTOS)?;
+    let refs = photo_refs(&p.photos, MAX_PHOTOS)?;
     let threshold = p.threshold.unwrap_or(10);
     if threshold > 32 {
         return Err(ApiError::bad_params("threshold is a Hamming distance 0..32 (of 64 bits)"));
     }
     let ws = workspace(ctx)?;
     let deadline = Instant::now() + time_budget(p.time_budget_ms);
-    let recs = records(&ws, &ids)?;
-    let total = recs.len();
+    let mut recs = library_records(&ws, &refs)?;
+    let ids: Vec<String> = refs.iter().map(PhotoRef::id).collect();
+    let total = refs.len();
     let mut facts: Vec<Option<Facts>> = Vec::with_capacity(total);
     let mut failed: HashMap<usize, Value> = HashMap::new();
-    for (i, (_, rec)) in recs.iter().enumerate() {
+    for (i, r) in refs.iter().enumerate() {
         ctx.check_cancel()?;
-        let f = match rec {
-            Ok(r) if Instant::now() <= deadline || analysis::cached_facts(&ws, &r.hash, false).is_some() => facts_for(&ws, r, false),
-            Ok(_) => Err(ApiError::new("time_budget", "not analysed within the time budget")),
-            Err(e) => Err(e.clone()),
+        let in_budget = Instant::now() <= deadline;
+        let f = match r {
+            PhotoRef::Library(_) => match recs.remove(&ids[i]) {
+                Some(Ok(rec)) if in_budget || analysis::cached_facts(&ws, &rec.hash, false).is_some() => facts_for(&ws, &rec, false),
+                Some(Ok(_)) => Err(ApiError::new("time_budget", "not analysed within the time budget")),
+                Some(Err(e)) => Err(e),
+                None => Err(ApiError::not_found(format!("no photo `{}`", ids[i]))),
+            },
+            PhotoRef::Gallery(_) if !in_budget => Err(ApiError::new("time_budget", "not analysed within the time budget")),
+            PhotoRef::Gallery(g) => gallery_facts(ctx, *g, false).map(|(f, _)| f),
         };
         match f {
             Ok(f) => facts.push(Some(f)),
@@ -806,7 +866,7 @@ fn duplicates(ctx: &Ctx, p: DuplicatesParams) -> ApiResult<Value> {
     for group in analysis::clusters(&hashes, threshold) {
         if let Some(e) = failed.get(&group[0]) {
             // Unreadable photos stay visible as singletons carrying their error.
-            let id = recs[group[0]].0.as_str();
+            let id = ids[group[0]].as_str();
             out.push(json!({"members": [id], "representative": id, "error": e}));
             continue;
         }
@@ -821,15 +881,22 @@ fn duplicates(ctx: &Ctx, p: DuplicatesParams) -> ApiResult<Value> {
             let (ka, kb) = (key(a), key(b));
             ka.0.total_cmp(&kb.0).then(ka.1.cmp(&kb.1)).then(b.cmp(a))
         });
-        let members: Vec<&str> = group.iter().map(|&i| recs[i].0.as_str()).collect();
-        out.push(json!({"members": members, "representative": rep.map(|i| recs[i].0.as_str())}));
+        let members: Vec<&str> = group.iter().map(|&i| ids[i].as_str()).collect();
+        out.push(json!({"members": members, "representative": rep.map(|i| ids[i].as_str())}));
     }
     Ok(Value::Array(out))
 }
 
 fn histogram(ctx: &Ctx, p: HistogramParams) -> ApiResult<Value> {
     match (p.photo, p.image) {
-        (Some(photo), None) => {
+        (Some(PhotoRef::Gallery(g)), None) => {
+            let photo = ctx.shared.gallery.read(g, analysis::PROXY_SIDE)?;
+            let (img, _) = pixels::decode_scaled(&photo.bytes, analysis::PROXY_SIDE)?;
+            let mut v = analysis::histogram(&img.px);
+            v["source"] = json!({"photo": format!("gallery:{g}"), "name": photo.name, "width": photo.width, "height": photo.height, "sampled": format!("{}x{} proxy", img.w, img.h)});
+            Ok(v)
+        }
+        (Some(PhotoRef::Library(photo)), None) => {
             let ws = workspace(ctx)?;
             let id = Workspace::normalize(&photo)?;
             let path = ws.photo_path(&id)?;
@@ -854,22 +921,34 @@ fn thumbnail(ctx: &Ctx, p: ThumbnailParams) -> ApiResult<Value> {
     if !(16..=2048).contains(&max_side) {
         return Err(ApiError::bad_params("maxSide is 16..2048"));
     }
-    let ws = workspace(ctx)?;
-    let id = Workspace::normalize(&p.photo)?;
-    let cat = Store::new(&ws).read()?;
-    let rec = cat.photo(&id)?;
-    let path = ws.photo_path(&id)?;
-    let img = pixels::preview(&ws, &rec.hash, &path, max_side)?;
+    let r = photo_refs(std::slice::from_ref(&p.photo), 1)?.remove(0);
+    let (img, name) = match &r {
+        PhotoRef::Gallery(g) => {
+            let photo = ctx.shared.gallery.read(*g, max_side)?;
+            (pixels::decode_scaled(&photo.bytes, max_side)?.0, Some(photo.name))
+        }
+        PhotoRef::Library(id) => {
+            let ws = workspace(ctx)?;
+            let cat = Store::new(&ws).read()?;
+            let rec = cat.photo(id)?;
+            let path = ws.photo_path(id)?;
+            (pixels::preview(&ws, &rec.hash, &path, max_side)?, None)
+        }
+    };
     let (handle, w, h) = put_image(ctx, img)?;
-    Ok(json!({"image": handle, "width": w, "height": h, "photo": id}))
+    let mut v = json!({"image": handle, "width": w, "height": h, "photo": r.id()});
+    if let Some(name) = name {
+        v["name"] = json!(name);
+    }
+    Ok(v)
 }
 
 fn contact_sheet(ctx: &Ctx, p: SheetParams) -> ApiResult<Value> {
-    let ids = photo_ids(&p.photos, MAX_SHEET)?;
-    if ids.is_empty() {
+    let refs = photo_refs(&p.photos, MAX_SHEET)?;
+    if refs.is_empty() {
         return Err(ApiError::bad_params("no photos"));
     }
-    let n = ids.len() as u32;
+    let n = refs.len() as u32;
     let cols = p.columns.unwrap_or_else(|| (f64::from(n).sqrt().ceil() as u32).max(1)).clamp(1, 16).min(n);
     let rows = n.div_ceil(cols);
     let gap = 6u32;
@@ -880,20 +959,28 @@ fn contact_sheet(ctx: &Ctx, p: SheetParams) -> ApiResult<Value> {
     }
     let (sw, sh) = (cols * (cell + gap) + gap, rows * (cell + gap) + gap);
     let ws = workspace(ctx)?;
-    let recs = records(&ws, &ids)?;
+    let mut recs = library_records(&ws, &refs)?;
     let mut canvas = sheet::Canvas::new(sw, sh);
     let scale = (cell / 64).clamp(2, 6);
     let mut layout = Vec::new();
-    for (i, (id, rec)) in recs.into_iter().enumerate() {
+    for (i, r) in refs.iter().enumerate() {
         ctx.check_cancel()?;
-        let (c, r) = (i as u32 % cols, i as u32 / cols);
-        let (cx, cy) = (gap + c * (cell + gap), gap + r * (cell + gap));
-        let img = rec.and_then(|rec| {
-            let path = ws.photo_path(&rec.id)?;
-            pixels::preview(&ws, &rec.hash, &path, cell)
-        });
+        let id = r.id();
+        let (c, row) = (i as u32 % cols, i as u32 / cols);
+        let (cx, cy) = (gap + c * (cell + gap), gap + row * (cell + gap));
+        let mut name = None;
+        let img = match r {
+            PhotoRef::Library(_) => recs.remove(&id).unwrap_or_else(|| Err(ApiError::not_found(format!("no photo `{id}`")))).and_then(|rec| {
+                let path = ws.photo_path(&rec.id)?;
+                pixels::preview(&ws, &rec.hash, &path, cell)
+            }),
+            PhotoRef::Gallery(g) => ctx.shared.gallery.read(*g, cell).and_then(|photo| {
+                name = Some(photo.name.clone());
+                Ok(pixels::decode_scaled(&photo.bytes, cell)?.0)
+            }),
+        };
         let index = i + 1;
-        let entry = match img {
+        let mut entry = match img {
             Ok(img) => {
                 let (x, y) = (cx + (cell - img.w.min(cell)) / 2, cy + (cell - img.h.min(cell)) / 2);
                 canvas.blit(&img, x, y);
@@ -904,11 +991,18 @@ fn contact_sheet(ctx: &Ctx, p: SheetParams) -> ApiResult<Value> {
                 json!({"id": id, "index": index, "rect": [cx, cy, cell, cell], "error": {"code": e.code, "message": e.message}})
             }
         };
+        if let Some(g) = r.gallery_id() {
+            entry["gallery"] = json!(g);
+        }
+        if let Some(name) = name {
+            entry["name"] = json!(name);
+        }
         canvas.label(index, cx, cy, scale);
         layout.push(entry);
     }
+    let order: Vec<String> = refs.iter().map(PhotoRef::id).collect();
     let (handle, w, h) = put_image(ctx, canvas.img)?;
-    Ok(json!({"image": handle, "width": w, "height": h, "columns": cols, "cellSize": cell, "layout": layout}))
+    Ok(json!({"image": handle, "width": w, "height": h, "columns": cols, "cellSize": cell, "photos": order, "layout": layout}))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1083,31 +1177,32 @@ impl Module for LibraryModule {
         // ---- analyze
         registry
             .function("analyze", "quality", "Quality scores per photo: sharpness, exposure, contrast, noise, faces, overall (0..1) + notes")
-            .description("Returns {id: {sharpness, exposure, contrast, noise, faces:{count, maxScore, largestArea, sharpness, eyes, boxes}|null, overall, notes:[..], width, height, details}} or {id: {error}}. Measured on a ≤1024 px proxy; overall = 0.45·sharpness (blended 40/60 with face sharpness when faces are found) + 0.25·exposure + 0.15·noise + 0.15·contrast. Cached per content hash, so repeat calls are instant. faces (default true) runs the on-device face detector. Photos left when timeBudgetMs (default 300000) runs out get {error:{code:\"time_budget\"}}.")
-            .params(json!({"type": "object", "required": ["photos"], "properties": {"photos": photos_schema(), "faces": {"type": "boolean", "default": true}, "timeBudgetMs": {"type": "integer", "minimum": 1, "maximum": MAX_TIME_BUDGET_MS}}}))
+            .description("Returns {id: {sharpness, exposure, contrast, noise, faces:{count, maxScore, largestArea, sharpness, eyes, boxes}|null, overall, notes:[..], width, height, details}} or {id: {error}}. Measured on a ≤1024 px proxy; overall = 0.45·sharpness (blended 40/60 with face sharpness when faces are found) + 0.25·exposure + 0.15·noise + 0.15·contrast. Cached per content hash, so repeat calls are instant. faces (default true) runs the on-device face detector. Photos left when timeBudgetMs (default 300000) runs out get {error:{code:\"time_budget\"}}. `photos` takes library ids and gallery photos ({gallery: <MediaStore id>}, at most 200 per call); gallery results are keyed \"gallery:<id>\", carry the photo's `name`, are measured on a ≤1024 px JPEG copy the phone makes (scores can differ slightly from a library photo's) and are not cached. Gallery access exists only in the Android app (elsewhere: error `unsupported`); a deleted photo gives `not_found`. Nothing is written to the gallery.")
+            .params(json!({"type": "object", "required": ["photos"], "properties": {"photos": PhotoRef::list_schema(MAX_PHOTOS), "faces": {"type": "boolean", "default": true}, "timeBudgetMs": {"type": "integer", "minimum": 1, "maximum": MAX_TIME_BUDGET_MS}}}))
             .typed(quality)
             .register();
         registry
             .function("analyze", "duplicates", "Cluster near-duplicate photos (64-bit dHash, Hamming distance ≤ threshold)")
-            .description("Returns [{members:[id], representative}] covering every photo (singletons included unless includeSingletons=false); representative = best cached overall quality, then most pixels. threshold default 10 (of 64 bits); 0-4 = near-identical, 10 = same shot resized/recompressed, 16+ = loose. Photos that could not be read appear as singletons with an `error`.")
-            .params(json!({"type": "object", "required": ["photos"], "properties": {"photos": photos_schema(), "threshold": {"type": "integer", "minimum": 0, "maximum": 32, "default": 10}, "includeSingletons": {"type": "boolean", "default": true}, "timeBudgetMs": {"type": "integer"}}}))
+            .description("Returns [{members:[id], representative}] covering every photo (singletons included unless includeSingletons=false); representative = best cached overall quality, then most pixels. threshold default 10 (of 64 bits); 0-4 = near-identical, 10 = same shot resized/recompressed, 16+ = loose. Photos that could not be read appear as singletons with an `error`. `photos` takes library ids and gallery photos ({gallery: <id>}, at most 200); gallery members are named \"gallery:<id>\" and can be passed straight back as photos.")
+            .params(json!({"type": "object", "required": ["photos"], "properties": {"photos": PhotoRef::list_schema(MAX_PHOTOS), "threshold": {"type": "integer", "minimum": 0, "maximum": 32, "default": 10}, "includeSingletons": {"type": "boolean", "default": true}, "timeBudgetMs": {"type": "integer"}}}))
             .typed(duplicates)
             .register();
         registry
             .function("analyze", "histogram", "RGB + luma histograms (256 bins) with clipping fractions, of a photo or an img:N handle")
             .description("Give `photo` (sampled on a ≤1024 px proxy) or `image` (full handle). Returns {r, g, b, luma: [256 counts], pixels, mean, clipping:{shadows, highlights, r, g, b}, source}.")
-            .params(json!({"type": "object", "properties": {"photo": {"type": "string"}, "image": {"type": "string", "description": "img:N"}}}))
+            .params(json!({"type": "object", "properties": {"photo": PhotoRef::schema(), "image": {"type": "string", "description": "img:N"}}}))
             .typed(histogram)
             .register();
         registry
-            .function("analyze", "thumbnail", "A preview of a photo as an image handle (img:N)")
-            .params(json!({"type": "object", "required": ["photo"], "properties": {"photo": {"type": "string"}, "maxSide": {"type": "integer", "minimum": 16, "maximum": 2048, "default": 512}}}))
+            .function("analyze", "thumbnail", "A preview of a library or gallery photo as an image handle (img:N)")
+            .description("`photo`: a library id or {gallery: <id>}. Returns {image, width, height, photo, name?} (`name` for a gallery photo; `photo` is \"gallery:<id>\" for it). Android only for gallery photos (elsewhere `unsupported`).")
+            .params(json!({"type": "object", "required": ["photo"], "properties": {"photo": PhotoRef::schema(), "maxSide": {"type": "integer", "minimum": 16, "maximum": 2048, "default": 512}}}))
             .typed(thumbnail)
             .register();
         registry
-            .function("analyze", "contactSheet", "A numbered grid of up to 64 photos as one image (img:N), to look at and refer to by number")
-            .description("Each cell shows its 1-based index in the top-left corner; `layout` maps index → id and the image rect [x, y, w, h] on the sheet. columns default ⌈√n⌉ (≤16), cellSize default 256 (64..512); the sheet stays within 4096 px.")
-            .params(json!({"type": "object", "required": ["photos"], "properties": {"photos": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_SHEET}, "columns": {"type": "integer", "minimum": 1, "maximum": 16}, "cellSize": {"type": "integer", "minimum": 64, "maximum": 512}}}))
+            .function("analyze", "contactSheet", "A numbered grid of up to 64 photos (library or gallery) as one image (img:N), to look at and refer to by number")
+            .description("`photos` mixes library ids and gallery photos ({gallery: <MediaStore id>}), e.g. photos: ids.map(id => ({gallery: id})). Each cell shows its 1-based index in the top-left corner; `photos` lists the ids in cell order and `layout` maps index → id (a gallery cell also has `gallery` and `name`) and the image rect [x, y, w, h] on the sheet, so a cell number answers \"which photo\". A photo that cannot be read gets a crossed-out cell and an `error` (not_found, permission, unsupported). Gallery photos are read downscaled by the phone, one at a time; Android only. columns default ⌈√n⌉ (≤16), cellSize default 256 (64..512); the sheet stays within 4096 px.")
+            .params(json!({"type": "object", "required": ["photos"], "properties": {"photos": PhotoRef::list_schema(MAX_SHEET), "columns": {"type": "integer", "minimum": 1, "maximum": 16}, "cellSize": {"type": "integer", "minimum": 64, "maximum": 512}}}))
             .typed(contact_sheet)
             .register();
     }

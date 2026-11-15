@@ -138,7 +138,7 @@ impl Lab {
         imagelab_edit::fonts::register_all(&root);
         let session = Arc::new(Mutex::new(headless));
         let sink = Arc::new(ForwardingSink::default());
-        let shared = Shared { root: root.clone(), session: session.clone(), handles: Arc::new(Handles::default()), events: sink.clone() };
+        let shared = Shared { root: root.clone(), session: session.clone(), handles: Arc::new(Handles::default()), events: sink.clone(), gallery: Default::default() };
         let core = Arc::new(Core::new(build_registry(), shared, sink));
         let mcp = PhotocraftMcp::with_backend(Backend::Headless(session.clone()));
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -221,6 +221,12 @@ impl Lab {
     /// Where events go from now on (the FFI's Kotlin listener, a test collector...).
     pub fn set_event_sink(&self, sink: Arc<dyn EventSink>) {
         self.core.sink.set(sink);
+    }
+
+    /// The phone's photo gallery, for programs that take gallery photos (Android: set once at
+    /// startup; elsewhere gallery photos answer `unsupported`).
+    pub fn set_gallery_reader(&self, reader: Arc<dyn imagelab_api::GalleryReader>) {
+        self.core.shared.gallery.set(reader);
     }
 
     /// PNG of an `img:N` / `mask:N` handle (masks as grayscale), longest side at most
@@ -558,6 +564,46 @@ mod tests {
         let mut expected: Vec<String> = REVIEWED.iter().map(|s| (*s).to_string()).collect();
         expected.sort();
         assert_eq!(actual, expected, "read-only functions changed: review the new ones (see the comment)");
+    }
+
+
+    /// One program, many gallery photos: a read-only realm sheets, scores and groups them, and
+    /// cannot open one as the document.
+    #[test]
+    fn a_read_program_covers_many_gallery_photos() {
+        use imagelab_api::{GalleryPhoto, GalleryReader};
+        struct Phone(Vec<u8>);
+        impl GalleryReader for Phone {
+            fn read(&self, id: i64, _max_side: u32) -> ApiResult<GalleryPhoto> {
+                if id > 9 {
+                    return Err(ApiError::not_found(format!("no gallery photo {id}")));
+                }
+                Ok(GalleryPhoto { id, name: format!("IMG_{id:04}.png"), width: 64, height: 48, bytes: self.0.clone() })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lab = Lab::new(dir.path(), &LabOptions { gpu: false }).unwrap();
+        lab.new_document(json!({"width": 64, "height": 48})).unwrap();
+        lab.set_gallery_reader(Arc::new(Phone(lab.render_png(0).unwrap())));
+        let out = lab.run_script(
+            "const ids = [3, 1, 99];\n\
+             const photos = ids.map(id => ({gallery: id}));\n\
+             const sheet = await lab.analyze.contactSheet({photos, cellSize: 96});\n\
+             const q = await lab.analyze.quality({photos, faces: false});\n\
+             return {image: sheet.image, photos: sheet.photos, names: sheet.layout.map(c => c.name ?? null), q: Object.keys(q)};",
+            true,
+            Duration::from_secs(60),
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.value["photos"], json!(["gallery:3", "gallery:1", "gallery:99"]));
+        assert_eq!(out.value["names"], json!(["IMG_0003.png", "IMG_0001.png", null]));
+        assert_eq!(out.value["q"], json!(["gallery:1", "gallery:3", "gallery:99"]));
+        let out = lab.run_script("await lab.doc.open({gallery: 1})", true, Duration::from_secs(10));
+        assert!(out.error.as_ref().is_some_and(|e| e.to_string().contains("read_only")), "{:?}", out.error);
+        let out = lab.run_script("const r = await lab.doc.open({gallery: 2}); return r", false, Duration::from_secs(10));
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.value["photo"], "gallery:2");
     }
 
     #[test]

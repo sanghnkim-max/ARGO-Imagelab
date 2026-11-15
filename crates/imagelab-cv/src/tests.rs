@@ -22,7 +22,7 @@ impl Lab {
     fn with_session(make: impl FnOnce(&std::path::Path) -> Headless) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let shared = Shared { root: root.clone(), session: Arc::new(Mutex::new(make(&root))), handles: Arc::new(Handles::default()), events: Arc::new(NoEvents) };
+        let shared = Shared { root: root.clone(), session: Arc::new(Mutex::new(make(&root))), handles: Arc::new(Handles::default()), events: Arc::new(NoEvents), gallery: Default::default() };
         Lab { _dir: dir, reg: Registry::new().with(&CvModule), ctx: Ctx::new(shared, Source::Agent) }
     }
 

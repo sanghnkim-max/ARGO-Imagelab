@@ -7,7 +7,7 @@ use serde_json::json;
 use super::*;
 
 fn shared() -> Shared {
-    Shared { root: std::env::temp_dir(), session: Arc::new(Mutex::new(Headless::new())), handles: Arc::new(Handles::default()), events: Arc::new(NoEvents) }
+    Shared { root: std::env::temp_dir(), session: Arc::new(Mutex::new(Headless::new())), handles: Arc::new(Handles::default()), events: Arc::new(NoEvents), gallery: Default::default() }
 }
 
 /// A test area: arithmetic, a pretend write, and image/mask makers.

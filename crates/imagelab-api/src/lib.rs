@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod gallery;
 pub mod handles;
 
 use std::collections::BTreeMap;
@@ -27,6 +28,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+pub use gallery::{GalleryPhoto, GalleryReader, GallerySlot, MAX_GALLERY_PHOTOS, PhotoRef};
 pub use handles::{HandleId, Handles, ImageBuf, MaskBuf};
 pub use photocraft_automation::Headless;
 
@@ -70,6 +72,9 @@ impl ApiError {
     }
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new("not_found", message)
+    }
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new("unsupported", message)
     }
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new("unavailable", message)
@@ -136,6 +141,8 @@ pub struct Shared {
     pub session: Arc<Mutex<Headless>>,
     pub handles: Arc<Handles>,
     pub events: Arc<dyn EventSink>,
+    /// The phone's photo gallery, when the host has one (Android); empty otherwise.
+    pub gallery: Arc<GallerySlot>,
 }
 
 /// One call's context: the shared state plus who is calling and under which rules.
@@ -415,6 +422,7 @@ mod tests {
             session: Arc::new(Mutex::new(Headless::new())),
             handles: Arc::new(Handles::default()),
             events: Arc::new(NoEvents),
+            gallery: Default::default(),
         }
     }
 
