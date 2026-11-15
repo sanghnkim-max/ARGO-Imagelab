@@ -95,6 +95,33 @@ Rules of the runtime (`crates/imagelab-script`):
 `LabCallError{code:"read_only"}`. That is how plan mode / "look but don't touch" works: by
 effects declared in code, not by words.
 
+### Gallery photos in programs
+
+A gallery photo is a MediaStore id, as ARGO's photo tools return it. A program covers many of them
+at once: wherever a function takes photos it takes a **photo reference**, either a library id
+(`"library/2026-11/IMG_0012.jpg"`) or a gallery photo, `{gallery: 61}` (a bare number is refused;
+the string `"gallery:61"` is the same thing, and is how results name a gallery photo, so a cluster's
+`members` can be passed straight back).
+
+```js
+const photos = ids.map(id => ({ gallery: id }));              // ids from ARGO's photo search
+const sheet = await lab.analyze.contactSheet({ photos });      // up to 64 cells
+const q = await lab.analyze.quality({ photos });               // {"gallery:61": {overall, ..., name}}
+return { image: sheet.image, cells: sheet.layout.map(c => [c.index, c.id, c.name, q[c.id]?.overall]) };
+```
+
+* Functions: `analyze.contactSheet`, `quality`, `duplicates`, `thumbnail`, `histogram`;
+  `batch.apply` and `batch.export` (a copy of the original is edited, exports go to the workspace's
+  `exports/`, named after the photo; no sidecar); `doc.open({gallery})` in `edit` to switch documents.
+* The contact sheet keeps its numbering: `photos` lists the ids in cell order and `layout[i]` has
+  `index`, `id`, `gallery`, `name`, and `error` when a photo could not be read (its cell is crossed out).
+* Gallery photos are read one at a time, downscaled by the phone (cells at the cell size, analysis at
+  a 1024 px JPEG), at most 200 per call (64 on a sheet). Gallery measurements are not cached, and
+  scores can differ slightly from a library photo's. Nothing is ever written to the gallery.
+* The core reads the gallery through a host-provided `GalleryReader` (FFI: `GalleryProvider`,
+  `setGalleryProvider`). Without one (CLI, desktop) gallery photos fail with `unsupported`; a deleted
+  photo is `not_found`; missing photo access is `permission`. `read` stays read-only: reading is a read.
+
 ## 4. Data model
 
 * **Photo** — a file in the workspace `library/` (imported from the gallery/camera by copy), id =
@@ -375,6 +402,10 @@ cancelScripts()
 setEventListener(listener: EventListener)        // callback interface
     EventListener.onEvent(eventJson: String)      // Event serialized (§5), called off the main thread
 renderHandle(handle: String, maxSide: UInt) -> ByteArray   // PNG of img:N / mask:N for overlays
+setGalleryProvider(provider: GalleryProvider)    // callback interface, the phone's gallery (read only)
+    GalleryProvider.readPhoto(id: Long, maxSide: UInt) -> GalleryReply   // maxSide 0: the original's bytes
+    GalleryReply { code: String ("" ok | not_found | permission | unsupported | too_large), message,
+                   name, width, height (the original's), bytes (encoded, upright, fits maxSide) }
 ```
 
 ## 12. ARGO companion
@@ -407,7 +438,7 @@ roster line (`select:imagelab`) like every MCP server's.
 
 | Tool | What |
 |---|---|
-| `open {photo}` | Open a gallery photo by MediaStore id (ImageLab reads it with its own photo permission) |
+| `open {photo}` | Open a gallery photo by MediaStore id (ImageLab reads it with its own photo permission); answers the photo's name and size, never an internal path. A program (`read`/`edit`) can also cover many gallery photos at once (§3) |
 | `read {code, description, timeoutMs?}` | `lab_read`: a read-only program; ARGO declares it read-only |
 | `edit {code, description, timeoutMs?}` | `lab_script`: an editing program, one undoable step each |
 | `help {area?}` | `lab_help` |

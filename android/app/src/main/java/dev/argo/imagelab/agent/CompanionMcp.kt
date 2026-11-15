@@ -1,9 +1,7 @@
 package dev.argo.imagelab.agent
 
-import android.content.ContentUris
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.provider.MediaStore
 import android.util.Base64
 import dev.argo.imagelab.BuildConfig
 import dev.argo.imagelab.ImageLabApp
@@ -209,32 +207,37 @@ class CompanionMcp(private val app: ImageLabApp) {
         return JsonObject(result + ("content" to JsonArray(blocks.map { block -> (block as? JsonObject)?.let(::jpeg) ?: block })))
     }
 
-    /** Open gallery photo `photo` (a MediaStore id) as the document. */
+    /**
+     * Open gallery photo `photo` (a MediaStore id) as the document: the core's `doc.open {gallery}`
+     * reads the photo through [dev.argo.imagelab.core.MediaStoreGallery] and edits a copy. The
+     * answer names the photo; the copy's workspace path stays inside ImageLab.
+     */
     private fun open(args: JsonObject): JsonObject {
         val id = (args["photo"] as? JsonPrimitive)?.longOrNull ?: return failed("`photo` is required: a photo id from the gallery")
-        val resolver = app.contentResolver
-        val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-        val name = runCatching {
-            resolver.query(uri, arrayOf(MediaStore.Images.Media.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst()) c.getString(0) else null
-            }
-        }.getOrNull() ?: "photo-$id.jpg"
-        val bytes = try {
-            resolver.openInputStream(uri)?.use { input -> readCapped(input) }
-        } catch (_: SecurityException) {
-            return failed(NO_PHOTO_ACCESS)
-        } catch (_: java.io.FileNotFoundException) {
-            null
-        } ?: return failed("photo $id could not be read: it may have been deleted")
-        val opened = runBlocking { app.lab.io { it.importBytes(name, bytes) } }.getOrThrow()
+        val body = buildJsonObject { put("gallery", id) }.toString()
+        val answer = try {
+            runBlocking { app.lab.io { it.call("doc.open", body, "agent") } }.getOrThrow()
+        } catch (e: Exception) {
+            val why = Lab.describe(e)
+            return failed(
+                when {
+                    "permission" in why -> NO_PHOTO_ACCESS
+                    "not_found" in why -> "photo $id could not be read: it may have been deleted"
+                    else -> "photo $id could not be opened: $why"
+                },
+            )
+        }
         app.lab.requestRefresh()
-        val document = Json.parseToJsonElement(opened)
+        val opened = Json.parseToJsonElement(answer) as? JsonObject ?: JsonObject(emptyMap())
+        val name = opened.text("name") ?: "photo-$id"
         return ok(
             "Photo $id ($name) is open in ImageLab: `read` and `edit` work on it now. The gallery original is unchanged.",
             buildJsonObject {
                 put("opened", true)
                 put("photo", id)
-                put("document", document)
+                put("name", name)
+                opened["width"]?.let { put("width", it) }
+                opened["height"]?.let { put("height", it) }
             },
         )
     }
@@ -294,20 +297,6 @@ class CompanionMcp(private val app: ImageLabApp) {
             put("replaced", true)
             put("path", path)
         })
-    }
-
-    private fun readCapped(input: java.io.InputStream): ByteArray {
-        val out = ByteArrayOutputStream()
-        val buf = ByteArray(1 shl 16)
-        var total = 0L
-        while (true) {
-            val n = input.read(buf)
-            if (n < 0) break
-            total += n
-            require(total <= MAX_PHOTO_BYTES) { "the photo is larger than ${MAX_PHOTO_BYTES shr 20} MB" }
-            out.write(buf, 0, n)
-        }
-        return out.toByteArray()
     }
 
     /**
@@ -424,7 +413,6 @@ class CompanionMcp(private val app: ImageLabApp) {
         private const val INTERNAL_ERROR = -32603
 
         private const val MAX_PROGRAM_MS = 590_000L
-        private const val MAX_PHOTO_BYTES = 200L shl 20
         private const val JPEG_QUALITY = 88
 
         const val NO_PHOTO_ACCESS =
@@ -433,7 +421,9 @@ class CompanionMcp(private val app: ImageLabApp) {
         private const val INSTRUCTIONS =
             "ImageLab is the phone's photo editor. Open a gallery photo with `open`, look at it with `read` (return a " +
                 "preview image), change it with `edit`, and keep the result with `save`, which makes a new gallery photo. " +
-                "The gallery original is never changed, and every edit is one undoable step in ImageLab."
+                "The gallery original is never changed, and every edit is one undoable step in ImageLab. A `read` or `edit` " +
+                "program is not limited to the open photo: it can work on many gallery photos at once by their gallery ids " +
+                "(`lab.help('analyze')`), e.g. one contact sheet, one set of quality scores or one batch for a whole set."
 
         private const val PROGRAM_RULES =
             "The program is the body of an async JavaScript function: use `await` and `return` the result (JSON). " +
@@ -442,7 +432,9 @@ class CompanionMcp(private val app: ImageLabApp) {
                 "edit (PhotoCraft engine commands via edit.run {id, params}, looks, recipes; edit.commands() indexes the command " +
                 "groups and edit.commands({filter: 'curves'}) gives ids with their params), " +
                 "select (subject, sky, object, colorRange, magicWand, fromMask, none), segment (SAM masks by point/box/text), " +
-                "cv (OpenCV-style ops on image handles), analyze (quality, histogram, contact sheets), library, batch, fonts. " +
+                "cv (OpenCV-style ops on image handles), analyze (quality, duplicates, histogram, numbered contact sheets), library, batch, fonts. " +
+                "Photos other than the open one are passed as gallery photos, `{gallery: <id>}`, to analyze.* and batch.* " +
+                "(many at once; the result says which photo each number or key is), or opened inside `edit` with lab.doc.open({gallery: id}). " +
                 "Images and masks are handles (\"img:N\", \"mask:N\"), never bytes; any `{image: \"img:N\"}` in the returned " +
                 "value comes back to you as an image (e.g. `return {image: (await lab.doc.preview({maxSide: 1024})).image}`). " +
                 "To edit part of a photo, make the region the selection (select.subject, or select.fromMask with a mask) " +
@@ -461,7 +453,8 @@ class CompanionMcp(private val app: ImageLabApp) {
                 "open", "Open a gallery photo",
                 "Open a photo from the phone's gallery in ImageLab, so `read` and `edit` work on it. `photo`: the photo's " +
                     "gallery (MediaStore) id, as the phone's photo search gives it. ImageLab edits its own copy; the gallery " +
-                    "original stays as it is.",
+                    "original stays as it is. To compare, rate or process several photos, skip `open`: one `read` or `edit` " +
+                    "program takes many gallery ids.",
                 """{"type":"object","properties":{"photo":{"type":"integer","description":"The photo's gallery id."}},"required":["photo"],"additionalProperties":false}""",
                 readOnly = false, idempotent = true,
             ))
@@ -469,7 +462,8 @@ class CompanionMcp(private val app: ImageLabApp) {
                 "read", "Look at the photo",
                 "Look at and measure the photo open in ImageLab without changing anything: render a preview to see it, " +
                     "inspect layers and history, histograms, quality scores, find objects and masks. Open a gallery photo " +
-                    "first with `open`. Any function that changes something throws LabCallError{code:\"read_only\"}. $PROGRAM_RULES",
+                    "first with `open`, or give the program gallery photos directly (a numbered contact sheet, quality scores, " +
+                    "near-duplicates of many photos in one call). Any function that changes something throws LabCallError{code:\"read_only\"}. $PROGRAM_RULES",
                 PROGRAM_SCHEMA, readOnly = true, idempotent = true,
             ))
             add(tool(
